@@ -1,0 +1,36 @@
+# Build outputs
+dist/
+out/
+*.zip
+
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Development files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
