@@ -1,0 +1,19 @@
+{
+  "name": "PowerDeck",
+  "author": "Fewtarius",
+  "flags": [
+    "root"
+  ],
+  "api_version": 1,
+  "publish": {
+    "tags": [
+      "power",
+      "tdp",
+      "thermal",
+      "handheld",
+      "root"
+    ],
+    "description": "Advanced power management for Steam Deck and handheld PCs - TDP, thermal controls, performance profiles"
+  },
+  "version": "1.0.14"
+}

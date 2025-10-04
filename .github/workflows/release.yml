@@ -1,0 +1,175 @@
+name: PowerDeck Release
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "main"
+      - "dev"
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build_plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Install system dependencies for RyzenAdj
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake build-essential libpci-dev
+
+      - name: Build RyzenAdj for TDP control
+        run: |
+          if [ -d "RyzenAdj" ]; then
+            echo "Building RyzenAdj..."
+            mkdir -p RyzenAdj/build
+            cd RyzenAdj/build
+            cmake -DCMAKE_BUILD_TYPE=Release ..
+            make -j$(nproc)
+            
+            # Verify binary was created
+            if [ -f "ryzenadj" ]; then
+              echo "RyzenAdj built successfully!"
+              echo "Binary size: $(ls -lh ryzenadj | awk '{print $5}')"
+              ./ryzenadj --help | head -5
+            else
+              echo "Error: RyzenAdj compilation failed!"
+              exit 1
+            fi
+            cd ../..
+          else
+            echo "Warning: RyzenAdj submodule not found"
+          fi
+
+      - name: Setup latest Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: latest
+
+      - name: Setup PNPM@10
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10.11.0"
+
+      - name: Sync version from VERSION file
+        run: |
+          if [ -f "VERSION" ]; then
+            chmod +x update-version.sh
+            ./update-version.sh
+            echo "Version synchronized from VERSION file"
+          else
+            echo "VERSION file not found, using existing versions"
+          fi
+
+      - name: Build PowerDeck frontend from source
+        run: |
+          pnpm install
+          pnpm run build
+        continue-on-error: true
+
+      - name: Download Decky Plugin CLI
+        run: |
+          mkdir $(pwd)/cli
+          curl -L -o $(pwd)/cli/decky "https://github.com/SteamDeckHomebrew/cli/releases/latest/download/decky-linux-x86_64"
+          chmod +x $(pwd)/cli/decky
+
+      - name: Build PowerDeck plugin
+        run: |
+          $(pwd)/cli/decky plugin build $(pwd)
+          
+          # Add RyzenAdj binary to the plugin package
+          if [ -f "RyzenAdj/build/ryzenadj" ]; then
+            echo "Adding RyzenAdj binary to plugin package..."
+            unzip "out/PowerDeck.zip" -d "out/PowerDeck"
+            
+            # Create RyzenAdj directory structure in plugin
+            mkdir -p "out/PowerDeck/RyzenAdj/build"
+            cp "RyzenAdj/build/ryzenadj" "out/PowerDeck/RyzenAdj/build/"
+            
+            # Also copy install script
+            cp "install-ryzenadj.sh" "out/PowerDeck/" 2>/dev/null || echo "Warning: install-ryzenadj.sh not found"
+            
+            # Repack the plugin with RyzenAdj
+            cd out/PowerDeck && zip -r "../PowerDeck.zip" . && cd ../..
+            echo "RyzenAdj binary added to plugin package"
+          else
+            echo "Warning: RyzenAdj binary not found, creating package without TDP control"
+          fi
+
+      - name: Show PowerDeck build files
+        run: |
+          ls out/PowerDeck.zip
+          7z l out/PowerDeck.zip
+
+      - name: Publish PowerDeck Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PowerDeck
+          path: out/PowerDeck.zip
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: build_plugin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - run: mkdir /tmp/artifacts
+
+      - name: Download PowerDeck artifact
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+
+      - run: ls -R /tmp/artifacts
+
+      - name: Get version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Publish PowerDeck to GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            /tmp/artifacts/PowerDeck/PowerDeck.zip
+          tag_name: ${{ github.ref_name }}
+          name: "PowerDeck v${{ steps.get_version.outputs.version }}"
+          body: |
+            # PowerDeck v${{ steps.get_version.outputs.version }}
+            
+            Advanced power management plugin for Steam Deck and handheld PCs.
+            
+            ## Features
+            - TDP (Thermal Design Power) control
+            - CPU boost management  
+            - Performance profiles
+            - AC/Battery power mode switching
+            - Per-game profile support
+            
+            ## Installation
+            1. Download `PowerDeck.zip` below
+            2. Extract to your Decky plugins directory
+            3. Restart Decky Loader
+            
+            ## Compatible Devices
+            - AYANEO handheld devices
+            - ROG Ally series
+            - Most devices running SteamOS
+            
+          draft: false
+          generate_release_notes: false
+          prerelease: contains(github.ref, 'pre')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
