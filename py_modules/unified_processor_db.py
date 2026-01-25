@@ -26,22 +26,20 @@ from pathlib import Path
 
 # Global database variables (loaded once)
 _PROCESSOR_DATABASE: Optional[List[Dict]] = None
-_DETECTION_PATTERNS: Optional[Dict[str, List[Dict]]] = None
 
 def load_processor_database() -> bool:
     """Load the unified processor database"""
-    global _PROCESSOR_DATABASE, _DETECTION_PATTERNS
+    global _PROCESSOR_DATABASE
     
     if _PROCESSOR_DATABASE is not None:
         return True
     
     try:
-        # Get path to database files
+        # Get path to database file
         current_dir = Path(__file__).parent
-        db_file = current_dir / "unified_processor_database.json"
-        patterns_file = current_dir / "processor_detection_patterns.json"
+        db_file = current_dir / "processor_database.json"
         
-        # Load processor database
+        # Load merged processor database
         if db_file.exists():
             with open(db_file, 'r') as f:
                 _PROCESSOR_DATABASE = json.load(f)
@@ -49,15 +47,7 @@ def load_processor_database() -> bool:
             print(f"Warning: Processor database not found at {db_file}")
             return False
         
-        # Load detection patterns
-        if patterns_file.exists():
-            with open(patterns_file, 'r') as f:
-                _DETECTION_PATTERNS = json.load(f)
-        else:
-            print(f"Warning: Detection patterns not found at {patterns_file}")
-            return False
-        
-        print(f"Loaded {len(_PROCESSOR_DATABASE)} processors with {len(_DETECTION_PATTERNS)} detection patterns")
+        print(f"Loaded {len(_PROCESSOR_DATABASE)} processors from unified database")
         return True
         
     except Exception as e:
@@ -103,25 +93,24 @@ def get_cpu_info() -> Dict[str, str]:
     return cpu_info
 
 def find_processor_by_pattern(model_name: str) -> Optional[Dict[str, Any]]:
-    """Find processor using detection patterns"""
-    if not load_processor_database() or not _DETECTION_PATTERNS:
+    """Find processor using processor database with smart pattern matching"""
+    if not load_processor_database() or not _PROCESSOR_DATABASE:
         return None
     
     model_lower = model_name.lower()
     
-    # Special case for Steam Deck's unique naming
-    if "custom apu 0932" in model_lower or "amd custom apu 0932" in model_lower:
-        if "custom_apu_0932" in _DETECTION_PATTERNS:
-            processors = _DETECTION_PATTERNS["custom_apu_0932"]
-            for proc in processors:
-                if "steam deck" in proc['name'].lower() or "custom apu 0932" in proc['name'].lower():
-                    return proc
+    # Extract potential matching patterns from the model name
+    # for more efficient searching
     
-    if "custom apu 0405" in model_lower or "amd custom apu 0405" in model_lower:
-        if "custom_apu_0405" in _DETECTION_PATTERNS:
-            processors = _DETECTION_PATTERNS["custom_apu_0405"]
-            for proc in processors:
-                if "steam deck" in proc['name'].lower() or "custom apu 0405" in proc['name'].lower():
+    # Special case for Steam Deck's unique naming
+    steam_deck_patterns = ["custom apu 0932", "amd custom apu 0932", 
+                           "custom apu 0405", "amd custom apu 0405"]
+    
+    for pattern in steam_deck_patterns:
+        if pattern in model_lower:
+            for proc in _PROCESSOR_DATABASE:
+                proc_lower = proc['name'].lower()
+                if "steam deck" in proc_lower or pattern.replace("amd ", "") in proc_lower:
                     return proc
     
     # Extract specific model patterns first (more specific patterns)
@@ -129,85 +118,81 @@ def find_processor_by_pattern(model_name: str) -> Optional[Dict[str, Any]]:
     # AMD specific patterns - extract the exact model number
     amd_model_matches = re.findall(r'(\d{4}[a-z]+)', model_lower)
     for model in amd_model_matches:
-        if model in _DETECTION_PATTERNS:
-            processors = _DETECTION_PATTERNS[model]
-            # Find exact match in the processor list, prefer processors with valid default TDP
-            # Also prefer non-PRO versions for consumer devices unless explicitly PRO
-            best_match = None
-            preferred_match = None
-            
-            for proc in processors:
-                if model in proc['name'].lower():
-                    is_pro = 'pro' in proc['name'].lower()
-                    has_valid_tdp = proc.get('default_tdp', 0) > 0
+        best_match = None
+        preferred_match = None
+        
+        for proc in _PROCESSOR_DATABASE:
+            proc_lower = proc['name'].lower()
+            if model in proc_lower:
+                is_pro = 'pro' in proc_lower
+                has_valid_tdp = proc.get('default_tdp', 0) > 0
+                
+                # If this is a valid processor
+                if has_valid_tdp:
+                    # Check if model string explicitly mentions PRO
+                    model_wants_pro = 'pro' in model_lower
                     
-                    # If this is a valid processor
-                    if has_valid_tdp:
-                        # Check if model string explicitly mentions PRO
-                        model_wants_pro = 'pro' in model_lower
-                        
-                        if model_wants_pro and is_pro:
-                            # Explicitly looking for PRO and this is PRO
-                            return proc
-                        elif not model_wants_pro and not is_pro:
-                            # Looking for regular version and this is regular
-                            return proc
-                        elif not preferred_match:
-                            # Keep as preferred match
-                            preferred_match = proc
-                    
-                    # Keep as fallback if no better match found
-                    elif best_match is None:
-                        best_match = proc
-            
-            # Return preferred match or fallback
-            if preferred_match:
-                return preferred_match
-            elif best_match:
-                return best_match
+                    if model_wants_pro and is_pro:
+                        # Explicitly looking for PRO and this is PRO
+                        return proc
+                    elif not model_wants_pro and not is_pro:
+                        # Looking for regular version and this is regular
+                        return proc
+                    elif not preferred_match:
+                        # Keep as preferred match
+                        preferred_match = proc
+                
+                # Keep as fallback if no better match found
+                elif best_match is None:
+                    best_match = proc
+        
+        # Return preferred match or fallback
+        if preferred_match:
+            return preferred_match
+        elif best_match:
+            return best_match
     
     # Intel specific patterns - extract the exact model number  
     intel_model_matches = re.findall(r'(i[3579]-\d+[a-z]*)', model_lower)
     for model in intel_model_matches:
-        if model in _DETECTION_PATTERNS:
-            processors = _DETECTION_PATTERNS[model]
-            # Find exact match, prefer processors with valid default TDP
-            best_match = None
-            for proc in processors:
-                if model in proc['name'].lower():
+        best_match = None
+        
+        for proc in _PROCESSOR_DATABASE:
+            proc_lower = proc['name'].lower()
+            if model in proc_lower:
+                # Prefer processors with non-zero default TDP
+                if proc.get('default_tdp', 0) > 0:
+                    return proc
+                # Keep as fallback if no better match found
+                if best_match is None:
+                    best_match = proc
+        
+        # Return best match if found (even with 0 TDP as fallback)
+        if best_match:
+            return best_match
+    
+    # Generic number patterns (less specific)
+    number_matches = re.findall(r'(\d{3,4}[a-z]*)', model_lower)
+    for number in number_matches:
+        best_match = None
+        
+        for proc in _PROCESSOR_DATABASE:
+            proc_lower = proc['name'].lower()
+            if number in proc_lower:
+                # Check if other parts of the model name also match
+                name_parts = model_lower.split()
+                matches = sum(1 for part in name_parts if part in proc_lower)
+                if matches >= 2:  # At least 2 parts must match
                     # Prefer processors with non-zero default TDP
                     if proc.get('default_tdp', 0) > 0:
                         return proc
                     # Keep as fallback if no better match found
                     if best_match is None:
                         best_match = proc
-            # Return best match if found (even with 0 TDP as fallback)
-            if best_match:
-                return best_match
-    
-    # Generic number patterns (less specific)
-    number_matches = re.findall(r'(\d{3,4}[a-z]*)', model_lower)
-    for number in number_matches:
-        if number in _DETECTION_PATTERNS:
-            processors = _DETECTION_PATTERNS[number]
-            # Prefer exact name matches within the pattern group, and prefer non-zero TDP
-            best_match = None
-            for proc in processors:
-                if number in proc['name'].lower():
-                    # Check if other parts of the model name also match
-                    name_parts = model_lower.split()
-                    proc_name_lower = proc['name'].lower()
-                    matches = sum(1 for part in name_parts if part in proc_name_lower)
-                    if matches >= 2:  # At least 2 parts must match
-                        # Prefer processors with non-zero default TDP
-                        if proc.get('default_tdp', 0) > 0:
-                            return proc
-                        # Keep as fallback if no better match found
-                        if best_match is None:
-                            best_match = proc
-            # Return best match if found (even with 0 TDP as fallback)
-            if best_match:
-                return best_match
+        
+        # Return best match if found (even with 0 TDP as fallback)
+        if best_match:
+            return best_match
     
     return None
 
