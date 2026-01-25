@@ -1103,63 +1103,9 @@ class Plugin:
             debug_log(f"ROG Ally native TDP support loaded from settings: {self.rog_ally_native_tdp_enabled}")
             
             # Migrate from old settings format if they exist
-            await self._migrate_old_settings_to_unified()
             
         except Exception as e:
             decky.logger.error(f"Failed to load unified profiles: {e}")
-
-    async def _migrate_old_settings_to_unified(self):
-        """Migrate old powerdeck_settings.json to unified profile format"""
-        try:
-            if not self.settings:
-                return
-                
-            saved_settings = self.settings.get("powerDeckSettings", {})
-            if not saved_settings:
-                debug_log("No old settings to migrate")
-                return
-                
-            debug_log("Migrating old settings to unified profile format")
-            
-            # Extract current profile from old format
-            if "currentProfile" in saved_settings:
-                current_profile = saved_settings["currentProfile"]
-                
-                # CRITICAL FIX: Create identical AC and battery profiles using system-derived values
-                # Use the current system-derived profile as the base for both AC and battery
-                system_derived_profile = self.current_profile.copy()
-                
-                # Merge old settings with system-derived defaults (system values take precedence for missing fields)
-                for key, value in current_profile.items():
-                    if key in system_derived_profile:
-                        system_derived_profile[key] = value
-                
-                # Save identical profiles for both AC and battery modes
-                await self.save_profile({"gameId": "00000000_ac", **system_derived_profile})
-                await self.save_profile({"gameId": "00000000_battery", **system_derived_profile})
-                
-                debug_log(f"Migrated to identical AC and battery profiles using system-derived defaults: {system_derived_profile}")
-            else:
-                # If no old profile exists, create identical AC and battery profiles from current system-derived defaults
-                system_profile = self.current_profile.copy()
-                await self.save_profile({"gameId": "00000000_ac", **system_profile})
-                await self.save_profile({"gameId": "00000000_battery", **system_profile})
-                debug_log(f"Created identical default AC and battery profiles from system-derived values: {system_profile}")
-            
-            # Extract per-game profiles setting
-            if "enablePerGameProfiles" in saved_settings:
-                self.enable_per_game_profiles = saved_settings["enablePerGameProfiles"]
-                debug_log(f"Migrated enablePerGameProfiles setting: {self.enable_per_game_profiles}")
-                
-            # Mark migration as complete by clearing only migrated fields, preserve others
-            # Don't clear rogAllyNativeTdpEnabled and other persistent settings
-            remaining_settings = {k: v for k, v in saved_settings.items() 
-                                 if k in ["rogAllyNativeTdpEnabled", "enablePerGameProfiles"]}
-            self.settings.set("powerDeckSettings", remaining_settings)
-            debug_log("Migration completed, cleared old settings")
-            
-        except Exception as e:
-            decky.logger.error(f"Failed to migrate old settings: {e}")
 
     async def get_scaling_driver(self) -> str:
         """Get current CPU scaling driver"""

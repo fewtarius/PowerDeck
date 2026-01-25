@@ -96,7 +96,7 @@ class PowerDeckSettings:
             # Import/Export settings
             "backup_on_profile_change": True,
             "auto_backup_interval": 86400,  # 24 hours in seconds
-            "max_backup_files": 10,,
+            "max_backup_files": 10,
             
             # PowerDeck-specific settings (managed by main.py)
             "powerDeckSettings": {
