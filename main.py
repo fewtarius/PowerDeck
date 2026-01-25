@@ -159,6 +159,7 @@ class Plugin:
         self.tdp_limits = {"min": 4, "max": None}  # Min is hard-coded 4W, max from database
         self.enable_per_game_profiles = True  # Per-game profiles setting - enabled by default
         self.rog_ally_native_tdp_enabled = False  # ROG Ally native TDP support - disabled by default
+        self._rog_ally_native_tdp_explicitly_set = False  # Track if user explicitly set this
         self.device_info = {
             "device_name": "Unknown Device",
             "cpu_vendor": "unknown",
@@ -867,7 +868,8 @@ class Plugin:
                     decky.logger.info(f"LOAD_SETTINGS: Set rogAllyNativeTdpEnabled to {self.rog_ally_native_tdp_enabled}")
                 else:
                     # Default to True for ROG Ally devices, False for others if not found in settings
-                    self.rog_ally_native_tdp_enabled = await self.is_rog_ally_device()
+                    # Keep last known value or default to False to prevent unexpected UI changes
+                    self.rog_ally_native_tdp_enabled = False
                     decky.logger.info(f"LOAD_SETTINGS: Set default rogAllyNativeTdpEnabled to {self.rog_ally_native_tdp_enabled} (ROG Ally device: {await self.is_rog_ally_device()})")
             else:
                 decky.logger.error(f"LOAD_SETTINGS: self.settings is None!")
@@ -3472,8 +3474,9 @@ class Plugin:
                 return False
                 
             self.rog_ally_native_tdp_enabled = enabled
+            self._rog_ally_native_tdp_explicitly_set = True  # Mark as explicitly set by user
             await self.save_settings()
-            decky.logger.info(f"ROG Ally native TDP support changed to: {enabled}")
+            decky.logger.info(f"ROG Ally native TDP support changed to: {enabled} (explicitly set by user)")
             return True
         except Exception as e:
             decky.logger.error(f"Failed to set ROG Ally native TDP setting: {e}")

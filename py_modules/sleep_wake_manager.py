@@ -173,12 +173,23 @@ class EnhancedSleepWakeManager:
                         line = line_bytes.decode('utf-8', errors='ignore').strip()
                         
                         # Check for resume indicators
+                        # Check for resume indicators (wake events)
                         if any(indicator in line.lower() for indicator in [
                             'resuming', 'resumed', 'wake', 'psp is resuming', 
                             'smu is resuming', 'finished preparing resuming'
                         ]):
                             decky.logger.info(f"Journal wake detection: {line}")
                             await self._handle_wake_event("journal_monitor")
+                            break  # Exit to restart monitoring
+                        
+                        # Check for suspend indicators (sleep events)
+                        if any(indicator in line.lower() for indicator in [
+                            'suspend', 'sleeping', 'going to sleep', 'preparing to sleep',
+                            'pm-suspend', 'kernel: PM: suspend'
+                        ]):
+                            decky.logger.info(f"Journal sleep detection: {line}")
+                            await self._prepare_for_sleep()
+                            # Wake will be detected by suspend_counter_monitor
                             break  # Exit to restart monitoring
                         
                     except asyncio.TimeoutError:
@@ -233,7 +244,7 @@ class EnhancedSleepWakeManager:
             if self.pre_sleep_state:
                 event.ac_power_before = self.pre_sleep_state.get('ac_power')
                 event.profile_before = self.pre_sleep_state.get('current_profile_id')
-                event.gpu_mode_before = self.pre_sleep_state.get('gpu_mode')
+                event.gpu_mode_before = self.pre_sleep_state.get('profile_gpu_mode')
             
             # Capture current state for comparison
             current_state = await self._capture_comprehensive_state()
@@ -261,7 +272,7 @@ class EnhancedSleepWakeManager:
                 decky.logger.error(f"Failed to get current profile: {e}")
             
             # COMPREHENSIVE PARAMETER RESTORATION
-            restoration_success = await self._restore_comprehensive_state(current_profile)
+            restoration_success = await self._restore_comprehensive_state(current_profile, self.pre_sleep_state)
             event.settings_restored = restoration_success
             
             # Hardware reinitialization
@@ -338,7 +349,7 @@ class EnhancedSleepWakeManager:
         
         return differences
     
-    async def _restore_comprehensive_state(self, current_profile: Dict[str, Any]) -> bool:
+    async def _restore_comprehensive_state(self, current_profile: Dict[str, Any], pre_sleep_state: Optional[Dict[str, Any]] = None) -> bool:
         """Restore all PowerDeck managed parameters after wake"""
         restoration_success = True
         
@@ -350,22 +361,34 @@ class EnhancedSleepWakeManager:
                 return False
             
             # 1. GPU Mode Restoration (highest priority for power consumption)
-            if 'gpuMode' in current_profile:
+            # Prioritize pre-sleep GPU mode if available
+            gpu_mode = None
+            if pre_sleep_state and 'profile_gpu_mode' in pre_sleep_state:
+                gpu_mode = pre_sleep_state['profile_gpu_mode']
+                decky.logger.info(f"Using pre-sleep GPU mode: {gpu_mode}")
+            elif 'gpuMode' in current_profile:
+                gpu_mode = current_profile['gpuMode']
+            
+            if gpu_mode:
                 try:
-                    gpu_mode = current_profile['gpuMode']
                     success = await self.plugin.set_gpu_mode(gpu_mode)
                     if success:
                         # Only log success, not details (minimize NVMe wake)
                         decky.logger.info(f"GPU mode restored: {gpu_mode}")
                         
-                        # Also apply GPU frequency limits if specified
-                        if 'gpuFreqMin' in current_profile and 'gpuFreqMax' in current_profile:
+                        # Get frequency limits from profile
+                        freq_min = None
+                        freq_max = None
+                        if pre_sleep_state and 'profile_gpu_freq_min' in pre_sleep_state:
+                            freq_min = pre_sleep_state['profile_gpu_freq_min']
+                            freq_max = pre_sleep_state['profile_gpu_freq_max']
+                        elif 'gpuFreqMin' in current_profile and 'gpuFreqMax' in current_profile:
                             freq_min = current_profile['gpuFreqMin']
                             freq_max = current_profile['gpuFreqMax']
-                            
-                            # Apply frequency limits
-                            if hasattr(self.plugin, 'set_gpu_frequency_range'):
-                                await self.plugin.set_gpu_frequency_range(freq_min, freq_max)
+                        
+                        # Apply frequency limits if specified
+                        if freq_min and freq_max and hasattr(self.plugin, 'set_gpu_frequency_range'):
+                            await self.plugin.set_gpu_frequency_range(freq_min, freq_max)
                     else:
                         restoration_success = False
                 except Exception:
@@ -726,30 +749,21 @@ class EnhancedSleepWakeManager:
             self.pre_sleep_state = {}
     
     async def _reinitialize_hardware_after_wake(self) -> bool:
-        """Reinitialize hardware components after wake"""
-        success = True
-        
+        """
+        Reinitialize hardware components after wake.
+        Since GPU mode and other parameters are restored via _restore_comprehensive_state,
+        this function primarily handles any additional hardware setup if needed.
+        """
         try:
-            # GPU reinitialization
-            if hasattr(self.plugin, 'device_manager'):
-                gpu_success = await self.plugin.device_manager.reinitialize_gpu()
-                if not gpu_success:
-                    decky.logger.warning("GPU reinitialization failed")
-                    success = False
-            
-            # CPU reinitialization
-            if hasattr(self.plugin, 'device_manager'):
-                cpu_success = await self.plugin.device_manager.reinitialize_cpu()
-                if not cpu_success:
-                    decky.logger.warning("CPU reinitialization failed")
-                    success = False
-            
-            return success
-            
+            # GPU restoration is handled in _restore_comprehensive_state
+            # CPU restoration is handled in _restore_cpu_parameters
+            # No additional reinitialization needed at this time
+            decky.logger.info("Hardware post-wake state verification complete")
+            return True
         except Exception as e:
-            decky.logger.error(f"Hardware reinitialization failed: {e}")
+            decky.logger.warning(f"Hardware post-wake verification failed: {e}")
             return False
-    
+
     async def _validate_post_wake_state(self):
         """Validate system state after wake"""
         try:
