@@ -1869,11 +1869,10 @@ const Content: React.FC = () => {
         </PanelSection>
       )}
 
-      {/* CPU Control Section - Hidden when ROG Ally native TDP is enabled */}
+      {/* CPU Control Section - Always visible */}
       {(() => {
-        const shouldShow = !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled);
-        debug.log(`CPU Control visibility: isRogAllyDeviceDetected=${isRogAllyDeviceDetected}, rogAllyNativeTdpEnabled=${rogAllyNativeTdpEnabled}, shouldShow=${shouldShow}`);
-        return shouldShow;
+        debug.log(`CPU Control visibility: always shown`);
+        return true;
       })() && (
       <PanelSection title="CPU Control">
         <DebouncedSlider
@@ -2025,11 +2024,10 @@ const Content: React.FC = () => {
       </PanelSection>
       )}
 
-      {/* GPU Control Section - Hidden when ROG Ally native TDP is enabled */}
+      {/* GPU Control Section - Always visible */}
       {(() => {
-        const shouldShow = !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled);
-        debug.log(`GPU Control visibility: isRogAllyDeviceDetected=${isRogAllyDeviceDetected}, rogAllyNativeTdpEnabled=${rogAllyNativeTdpEnabled}, shouldShow=${shouldShow}`);
-        return shouldShow;
+        debug.log(`GPU Control visibility: always shown`);
+        return true;
       })() && (
       <PanelSection title="GPU Control">
         <PanelSectionRow>
