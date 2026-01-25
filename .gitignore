@@ -34,3 +34,9 @@ pnpm-debug.log*
 .env.development.local
 .env.test.local
 .env.production.local
+
+# CLIO
+.clio/logs/
+.clio/sessions/
+.clio/memory/
+.clio/*.json

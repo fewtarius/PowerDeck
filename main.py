@@ -880,7 +880,10 @@ class Plugin:
         """Save current settings"""
         try:
             if self.settings:
+                # Ensure we always have complete settings structure
+                existing = self.settings.get("powerDeckSettings", {})
                 settings_data = {
+                    **existing,  # Keep any existing settings
                     "currentProfile": self.current_profile,
                     "tdpLimits": self.tdp_limits,
                     "enablePerGameProfiles": self.enable_per_game_profiles,
