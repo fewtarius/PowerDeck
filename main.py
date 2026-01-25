@@ -966,6 +966,9 @@ class Plugin:
     async def load_unified_profiles(self):
         """Load settings from unified profile system instead of old settings format"""
         try:
+            # CRITICAL: Load saved settings first (rogAllyNativeTdpEnabled, enablePerGameProfiles, etc.)
+            await self.load_saved_settings()
+            
             debug_log("Starting unified profile loading")
             
             # Detect current power state with retry logic for reliable boot detection
