@@ -35,8 +35,11 @@ pnpm-debug.log*
 .env.test.local
 .env.production.local
 
-# CLIO
+# CLIO AI Assistant
+ai-assisted/202*
+scratch/
 .clio/logs/
 .clio/sessions/
 .clio/memory/
 .clio/*.json
+
