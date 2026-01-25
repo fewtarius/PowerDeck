@@ -1151,8 +1151,11 @@ class Plugin:
                 self.enable_per_game_profiles = saved_settings["enablePerGameProfiles"]
                 debug_log(f"Migrated enablePerGameProfiles setting: {self.enable_per_game_profiles}")
                 
-            # Mark migration as complete by clearing old settings
-            self.settings.set("powerDeckSettings", {})
+            # Mark migration as complete by clearing only migrated fields, preserve others
+            # Don't clear rogAllyNativeTdpEnabled and other persistent settings
+            remaining_settings = {k: v for k, v in saved_settings.items() 
+                                 if k in ["rogAllyNativeTdpEnabled", "enablePerGameProfiles"]}
+            self.settings.set("powerDeckSettings", remaining_settings)
             debug_log("Migration completed, cleared old settings")
             
         except Exception as e:
