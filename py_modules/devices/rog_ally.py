@@ -198,6 +198,13 @@ class ROGAllyController:
             success &= self._write_sysfs_value(ARMOURY_FAST_LIMIT, str(fast_limit))
             success &= self._write_sysfs_value(ARMOURY_SUSTAINED_LIMIT, str(sustained_limit))
             success &= self._write_sysfs_value(ARMOURY_STAPM_LIMIT, str(stapm_limit))
+            # Armoury writes are persistent (NVRAM) but NOT live — amd_pmf (AMD
+            # Platform Management Framework) runs a 1s loop that continuously
+            # pushes OEM limits to the SMU, overriding anything written via
+            # ryzenadj.  Reloading amd_pmf forces it to re-read the armoury
+            # values and then hold them indefinitely.  This avoids any polling.
+            if success:
+                self._reload_amd_pmf()
         elif self.wmi_available:
             # Fallback to standard WMI interface (expects milliwatts)
             success &= self._write_sysfs_value(WMI_FAST_LIMIT, fast_mw)
@@ -211,6 +218,30 @@ class ROGAllyController:
             decky_plugin.logger.info(f"ROG Ally power limits set: Fast={fast_limit}W, Sustained={sustained_limit}W, STAPM={stapm_limit}W")
         
         return success
+
+    def _reload_amd_pmf(self) -> None:
+        """Reload amd_pmf kernel module so it picks up new armoury power limits.
+
+        amd_pmf reads armoury/firmware-attributes at module init and then holds
+        those limits in its 1-second maintenance loop.  Writing to armoury sysfs
+        does NOT update the running PMF instance — a reload is required.
+
+        This is safe: amd_pmf is a non-essential power-tuning module and
+        reloads cleanly in <500ms with no observable side-effects.
+        """
+        try:
+            import subprocess as _sp
+            rmmod = _sp.run(
+                ["pkexec", "/usr/bin/bash", "-c", "rmmod amd_pmf 2>/dev/null; modprobe amd_pmf"],
+                capture_output=True, text=True, timeout=10
+            )
+            if rmmod.returncode == 0:
+                decky_plugin.logger.info("amd_pmf reloaded — PMF will now hold new armoury power limits")
+            else:
+                # Not fatal — ryzenadj in main.py will still apply live limits
+                decky_plugin.logger.warning(f"amd_pmf reload failed (non-fatal): {rmmod.stderr.strip()}")
+        except Exception as e:
+            decky_plugin.logger.warning(f"amd_pmf reload exception (non-fatal): {e}")
     
     def get_power_limits(self) -> Dict[str, Optional[int]]:
         """Get current ROG Ally power limits"""
