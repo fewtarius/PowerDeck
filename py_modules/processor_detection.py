@@ -675,12 +675,16 @@ class ProcessorDetector:
 def get_current_processor_info() -> Dict[str, Any]:
     """Get current processor information and capabilities (CORRECTED)"""
     processor = detect_processor()
-    
+
     return {
         "detected": processor['database_source'] != 'fallback',
         "model": processor['model'],
+        "processor_name": processor['model'],  # Alias used by main.py
         "vendor": processor['vendor'],
         "family": processor['family'],
+        "series": processor.get('series', 'Unknown'),
+        "node_process": processor.get('node_process', 'Unknown'),
+        "form_factor": processor.get('form_factor', 'Unknown'),
         "cores": processor['cores'],
         "threads": processor['threads'],
         "default_tdp": processor['default_tdp'],  # CORRECTED: Now from unified DB

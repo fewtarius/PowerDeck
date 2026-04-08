@@ -45,7 +45,7 @@ class DeviceDetector:
             cpu_vendor=CPUVendor.AMD,
             tdp_method=TDPMethod.STEAM_DECK,
             min_tdp=3,
-            max_tdp=20,
+            max_tdp=25,
             scaling_driver=ScalingDriver.AMD_PSTATE_EPP,
             supports_gpu_control=True,
             supports_epp=True,
@@ -115,14 +115,59 @@ class DeviceDetector:
             cpu_vendor=CPUVendor.AMD,
             tdp_method=TDPMethod.RYZENADJ,
             min_tdp=5,
-            max_tdp=25,
+            max_tdp=54,
             scaling_driver=ScalingDriver.AMD_PSTATE_EPP,
             supports_gpu_control=True,
             supports_epp=True,
-            gpu_frequency_range=(400, 2700)
+            gpu_frequency_range=(400, 2700)   # Pre-2025 models (6900HX/7745HX)
         )
-        
-        # AYANEO 2S  
+
+        # ASUS ROG Flow Z13 (2025) — GZ302, AMD Ryzen AI Max+ 395 (Strix Halo, 40 CU)
+        # DMI product_name: "GZ302*", sys_vendor: "ASUSTeK COMPUTER INC."
+        # cTDP: 45W–120W; sweet spot 55–70W confirmed on hardware
+        profiles['flow_z13_2025'] = DeviceProfile(
+            name="ASUS ROG Flow Z13 (2025)",
+            cpu_vendor=CPUVendor.AMD,
+            tdp_method=TDPMethod.RYZENADJ,
+            min_tdp=15,
+            max_tdp=120,
+            scaling_driver=ScalingDriver.AMD_PSTATE_EPP,
+            supports_gpu_control=True,
+            supports_epp=True,
+            gpu_frequency_range=(400, 2900),   # Radeon 8060S: up to 2.9 GHz SCLK
+            device_specific_features={
+                'handheld_device': False,
+                'ac_power_detection': True,
+                'thermal_protection': True,
+                'fclk_control': True,
+                'nvme_power_control': True,
+                'platform_profile': True,
+            }
+        )
+
+        # AYANEO FLIP KB / FLIP DS / FLIP 1S — Ryzen 7 7840U / Radeon 780M 12 CU
+        # DMI sys_vendor: "AYANEO", product_name: "FLIP KB", "FLIP-KB", "FLIP DS", "FLIP 1S"
+        # Confirmed SMU ceiling: STAPM 30W, fast-limit 45W, slow-limit 43W
+        profiles['ayaneo_flip_kb'] = DeviceProfile(
+            name="AYANEO FLIP KB",
+            cpu_vendor=CPUVendor.AMD,
+            tdp_method=TDPMethod.RYZENADJ,
+            min_tdp=5,
+            max_tdp=30,
+            scaling_driver=ScalingDriver.AMD_PSTATE_EPP,
+            supports_gpu_control=True,
+            supports_epp=True,
+            gpu_frequency_range=(800, 2700),   # Min 800MHz avoids low-clock stutter
+            device_specific_features={
+                'handheld_device': True,
+                'ac_power_detection': True,
+                'thermal_protection': True,
+                'fclk_control': True,
+                'nvme_power_control': True,
+            }
+        )
+
+        # AYANEO 2S
         profiles['ayaneo_2s'] = DeviceProfile(
             name="AYANEO 2S",
             cpu_vendor=CPUVendor.AMD,
@@ -272,6 +317,11 @@ class DeviceDetector:
                     return 'rog_ally'
                 elif 'gv301' in product_name or 'flow z13' in product_name:
                     return 'flow_z13'
+
+            # ASUS Flow Z13 2025 (GZ302) — must check before generic flow_z13
+            if 'asus' in sys_vendor:
+                if 'gz302' in product_name:
+                    return 'flow_z13_2025'
             
             # Lenovo devices
             if 'lenovo' in sys_vendor:
@@ -282,7 +332,9 @@ class DeviceDetector:
             if 'ayaneo' in sys_vendor:
                 if '2s' in product_name or 'ayaneo 2s' in product_name:
                     return 'ayaneo_2s'
-                # Other AYANEO models
+                if any(x in product_name for x in ['flip kb', 'flip-kb', 'flip ds', 'flip-ds', 'flip 1s', 'flip1s']):
+                    return 'ayaneo_flip_kb'
+                # Other AYANEO models — conservative fallback
                 return 'ayaneo_generic'
             
             return None
@@ -414,7 +466,8 @@ class DeviceManager:
         """Check if device is a handheld"""
         # For now, consider specific known handhelds
         device_id = self.detector.detect_device()
-        handheld_devices = ['steam_deck', 'rog_ally', 'rog_ally_x', 'legion_go', 'flow_z13', 'ayaneo_2s', 'ayaneo_generic']
+        handheld_devices = ['steam_deck', 'rog_ally', 'rog_ally_x', 'legion_go',
+                            'flow_z13', 'flow_z13_2025', 'ayaneo_2s', 'ayaneo_flip_kb', 'ayaneo_generic']
         return device_id in handheld_devices
     
     def get_tdp_limits(self) -> tuple:

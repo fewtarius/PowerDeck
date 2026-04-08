@@ -1347,9 +1347,11 @@ class Plugin:
                     # Check if ROG Ally native TDP support is enabled
                     if self.rog_ally_native_tdp_enabled:
                         # Use ROG Ally native TDP control
-                        success = self.device_controller.set_power_limits(tdp, tdp, tdp)
+                        fast_limit = min(tdp + 15, 45)
+                        slow_limit = min(int(tdp * 1.25), 43)
+                        success = self.device_controller.set_power_limits(fast_limit, slow_limit, tdp)
                         if success:
-                            decky.logger.info(f"TDP set to {tdp}W via ROG Ally native controller")
+                            decky.logger.info(f"TDP set: sustained={tdp}W fast={fast_limit}W slow={slow_limit}W via ROG Ally native controller")
                         else:
                             decky.logger.warning(f"ROG Ally native TDP control failed, falling back to PowerDeck TDP")
                     else:
@@ -1358,9 +1360,11 @@ class Plugin:
                         success = False  # Force fallback to generic PowerDeck TDP
                 elif self.device_type == "legion":
                     # Legion WMI control
-                    success = self.device_controller.set_power_limits_wmi(tdp, tdp, tdp)
+                    fast_limit = min(tdp + 15, 45)
+                    slow_limit = min(int(tdp * 1.25), 43)
+                    success = self.device_controller.set_power_limits_wmi(fast_limit, slow_limit, tdp)
                     if success:
-                        decky.logger.info(f"TDP set to {tdp}W via {self.device_type} controller")
+                        decky.logger.info(f"TDP set: sustained={tdp}W fast={fast_limit}W slow={slow_limit}W via {self.device_type} controller")
                     else:
                         decky.logger.warning(f"{self.device_type} TDP control failed, falling back to generic")
                 elif self.device_type == "steam_deck":
@@ -1434,26 +1438,58 @@ class Plugin:
             return False
 
     async def set_amd_tdp(self, tdp: int) -> bool:
-        """Set AMD TDP using ryzenadj"""
+        """Set AMD TDP using ryzenadj with tiered burst limits.
+
+        STAPM (sustained) is set to `tdp`. fast_limit and slow_limit are
+        allowed to burst above STAPM, up to hardware-confirmed ceilings.
+        Values are read from the processor database when available and
+        fall back to conservative defaults safe for any AMD handheld/laptop.
+
+        Burst headroom formula:
+          fast_limit  = min(tdp_mw + burst_delta_mw, fast_max_mw)
+          slow_limit  = min(tdp_mw * 1.25,           slow_max_mw)
+        """
         try:
             if not self.ryzenadj_path:
                 decky.logger.error("ryzenadj not available")
                 return False
-            
-            tdp_milliwatts = tdp * 1000
-            
+
+            tdp_mw = tdp * 1000
+
+            # Pull burst ceilings from processor database if available
+            fast_max_mw   = 45000  # Conservative default (7840U / Z1E confirmed)
+            slow_max_mw   = 43000  # Conservative default
+            burst_delta_mw = 15000  # Default headroom above STAPM for fast burst
+
+            if self.processor_info:
+                db_fast = self.processor_info.get('tdp_fast_limit_max')
+                db_slow = self.processor_info.get('tdp_slow_limit_max')
+                db_delta = self.processor_info.get('tdp_burst_delta')
+                if db_fast:
+                    fast_max_mw = db_fast * 1000
+                if db_slow:
+                    slow_max_mw = db_slow * 1000
+                if db_delta:
+                    burst_delta_mw = db_delta * 1000
+
+            fast_limit_mw = min(tdp_mw + burst_delta_mw, fast_max_mw)
+            slow_limit_mw = min(int(tdp_mw * 1.25), slow_max_mw)
+
             cmd = [
                 self.ryzenadj_path,
-                '--stapm-limit', str(tdp_milliwatts),
-                '--fast-limit', str(tdp_milliwatts),
-                '--slow-limit', str(tdp_milliwatts),
+                '--stapm-limit', str(tdp_mw),
+                '--fast-limit',  str(fast_limit_mw),
+                '--slow-limit',  str(slow_limit_mw),
                 '--tctl-temp', '95',
                 '--apu-skin-temp', '95'
             ]
-            
+
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             if result.returncode == 0:
-                decky.logger.info(f"AMD TDP set successfully via ryzenadj")
+                decky.logger.info(
+                    f"AMD TDP set: sustained={tdp}W "
+                    f"fast={fast_limit_mw // 1000}W slow={slow_limit_mw // 1000}W"
+                )
                 return True
             else:
                 decky.logger.error(f"ryzenadj failed: {result.stderr}")
@@ -2341,7 +2377,7 @@ class Plugin:
                     "smt": True,
                     "cpuCores": max_cores,  # Use processor max cores
                     "governor": "powersave",  # Always use powersave for efficiency
-                    "epp": "balance_power"  # Conservative EPP setting
+                    "epp": "balance_performance"  # AC: favour responsiveness over pure efficiency
                 }
             else:
                 # Battery Power: Maximum power efficiency profile (matching SimpleDeckyTDP efficiency)
@@ -2411,7 +2447,7 @@ class Plugin:
         try:
             decky.logger.info(f"=== APPLYING POWER PROFILE ===")
             decky.logger.info(f"Profile data: {profile_data}")
-            
+
             success_count = 0
             total_operations = 0
             
@@ -2471,7 +2507,9 @@ class Plugin:
             if "governor" in profile_data or "powerGovernor" in profile_data or "epp" in profile_data:
                 # Handle both old "powerGovernor" and new "governor" field names
                 governor = profile_data.get("governor") or profile_data.get("powerGovernor", "powersave")
-                epp = profile_data.get("epp", "balance_power")
+                # Default EPP depends on whether we're on AC or battery
+                _default_epp = "balance_performance" if getattr(self, "ac_power", True) else "balance_power"
+                epp = profile_data.get("epp", _default_epp)
                 
                 # Set governor if present
                 if "governor" in profile_data or "powerGovernor" in profile_data:
@@ -2567,7 +2605,45 @@ class Plugin:
                         decky.logger.warning("Failed to apply PCIe ASPM")
                 except Exception as e:
                     decky.logger.error(f"Error applying PCIe ASPM: {e}")
-            
+
+            # Apply FCLK pinning for gaming profiles on supported AMD devices
+            # Keeps GPU memory fabric clock at max state to reduce iGPU latency
+            is_gaming_profile = profile_data.get("tdp", 0) >= 15 or profile_data.get("fclkGaming", False)
+            if is_gaming_profile and self.device_info.get("cpu_vendor") == "AMD":
+                total_operations += 1
+                try:
+                    fclk_success = await self._set_fclk_gaming()
+                    if fclk_success:
+                        success_count += 1
+                        decky.logger.info("Applied FCLK gaming pin")
+                    else:
+                        decky.logger.debug("FCLK pinning not available on this device (non-fatal)")
+                        total_operations -= 1  # Don't penalise success rate
+                except Exception as e:
+                    decky.logger.debug(f"FCLK pin skipped: {e}")
+                    total_operations -= 1
+
+            # Disable NVMe runtime power management for gaming profiles
+            # Prevents 2-30ms latency spikes on asset loads caused by NVMe autosuspend
+            if is_gaming_profile:
+                total_operations += 1
+                try:
+                    nvme_success = await self._set_nvme_gaming()
+                    if nvme_success:
+                        success_count += 1
+                        decky.logger.info("Applied NVMe gaming power mode (autosuspend disabled)")
+                    else:
+                        decky.logger.debug("NVMe power control not available (non-fatal)")
+                        total_operations -= 1
+                except Exception as e:
+                    decky.logger.debug(f"NVMe gaming power skipped: {e}")
+                    total_operations -= 1
+
+            # Restore power-saving settings for low-TDP / battery profiles
+            if not is_gaming_profile:
+                await self._restore_fclk_auto()
+                await self._restore_nvme_power_save()
+
             # Calculate success rate
             if total_operations > 0:
                 success_rate = success_count / total_operations
@@ -2579,6 +2655,162 @@ class Plugin:
                 
         except Exception as e:
             decky.logger.error(f"Failed to apply profile: {e}")
+            return False
+
+    # ---------------------------------------------------------------------------
+    # FCLK and NVMe power helpers
+    # ---------------------------------------------------------------------------
+
+    async def _set_fclk_gaming(self) -> bool:
+        """Ensure DPM is in 'auto' mode so FCLK scales under GPU load.
+
+        On RDNA3 APUs (Phoenix/Hawk Point/Strix) the Infinity Fabric clock
+        (FCLK) controls iGPU memory bandwidth. In 'auto' DPM mode the kernel
+        scales FCLK to ~1200 MHz under load (3× the 400 MHz idle floor).
+
+        IMPORTANT — do NOT use 'manual' DPM mode for FCLK pinning:
+          • pp_dpm_fclk state indices are REVERSED on Phoenix (write "0" =
+            highest freq, write "3" = lowest). The kernel accepts the write
+            silently but pins to the wrong state.
+          • 'manual' mode also freezes SCLK (shader clock) at its current
+            idle level, preventing the GPU from clocking up under load.
+          • Pinning FCLK to 1875 MHz (the max on Z1E/7840U) causes HIP
+            illegal-memory-access crashes at TDP ≤ 24 W — the memory
+            controller cannot sustain that frequency within the power budget.
+
+        The 'auto' DPM mode gives 1200 MHz FCLK + dynamic SCLK, which
+        benchmarks ~2.7× faster than the broken 400 MHz manual-mode pin.
+
+        Returns False gracefully if the sysfs paths don't exist.
+        """
+        try:
+            dpm_level_path = None
+            fclk_path = None
+            for card in sorted(os.listdir('/sys/class/drm')):
+                candidate = f'/sys/class/drm/{card}/device/pp_dpm_fclk'
+                if os.path.exists(candidate):
+                    fclk_path = candidate
+                    dpm_level_path = os.path.join(
+                        os.path.dirname(candidate),
+                        'power_dpm_force_performance_level')
+                    break
+
+            if not fclk_path or not dpm_level_path:
+                return False  # Not supported on this device
+
+            # Read current DPM level
+            with open(dpm_level_path, 'r') as f:
+                current_level = f.read().strip()
+
+            # If already in auto mode, nothing to do
+            if current_level == 'auto':
+                decky.logger.debug("FCLK gaming: DPM already in auto mode")
+            else:
+                # Switch to auto — kernel handles FCLK/SCLK scaling properly
+                with open(dpm_level_path, 'w') as f:
+                    f.write('auto\n')
+                decky.logger.info(
+                    f"FCLK gaming: switched DPM from '{current_level}' to 'auto' "
+                    f"via {dpm_level_path}")
+
+            # Verify FCLK actually scaled up (non-blocking check)
+            import time as _time
+            _time.sleep(0.5)
+            with open(fclk_path, 'r') as f:
+                for line in f:
+                    if '*' in line:
+                        freq = line.split(':')[1].strip().split()[0]
+                        decky.logger.info(f"FCLK active: {freq}")
+                        break
+
+            return True
+
+        except PermissionError:
+            decky.logger.warning("FCLK gaming failed: permission denied (need root)")
+            return False
+        except Exception as e:
+            decky.logger.debug(f"FCLK gaming not available: {e}")
+            return False
+
+    async def _restore_fclk_auto(self) -> bool:
+        """Restore FCLK to automatic DPM control (battery/idle profiles)."""
+        try:
+            for card in sorted(os.listdir('/sys/class/drm')):
+                dpm_path = f'/sys/class/drm/{card}/device/power_dpm_force_performance_level'
+                if os.path.exists(dpm_path):
+                    with open(dpm_path, 'w') as f:
+                        f.write('auto\n')
+                    decky.logger.debug(f"FCLK restored to auto via {dpm_path}")
+                    return True
+            return False
+        except Exception as e:
+            decky.logger.debug(f"FCLK restore skipped: {e}")
+            return False
+
+    async def _set_nvme_gaming(self) -> bool:
+        """Disable NVMe runtime power management for gaming.
+
+        Boot quirks (e.g. 003-powersaving on SteamFork/SteamOS) enable runtime
+        PM on NVMe drives, causing 2-30ms latency spikes when the drive wakes
+        from autosuspend during asset loads. Setting /power/control to 'on'
+        prevents the drive from suspending during active gaming.
+
+        Uses generic PCI class 0x010802 discovery — works on all Linux devices.
+        Returns False gracefully if no controllable NVMe devices are found.
+        """
+        try:
+            import glob as _glob
+            controlled = 0
+            for power_ctrl in _glob.glob('/sys/bus/pci/devices/*/power/control'):
+                class_path = os.path.join(
+                    os.path.dirname(os.path.dirname(power_ctrl)), 'class'
+                )
+                if not os.path.exists(class_path):
+                    continue
+                with open(class_path, 'r') as f:
+                    pci_class = f.read().strip()
+                if pci_class.lower() != '0x010802':
+                    continue
+                with open(power_ctrl, 'w') as f:
+                    f.write('on\n')
+                controlled += 1
+                decky.logger.debug(
+                    f"NVMe autosuspend disabled: "
+                    f"{os.path.dirname(os.path.dirname(power_ctrl))}"
+                )
+            return controlled > 0
+        except PermissionError:
+            decky.logger.warning("NVMe power control failed: permission denied")
+            return False
+        except Exception as e:
+            decky.logger.debug(f"NVMe gaming power not available: {e}")
+            return False
+
+    async def _restore_nvme_power_save(self) -> bool:
+        """Re-enable NVMe runtime PM for battery/idle profiles."""
+        try:
+            import glob as _glob
+            restored = 0
+            for power_ctrl in _glob.glob('/sys/bus/pci/devices/*/power/control'):
+                class_path = os.path.join(
+                    os.path.dirname(os.path.dirname(power_ctrl)), 'class'
+                )
+                if not os.path.exists(class_path):
+                    continue
+                with open(class_path, 'r') as f:
+                    pci_class = f.read().strip()
+                if pci_class.lower() != '0x010802':
+                    continue
+                with open(power_ctrl, 'w') as f:
+                    f.write('auto\n')
+                restored += 1
+                decky.logger.debug(
+                    f"NVMe autosuspend re-enabled: "
+                    f"{os.path.dirname(os.path.dirname(power_ctrl))}"
+                )
+            return restored > 0
+        except Exception as e:
+            decky.logger.debug(f"NVMe power save restore skipped: {e}")
             return False
 
     async def get_cpu_limits(self) -> Dict[str, int]:

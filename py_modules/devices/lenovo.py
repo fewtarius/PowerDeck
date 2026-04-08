@@ -256,7 +256,14 @@ def set_tdp(tdp: int) -> bool:
     """Set Legion TDP (convenience function)"""
     controller = get_legion_controller()
     if controller.wmi_available:
-        return controller.set_power_limits_wmi(tdp, tdp, tdp)
+        # Tiered burst limits: fast > slow > stapm for better responsiveness
+        # Z1 Extreme ceiling: fast 45W, slow 43W (confirmed hardware values)
+        fast_limit  = min(tdp + 15, 45)
+        slow_limit  = min(int(tdp * 1.25), 43)
+        decky_plugin.logger.info(
+            f"Legion TDP: sustained={tdp}W fast={fast_limit}W slow={slow_limit}W"
+        )
+        return controller.set_power_limits_wmi(fast_limit, slow_limit, tdp)
     else:
         decky_plugin.logger.error("Legion WMI TDP control not available")
         return False

@@ -19,6 +19,10 @@ __pycache__/
 *.swo
 *~
 
+# AI-assisted working docs (not for source control)
+PERFORMANCE_IMPROVEMENTS.md
+ai-assisted/
+
 # OS files
 .DS_Store
 Thumbs.db
@@ -38,8 +42,7 @@ pnpm-debug.log*
 # CLIO AI Assistant
 ai-assisted/202*
 scratch/
-.clio/logs/
-.clio/sessions/
-.clio/memory/
-.clio/*.json
 
+# CLIO (managed automatically)
+.clio/*
+!.clio/instructions.md

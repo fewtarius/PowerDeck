@@ -720,8 +720,14 @@ def get_rog_ally_controller():
 def set_tdp(tdp: int) -> bool:
     """Set ROG Ally TDP (convenience function)"""
     controller = get_rog_ally_controller()
-    # Set all power limits to TDP value for simplicity
-    return controller.set_power_limits(tdp, tdp, tdp)
+    # Tiered burst limits: fast > slow > stapm for better responsiveness
+    # Z1 Extreme ceiling: fast 45W, slow 43W (confirmed hardware values)
+    fast_limit  = min(tdp + 15, 45)
+    slow_limit  = min(int(tdp * 1.25), 43)
+    decky_plugin.logger.info(
+        f"ROG Ally TDP: sustained={tdp}W fast={fast_limit}W slow={slow_limit}W"
+    )
+    return controller.set_power_limits(fast_limit, slow_limit, tdp)
 
 def get_current_tdp() -> Optional[int]:
     """Get current ROG Ally TDP (convenience function)"""
