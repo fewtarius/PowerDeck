@@ -5890,7 +5890,17 @@ async def get_rog_ally_power_limits() -> Dict[str, Optional[int]]:
 async def set_rog_ally_platform_profile(profile: str) -> bool:
     """Set ROG Ally platform profile (frontend callable)"""
     decky.logger.info(f"GLOBAL FUNCTION: set_rog_ally_platform_profile({profile})")
-    return await plugin.set_rog_ally_platform_profile(profile)
+    if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
+        try:
+            result = plugin.device_controller.set_platform_profile(profile)
+            decky.logger.info(f"set_rog_ally_platform_profile result: {result}")
+            return result
+        except Exception as e:
+            decky.logger.error(f"set_rog_ally_platform_profile failed: {e}")
+            return False
+    else:
+        decky.logger.warning("set_rog_ally_platform_profile: Not a ROG Ally device")
+        return False
 
 async def get_rog_ally_platform_profile() -> Optional[str]:
     """Get current ROG Ally platform profile (frontend callable)"""
