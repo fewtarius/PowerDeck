@@ -1346,18 +1346,25 @@ class Plugin:
                 if self.device_type == "rog_ally":
                     # Check if ROG Ally native TDP support is enabled
                     if self.rog_ally_native_tdp_enabled:
-                        # Use ROG Ally native TDP control
+                        # Use ROG Ally native TDP control (armoury sysfs - persistent but non-live)
                         fast_limit = min(tdp + 15, 45)
                         slow_limit = min(int(tdp * 1.25), 43)
-                        success = self.device_controller.set_power_limits(fast_limit, slow_limit, tdp)
-                        if success:
+                        native_success = self.device_controller.set_power_limits(fast_limit, slow_limit, tdp)
+                        if native_success:
                             decky.logger.info(f"TDP set: sustained={tdp}W fast={fast_limit}W slow={slow_limit}W via ROG Ally native controller")
                         else:
                             decky.logger.warning(f"ROG Ally native TDP control failed, falling back to PowerDeck TDP")
-                    else:
-                        # Use PowerDeck TDP control (skip device controller)
-                        decky.logger.info(f"Using PowerDeck TDP control (ROG Ally native disabled)")
-                        success = False  # Force fallback to generic PowerDeck TDP
+                        # ALWAYS also apply via ryzenadj for immediate/live effect.
+                        # Armoury writes are persistent but only take effect at firmware init,
+                        # not at runtime.  ryzenadj writes via /dev/mem and is effective
+                        # immediately.  Both paths are kept: armoury for persistence,
+                        # ryzenadj for live application.
+                        live_success = await self.set_amd_tdp(tdp)
+                        if live_success:
+                            decky.logger.info(f"TDP applied live via ryzenadj: {tdp}W")
+                        else:
+                            decky.logger.warning(f"ryzenadj live TDP apply failed for {tdp}W")
+                        success = native_success or live_success
                 elif self.device_type == "legion":
                     # Legion WMI control
                     fast_limit = min(tdp + 15, 45)
