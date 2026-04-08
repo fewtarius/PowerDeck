@@ -209,21 +209,22 @@ def find_processor_by_exact_name(model_name: str) -> Optional[Dict[str, Any]]:
             return processor
     
     # Try substring matches
+    # Track best-scoring match instead of returning first 70%+ hit.
+    # This prevents "AMD Ryzen Z1 Extreme" from matching "AMD Ryzen AI Z2 Extreme"
+    # (3/4 match) before finding "AMD Ryzen Z1 Extreme" (4/4 match) simply
+    # because the wrong entry appears earlier in the database.
+    model_parts = model_lower.split()
+    threshold = len(model_parts) * 0.7
+    best_match = None
+    best_score = 0
     for processor in _PROCESSOR_DATABASE:
         proc_name_lower = processor['name'].lower()
-        
-        # Check if key parts of the model name are in processor name
-        model_parts = model_lower.split()
-        matches = 0
-        for part in model_parts:
-            if part in proc_name_lower:
-                matches += 1
-        
-        # If most parts match, consider it a match
-        if matches >= len(model_parts) * 0.7:
-            return processor
+        matches = sum(1 for part in model_parts if part in proc_name_lower)
+        if matches >= threshold and matches > best_score:
+            best_score = matches
+            best_match = processor
     
-    return None
+    return best_match
 
 def get_processor_info(cpu_model_override: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """

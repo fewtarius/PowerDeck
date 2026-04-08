@@ -2609,6 +2609,33 @@ class Plugin:
             # Apply FCLK pinning for gaming profiles on supported AMD devices
             # Keeps GPU memory fabric clock at max state to reduce iGPU latency
             is_gaming_profile = profile_data.get("tdp", 0) >= 15 or profile_data.get("fclkGaming", False)
+
+            # Apply ROG Ally platform profile (e.g. low-power / balanced / performance)
+            if "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally":
+                total_operations += 1
+                try:
+                    pp_success = await self.set_rog_ally_platform_profile(profile_data["platformProfile"])
+                    if pp_success:
+                        success_count += 1
+                        decky.logger.info(f"Applied ROG Ally platform profile: {profile_data['platformProfile']}")
+                    else:
+                        decky.logger.warning(f"Failed to apply ROG Ally platform profile: {profile_data['platformProfile']}")
+                except Exception as e:
+                    decky.logger.error(f"Error applying ROG Ally platform profile: {e}")
+
+            # Apply ROG Ally thermal throttle policy
+            if "thermalPolicy" in profile_data and getattr(self, 'device_type', None) == "rog_ally":
+                total_operations += 1
+                try:
+                    tp_success = await self.set_rog_ally_thermal_throttle_policy(profile_data["thermalPolicy"])
+                    if tp_success:
+                        success_count += 1
+                        decky.logger.info(f"Applied ROG Ally thermal policy: {profile_data['thermalPolicy']}")
+                    else:
+                        decky.logger.warning(f"Failed to apply ROG Ally thermal policy: {profile_data['thermalPolicy']}")
+                except Exception as e:
+                    decky.logger.error(f"Error applying ROG Ally thermal policy: {e}")
+
             if is_gaming_profile and self.device_info.get("cpu_vendor") == "AMD":
                 total_operations += 1
                 try:
@@ -5270,6 +5297,101 @@ class Plugin:
                 return False
         except Exception as e:
             decky.logger.error(f"Plugin.set_rog_ally_mcu_powersave failed: {e}")
+            return False
+
+    # =========================================================================
+    # ROG Ally Setter Methods (Plugin class - callable by frontend)
+    # NOTE: Decky ONLY dispatches callable() calls to Plugin class methods.
+    # Global functions at the bottom of this file are dead code and never called.
+    # =========================================================================
+
+    async def set_rog_ally_platform_profile(self, profile: str) -> bool:
+        """Set ROG Ally platform profile - Plugin class method"""
+        decky.logger.info(f"PLUGIN METHOD: set_rog_ally_platform_profile({profile})")
+        try:
+            if not (hasattr(self, 'device_controller') and self.device_controller):
+                decky.logger.warning("set_rog_ally_platform_profile: No device_controller")
+                return False
+            if not hasattr(self.device_controller, 'set_platform_profile'):
+                decky.logger.warning("set_rog_ally_platform_profile: device_controller has no set_platform_profile")
+                return False
+            # Frontend sends 'power-saver'; sysfs expects 'low-power'
+            translated = "low-power" if profile == "power-saver" else profile
+            if translated != profile:
+                decky.logger.info(f"set_rog_ally_platform_profile: translated '{profile}' -> '{translated}'")
+            result = self.device_controller.set_platform_profile(translated)
+            decky.logger.info(f"Plugin.set_rog_ally_platform_profile({translated}): {result}")
+            return result
+        except Exception as e:
+            decky.logger.error(f"Plugin.set_rog_ally_platform_profile failed: {e}")
+            return False
+
+    async def set_rog_ally_thermal_throttle_policy(self, policy: int) -> bool:
+        """Set ROG Ally thermal throttle policy - Plugin class method"""
+        decky.logger.info(f"PLUGIN METHOD: set_rog_ally_thermal_throttle_policy({policy})")
+        try:
+            if not (hasattr(self, 'device_controller') and self.device_controller):
+                decky.logger.warning("set_rog_ally_thermal_throttle_policy: No device_controller")
+                return False
+            if not hasattr(self.device_controller, 'set_thermal_throttle_policy'):
+                decky.logger.warning("set_rog_ally_thermal_throttle_policy: device_controller missing method")
+                return False
+            result = self.device_controller.set_thermal_throttle_policy(policy)
+            decky.logger.info(f"Plugin.set_rog_ally_thermal_throttle_policy({policy}): {result}")
+            return result
+        except Exception as e:
+            decky.logger.error(f"Plugin.set_rog_ally_thermal_throttle_policy failed: {e}")
+            return False
+
+    async def set_rog_ally_fan_mode(self, fan_id: int, mode: int) -> bool:
+        """Set ROG Ally fan mode - Plugin class method"""
+        decky.logger.info(f"PLUGIN METHOD: set_rog_ally_fan_mode(fan_id={fan_id}, mode={mode})")
+        try:
+            if not (hasattr(self, 'device_controller') and self.device_controller):
+                decky.logger.warning("set_rog_ally_fan_mode: No device_controller")
+                return False
+            if not hasattr(self.device_controller, 'set_fan_mode'):
+                decky.logger.warning("set_rog_ally_fan_mode: device_controller missing method")
+                return False
+            result = self.device_controller.set_fan_mode(fan_id, mode)
+            decky.logger.info(f"Plugin.set_rog_ally_fan_mode({fan_id}, {mode}): {result}")
+            return result
+        except Exception as e:
+            decky.logger.error(f"Plugin.set_rog_ally_fan_mode failed: {e}")
+            return False
+
+    async def set_rog_ally_power_limits(self, fast_limit: int, sustained_limit: int, stapm_limit: int) -> bool:
+        """Set ROG Ally power limits - Plugin class method"""
+        decky.logger.info(f"PLUGIN METHOD: set_rog_ally_power_limits(fast={fast_limit}, sustained={sustained_limit}, stapm={stapm_limit})")
+        try:
+            if not (hasattr(self, 'device_controller') and self.device_controller):
+                decky.logger.warning("set_rog_ally_power_limits: No device_controller")
+                return False
+            if not hasattr(self.device_controller, 'set_power_limits'):
+                decky.logger.warning("set_rog_ally_power_limits: device_controller missing method")
+                return False
+            result = self.device_controller.set_power_limits(fast_limit, sustained_limit, stapm_limit)
+            decky.logger.info(f"Plugin.set_rog_ally_power_limits: {result}")
+            return result
+        except Exception as e:
+            decky.logger.error(f"Plugin.set_rog_ally_power_limits failed: {e}")
+            return False
+
+    async def set_rog_ally_battery_charge_limit(self, limit: int) -> bool:
+        """Set ROG Ally battery charge limit - Plugin class method"""
+        decky.logger.info(f"PLUGIN METHOD: set_rog_ally_battery_charge_limit({limit})")
+        try:
+            if not (hasattr(self, 'device_controller') and self.device_controller):
+                decky.logger.warning("set_rog_ally_battery_charge_limit: No device_controller")
+                return False
+            if not hasattr(self.device_controller, 'set_battery_charge_limit'):
+                decky.logger.warning("set_rog_ally_battery_charge_limit: device_controller missing method")
+                return False
+            result = self.device_controller.set_battery_charge_limit(limit)
+            decky.logger.info(f"Plugin.set_rog_ally_battery_charge_limit({limit}): {result}")
+            return result
+        except Exception as e:
+            decky.logger.error(f"Plugin.set_rog_ally_battery_charge_limit failed: {e}")
             return False
 
     # =========================================================================
