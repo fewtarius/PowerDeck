@@ -189,6 +189,9 @@ class Plugin:
         self.staged_update_info = None
         self.staged_update_path = None
         self.update_staging_dir = "/tmp/powerdeck_staged_update"
+        # Backend game detection / profile auto-apply
+        self.game_monitor_task = None
+        self._last_detected_game_id: Optional[str] = None
         
     def log_warning_once(self, message: str):
         """Log a warning message only once to prevent spam"""
@@ -255,6 +258,10 @@ class Plugin:
                 
                 # Start background update checking task (non-blocking)
                 self.background_update_task = asyncio.create_task(self.background_update_checker())
+
+                # Start backend game detection loop (applies profiles without needing menu open)
+                self.game_monitor_task = asyncio.create_task(self.game_monitor())
+                decky.logger.info("Backend game detection loop started")
                 
                 decky.logger.info(f"PowerDeck initialized for device: {self.device_info['device_name']}")
             except Exception as e:
@@ -280,6 +287,12 @@ class Plugin:
                 decky.logger.info("Background update checker cancelled")
             except Exception as e:
                 decky.logger.error(f"Error cancelling background update checker: {e}")
+        if self.game_monitor_task:
+            try:
+                self.game_monitor_task.cancel()
+                decky.logger.info("Game monitor task cancelled")
+            except Exception as e:
+                decky.logger.error(f"Error cancelling game monitor task: {e}")
         
     async def _uninstall(self):
         decky.logger.info("PowerDeck uninstalling...")
@@ -4808,6 +4821,80 @@ class Plugin:
 
     async def background_update_checker(self):
         """Background task to periodically check for updates"""
+
+    async def game_monitor(self):
+        """Backend game detection loop.
+
+        Polls for the currently running Steam game every 5 seconds and
+        auto-applies the matching power profile — without requiring the
+        PowerDeck quick-access menu to be open.
+
+        Detection method: look for the Steam Reaper process whose cmdline
+        contains 'SteamLaunch AppId=<id>' (same approach as SimpleDeckyTDP).
+        Returns '00000000' when no game is running (desktop/handheld mode).
+        """
+        import re as _re
+        import subprocess as _sp
+        POLL_INTERVAL = 5  # seconds
+        try:
+            while True:
+                await asyncio.sleep(POLL_INTERVAL)
+                try:
+                    # Detect running Steam game via process list
+                    result = _sp.run(
+                        ["ps", "aux"],
+                        capture_output=True, text=True, timeout=3
+                    )
+                    match = _re.search(r'SteamLaunch AppId=(\d+)', result.stdout)
+                    raw_id = match.group(1) if match else "00000000"
+
+                    # Normalise: treat AppId 0 / 1 as desktop/handheld
+                    game_id = raw_id if (match and raw_id not in ("0", "1")) else "00000000"
+
+                    if game_id == self._last_detected_game_id:
+                        continue  # No change — nothing to do
+
+                    prev = self._last_detected_game_id
+                    self._last_detected_game_id = game_id
+
+                    decky.logger.info(
+                        f"Game monitor: game changed {prev!r} -> {game_id!r}, "
+                        f"loading and applying profile"
+                    )
+
+                    # Determine AC/battery suffix via hardware detection
+                    try:
+                        ac = await self.get_ac_power_status()
+                    except Exception:
+                        ac = True  # safe default
+                    suffix = "_ac" if ac else "_battery"
+                    profile_id = game_id + suffix
+
+                    # Load the profile (falls back to 00000000 if game-specific missing)
+                    profile = await self.load_profile(profile_id)
+                    if not profile:
+                        fallback_id = "00000000" + suffix
+                        profile = await self.load_profile(fallback_id)
+                        if profile:
+                            decky.logger.info(
+                                f"Game monitor: no profile for {profile_id}, "
+                                f"using fallback {fallback_id}"
+                            )
+
+                    if profile:
+                        await self.apply_profile(profile)
+                    else:
+                        decky.logger.warning(
+                            f"Game monitor: no profile found for {profile_id} or fallback"
+                        )
+
+                except asyncio.CancelledError:
+                    raise
+                except Exception as poll_err:
+                    decky.logger.warning(f"Game monitor poll error (non-fatal): {poll_err}")
+        except asyncio.CancelledError:
+            decky.logger.info("Game monitor loop cancelled")
+
         try:
             while True:
                 try:
