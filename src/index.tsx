@@ -325,6 +325,8 @@ interface PowerProfile {
   pciePowerManagement?: boolean;
   usbAutosuspend?: boolean;
   pcieAspm?: boolean;
+  platformProfile?: string;
+  thermalPolicy?: number;
 }
 
 interface DeviceInfo {
@@ -769,6 +771,30 @@ const Content: React.FC = () => {
       pcieAspm: profile.pcieAspm ?? false
     };
   }, []);
+
+  // Sync ROG Ally platform profile and thermal policy from a loaded profile to
+  // local state and hardware. No-op when not a ROG Ally or fields not in profile.
+  const syncRogAllySettings = useCallback(async (profile: PowerProfile) => {
+    if (!isRogAlly) return;
+    if (profile.platformProfile !== undefined) {
+      setRogAllyPlatformProfile(profile.platformProfile);
+      try {
+        await setRogAllyPlatformProfileBackend(profile.platformProfile);
+        debug.log(`Profile load: applied ROG Ally platform profile: ${profile.platformProfile}`);
+      } catch (e) {
+        debug.error('Profile load: failed to apply ROG Ally platform profile:', e);
+      }
+    }
+    if (profile.thermalPolicy !== undefined) {
+      setRogAllyThermalPolicy(profile.thermalPolicy);
+      try {
+        await setRogAllyThermalThrottlePolicyBackend(profile.thermalPolicy);
+        debug.log(`Profile load: applied ROG Ally thermal policy: ${profile.thermalPolicy}`);
+      } catch (e) {
+        debug.error('Profile load: failed to apply ROG Ally thermal policy:', e);
+      }
+    }
+  }, [isRogAlly]);
 
   // Helper function to sync USB and PCIe settings from profile to state variables and hardware
   const syncUsbPcieSettings = useCallback(async (profile: PowerProfile) => {
@@ -1215,6 +1241,7 @@ const Content: React.FC = () => {
                       const normalizedProfile = normalizeProfile(defaultProfile);
                       setCurrentProfile(normalizedProfile);
                       await syncUsbPcieSettings(normalizedProfile);
+                      await syncRogAllySettings(normalizedProfile);
                       // FORCE APPLY: Game exit, switching profiles - always re-apply settings
                       await applyProfileQuiet(normalizedProfile, true);
                     }
@@ -1278,6 +1305,7 @@ const Content: React.FC = () => {
               const normalizedProfile = normalizeProfile(newProfile);
               setCurrentProfile(normalizedProfile);
               await syncUsbPcieSettings(normalizedProfile);
+              await syncRogAllySettings(normalizedProfile);
               // FORCE APPLY: AC/battery or game changed, always re-apply settings to hardware
               await applyProfileQuiet(normalizedProfile, true);
               
@@ -1313,6 +1341,7 @@ const Content: React.FC = () => {
               
               setCurrentProfile(defaultProfile);
               await syncUsbPcieSettings(defaultProfile);
+              await syncRogAllySettings(defaultProfile);
               // FORCE APPLY: AC/battery or game changed, always re-apply settings to hardware
               await applyProfileQuiet(defaultProfile, true);
               await setGameProfile(newProfileId, defaultProfileWithMetadata);
@@ -1822,7 +1851,8 @@ const Content: React.FC = () => {
               label=""
               value={(() => {
                 const profiles = ["power-saver", "balanced", "performance"];
-                return profiles.indexOf(rogAllyPlatformProfile) >= 0 ? profiles.indexOf(rogAllyPlatformProfile) : 1;
+                const active = currentProfile.platformProfile ?? rogAllyPlatformProfile;
+                return profiles.indexOf(active) >= 0 ? profiles.indexOf(active) : 1;
               })()}
               min={0}
               max={2}
@@ -1835,6 +1865,7 @@ const Content: React.FC = () => {
                 try {
                   await setRogAllyPlatformProfileBackend(selectedProfile);
                   debug.log(`ROG Ally platform profile set to: ${selectedProfile}`);
+                  updateCurrentProfile({ platformProfile: selectedProfile });
                 } catch (error) {
                   debug.error("Failed to set ROG Ally platform profile:", error);
                 }
@@ -1850,7 +1881,7 @@ const Content: React.FC = () => {
           <PanelSectionRow>
             <SliderWithIcons
               label="Thermal Policy"
-              value={rogAllyThermalPolicy}
+              value={currentProfile.thermalPolicy ?? rogAllyThermalPolicy}
               min={0}
               max={3}
               step={1}
@@ -1860,6 +1891,7 @@ const Content: React.FC = () => {
                 try {
                   await setRogAllyThermalThrottlePolicyBackend(value);
                   debug.log(`ROG Ally thermal policy set to: ${value}`);
+                  updateCurrentProfile({ thermalPolicy: value });
                 } catch (error) {
                   debug.error("Failed to set ROG Ally thermal policy:", error);
                 }
