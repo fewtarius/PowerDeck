@@ -799,7 +799,7 @@ class EnhancedSleepWakeManager:
                 try:
                     with open(events_file, 'r') as f:
                         events = json.load(f)
-                except:
+                except (OSError, json.JSONDecodeError):
                     events = []
             
             events.append(event_dict)

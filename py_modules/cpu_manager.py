@@ -51,7 +51,7 @@ class CPUManager:
                     self._possible_cpus = list(range(start, end + 1))
                 else:
                     self._possible_cpus = [int(possible_range)]
-        except:
+        except (OSError, ValueError):
             # Fallback: scan cpu directories
             cpu_dirs = glob.glob('/sys/devices/system/cpu/cpu[0-9]*')
             self._possible_cpus = sorted([int(d.split('cpu')[-1]) for d in cpu_dirs])
@@ -78,7 +78,7 @@ class CPUManager:
                         original_online_cpus = [int(x) for x in online_range.split(',')]
                     else:
                         original_online_cpus = [int(online_range)]
-            except:
+            except (OSError, ValueError):
                 original_online_cpus = [0]
             
             self.logger.info(f"Original online CPUs: {original_online_cpus}")
@@ -827,7 +827,7 @@ class CPUManager:
         try:
             with open('/sys/devices/system/cpu/smt/active', 'r') as f:
                 return f.read().strip() == '1'
-        except:
+        except OSError:
             # Fallback: check if any CPU has multiple siblings
             if not self._topology_initialized:
                 self.initialize_cpu_topology()

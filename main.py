@@ -1,8 +1,11 @@
 import decky
 import asyncio
-import os
-import sys
+import glob
 import json
+import os
+import re
+import sys
+import traceback
 import psutil
 import subprocess
 import shutil
@@ -62,9 +65,6 @@ def error_log(message: str, *args, **kwargs):
     """Log error messages (always visible)"""
     if DISK_LOGGING_ENABLED:
         decky.logger.error(f"[PowerDeck] {message}", *args, **kwargs)
-
-# Add py_modules to path
-sys.path.append(os.path.join(os.path.dirname(__file__), "py_modules"))
 
 # Import device-specific controllers
 try:
@@ -308,8 +308,8 @@ class Plugin:
                     boost_value = f.read().strip()
                     system_defaults["cpuBoost"] = boost_value == "1"
                     decky.logger.info(f"Detected system default CPU boost: {system_defaults['cpuBoost']}")
-            except:
-                system_defaults["cpuBoost"] = True  # Default to enabled - typical system behavior
+            except (OSError, ValueError):
+                system_defaults["cpuBoost"] = True
                 
             # Detect current SMT state
             try:
@@ -317,8 +317,8 @@ class Plugin:
                     smt_value = f.read().strip()
                     system_defaults["smt"] = smt_value == "on"
                     decky.logger.info(f"Detected system default SMT: {system_defaults['smt']}")
-            except:
-                system_defaults["smt"] = True  # Conservative fallback
+            except (OSError, ValueError):
+                system_defaults["smt"] = True
                 
             # Detect current CPU governor
             try:
@@ -326,8 +326,8 @@ class Plugin:
                     governor = f.read().strip()
                     system_defaults["governor"] = governor
                     decky.logger.info(f"Detected system default governor: {governor}")
-            except:
-                system_defaults["governor"] = "powersave"  # Conservative fallback
+            except (OSError, ValueError):
+                system_defaults["governor"] = "powersave"
                 
             # Detect current EPP setting
             try:
@@ -335,14 +335,13 @@ class Plugin:
                     epp = f.read().strip()
                     system_defaults["epp"] = epp
                     decky.logger.info(f"Detected system default EPP: {epp}")
-            except:
-                system_defaults["epp"] = "balance_performance"  # Conservative fallback
+            except (OSError, ValueError):
+                system_defaults["epp"] = "balance_performance"
                 
             # Detect current online CPU cores
             try:
                 with open("/sys/devices/system/cpu/online", 'r') as f:
                     online_range = f.read().strip()
-                    # Parse "0-11" format
                     if '-' in online_range:
                         max_online = int(online_range.split('-')[-1])
                         online_cores = max_online + 1
@@ -350,8 +349,8 @@ class Plugin:
                         online_cores = 1
                     system_defaults["cpuCores"] = online_cores
                     decky.logger.info(f"Detected system default online cores: {online_cores}")
-            except:
-                system_defaults["cpuCores"] = 8  # Conservative fallback
+            except (OSError, ValueError):
+                system_defaults["cpuCores"] = 8
                 
             decky.logger.info(f"Detected system defaults: {system_defaults}")
             return system_defaults
@@ -418,8 +417,7 @@ class Plugin:
                             self.device_info["min_tdp"] = 4
                             self.device_info["max_tdp"] = 25
                             decky.logger.warning("Using last resort TDP limits: 4W - 25W")
-                    except:
-                        # Absolute final fallback
+                    except Exception:
                         self.tdp_limits = {"min": 4, "max": 25}
                         self.device_info["min_tdp"] = 4
                         self.device_info["max_tdp"] = 25
@@ -447,8 +445,7 @@ class Plugin:
                         if self.current_profile["tdp"] is None:
                             self.current_profile["tdp"] = 15
                         decky.logger.warning("Used absolute fallback TDP limits: 4W - 25W")
-                except:
-                    # Absolute last resort
+                except Exception:
                     self.tdp_limits = {"min": 4, "max": 25}
                     self.device_info["min_tdp"] = 4
                     self.device_info["max_tdp"] = 25
@@ -555,7 +552,7 @@ class Plugin:
                         max_cpu = int(possible_range.split('-')[-1])
                         self.device_info["max_cpu_cores"] = max_cpu + 1
                         decky.logger.info(f"Fallback sysfs detection found {max_cpu + 1} cores")
-                    except:
+                    except (OSError, ValueError):
                         # Try processor database as final attempt before absolute fallback
                         try:
                             if processor_support_available:
@@ -569,8 +566,8 @@ class Plugin:
                             else:
                                 self.device_info["max_cpu_cores"] = 8  # Conservative fallback  
                                 decky.logger.warning("Used conservative fallback: 8 cores")
-                        except:
-                            self.device_info["max_cpu_cores"] = 8  # Absolute last resort
+                        except Exception:
+                            self.device_info["max_cpu_cores"] = 8
                             decky.logger.warning("Used absolute last resort: 8 cores")
             
             # Check for ryzenadj availability
@@ -674,7 +671,7 @@ class Plugin:
         try:
             with open(path, 'r') as f:
                 return f.read().strip()
-        except:
+        except OSError:
             return None
 
     async def get_cpu_vendor(self) -> Optional[str]:
@@ -691,7 +688,7 @@ class Plugin:
                             return "Intel"
                         else:
                             return vendor
-        except:
+        except OSError:
             pass
         return None
 
@@ -795,7 +792,7 @@ class Plugin:
             with open("/proc/net/wireless", "r") as f:
                 lines = f.readlines()
                 return len(lines) > 2  # Header lines + at least one interface
-        except:
+        except OSError:
             return False
 
     async def get_intel_tdp_limits(self) -> Optional[tuple]:
@@ -812,7 +809,7 @@ class Plugin:
                         max_power_uw = int(f.read().strip())
                         max_tdp = max_power_uw // 1000000  # Convert to watts
                         return (4, max_tdp)  # Min 4W, max from hardware
-        except:
+        except (OSError, ValueError):
             pass
         return None
 
@@ -1237,7 +1234,6 @@ class Plugin:
     async def save_profile(self, profile_data: Dict[str, Any]) -> bool:
         """Save a power profile to individual JSON file per profile ID"""
         try:
-            import traceback
             import sys
             import os
             import json
@@ -1281,7 +1277,6 @@ class Plugin:
             return True
         except Exception as e:
             error_log(f"Failed to save profile: {e}")
-            import traceback
             traceback.print_exc()
             return False
 
@@ -1336,7 +1331,6 @@ class Plugin:
             
         except Exception as e:
             decky.logger.error(f"PowerDeck Backend: Failed to load profile for {game_id}: {e}")
-            import traceback
             traceback.print_exc()
             return None
 
@@ -1435,7 +1429,6 @@ class Plugin:
             ]
             
             for path_pattern in tdp_paths:
-                import glob
                 paths = glob.glob(path_pattern)
                 if paths:
                     for path in paths:
@@ -1595,8 +1588,8 @@ class Plugin:
                     else:
                         cpus.append(int(part))
                 return cpus
-        except:
-            return [0]  # Fallback to CPU 0
+        except (OSError, ValueError):
+            return [0]
 
     async def set_smt(self, enabled: bool) -> bool:
         """Set SMT (Simultaneous Multithreading) enable/disable"""
@@ -2102,7 +2095,6 @@ class Plugin:
         try:
             # Import Steam utilities for proper game detection
             import subprocess
-            import re
             
             # Try to detect running Steam games first
             try:
@@ -2210,12 +2202,10 @@ class Plugin:
                 decky.logger.warning(f"Gaming process detection failed: {e}")
             
             # Method 3: Enhanced device classification from working commit
-            sys.path.insert(0, os.path.dirname(__file__))
             decky.logger.info("Game detection: Starting enhanced device type detection")
             
             try:
                 from processor_detection import is_handheld_device
-                import glob
                 import psutil
                 
                 # Use enhanced device classification logic
@@ -2252,7 +2242,7 @@ class Plugin:
                         if any(pattern in product_name for pattern in ["ayaneo", "steam deck", "rog ally", "legion go", "onex", "gpd"]):
                             decky.logger.info("Handheld detected via DMI fallback")
                             return {"id": "handheld", "name": "Handheld"}
-                except:
+                except OSError:
                     pass
                 
                 # Final fallback to handheld for unknown devices (safest for gaming handhelds)
@@ -2267,43 +2257,18 @@ class Plugin:
     async def get_ac_power_status(self) -> bool:
         """Get AC power connection status using hardware-level detection"""
         try:
-            decky.logger.info("FRONTEND POLLING CALL DETECTED")
-            decky.logger.info("=== AC POWER STATUS CHECK ===")
-            decky.logger.info("Frontend requesting AC power status (polling active)")
+            from ac_power_manager import get_hardware_ac_status, supports_hardware_ac_detection
             
-            # Import AC power manager for hardware-level detection
-            sys.path.insert(0, os.path.dirname(__file__))
-            from ac_power_manager import get_hardware_ac_status, supports_hardware_ac_detection, debug_power_supply_info
-            
-            # Debug: Log all power supply information
-            debug_power_supply_info()
-            
-            # Try hardware-level detection first (most reliable)
             if supports_hardware_ac_detection():
-                decky.logger.info("Using hardware-level AC power detection")
                 hardware_status = get_hardware_ac_status()
                 if hardware_status is not None:
-                    decky.logger.info(f"Hardware AC power status: {hardware_status}")
-                    decky.logger.info(f"RETURNING AC STATUS: {hardware_status} to frontend")
                     return hardware_status
-                else:
-                    decky.logger.warning("Hardware AC detection returned None")
-            else:
-                decky.logger.warning("Hardware AC detection not supported")
             
             # Fallback to psutil if hardware detection unavailable
-            decky.logger.info("Falling back to psutil battery detection")
             battery = psutil.sensors_battery()
             if battery:
-                fallback_status = battery.power_plugged
-                decky.logger.info(f"Fallback AC power status: {fallback_status}")
-                decky.logger.info(f"RETURNING FALLBACK AC STATUS: {fallback_status} to frontend")
-                return fallback_status
-            else:
-                decky.logger.warning("No battery information available from psutil")
+                return battery.power_plugged
                 
-            decky.logger.error("All AC power detection methods failed")
-            decky.logger.info(f"RETURNING DEFAULT AC STATUS: False to frontend")
             return False
         except Exception as e:
             decky.logger.error(f"Failed to get AC power status: {e}")
@@ -2315,9 +2280,8 @@ class Plugin:
         Returns:
             bool: True if custom AC power management is supported
         """
-        decky.logger.info("Checking if device supports custom AC power management")
+        decky.logger.debug("Checking AC power management support")
         # Import device manager to check capabilities
-        sys.path.insert(0, os.path.dirname(__file__))
         from device_manager import DeviceManager
         
         try:
@@ -2352,7 +2316,6 @@ class Plugin:
     async def supports_hardware_ac_detection(self) -> bool:
         """Check if hardware-level AC power detection is available"""
         try:
-            sys.path.insert(0, os.path.dirname(__file__))
             from ac_power_manager import supports_hardware_ac_detection
             return supports_hardware_ac_detection()
         except Exception as e:
@@ -3278,7 +3241,6 @@ class Plugin:
                 return {}
                 
             usb_devices = {}
-            import glob
             
             # Get VID/PID pairs of all input devices from /proc/bus/input/devices
             input_device_vid_pids = self.get_input_device_vid_pids()
@@ -3436,7 +3398,6 @@ class Plugin:
             if not self.device_info.get("supports_usb_power_mgmt"):
                 return False
                 
-            import glob
             setting = "auto" if enable else "on"
             count = 0
             excluded_count = 0
@@ -3956,6 +3917,24 @@ class Plugin:
             return {"min": 4, "max": 25, "detected_cpu": "Fallback safety limits"}
 
     # Enhanced device classification for proper profile naming
+    def calculate_safe_tdp_limits(self, device_name: str) -> Dict[str, int]:
+        """Calculate safe TDP limits based on device name for fallback scenarios"""
+        device_lower = device_name.lower() if device_name else ""
+        
+        # Known device families with safe maximums
+        if any(k in device_lower for k in ['steam deck', 'jupiter', 'galileo']):
+            return {"min": 4, "max": 15}
+        elif any(k in device_lower for k in ['rog ally', 'rc71l', 'rc72l']):
+            return {"min": 4, "max": 30}
+        elif any(k in device_lower for k in ['legion go', 'lenovo']):
+            return {"min": 4, "max": 30}
+        elif any(k in device_lower for k in ['ayaneo', 'aya neo']):
+            return {"min": 4, "max": 33}
+        elif any(k in device_lower for k in ['onex', 'gpd']):
+            return {"min": 4, "max": 28}
+        else:
+            return {"min": 4, "max": 25}  # Conservative fallback
+
     async def get_device_classification(self) -> str:
         """Get device classification (Handheld, Portable, Desktop) for profile naming"""
         try:
@@ -3985,25 +3964,8 @@ class Plugin:
                     if is_handheld_device():
                         decky.logger.info(f"Device classified as Handheld via processor detection")
                         return "Handheld"
-                    else:
-                        decky.logger.info("Processor detection says not a handheld device")
                 except Exception as e:
                     decky.logger.warning(f"Processor handheld detection failed: {e}")
-            else:
-                decky.logger.info("Processor support not available for handheld detection")
-            
-            # Check if it's a handheld device using processor database
-            if processor_support_available:
-                try:
-                    if is_handheld_device():
-                        decky.logger.info(f"Device classified as Handheld via processor database")
-                        return "Handheld"
-                    else:
-                        decky.logger.info("Processor database says not a handheld device")
-                except Exception as e:
-                    decky.logger.warning(f"Processor handheld detection failed: {e}")
-            else:
-                decky.logger.info("Processor support not available for handheld detection")
             
             # Check if it's a laptop (has battery but not a gaming handheld)
             battery = psutil.sensors_battery()
@@ -4023,203 +3985,125 @@ class Plugin:
         """Get current plugin version"""
         return get_plugin_version()
 
-    async def get_latest_version(self) -> str:
-        """Get latest available version from GitHub API"""
-        try:
-            import urllib.request
-            import urllib.error
-            import ssl
-            import re
-            
-            # GitHub API endpoint for latest release
-            github_api_url = "https://api.github.com/repos/fewtarius/PowerDeck/releases/latest"
-            
-            decky.logger.info("Fetching latest version from GitHub...")
-            
+    async def _fetch_github_release(self) -> Optional[Dict[str, Any]]:
+        """Fetch latest release data from GitHub API"""
+        import urllib.request
+        import urllib.error
+        import ssl
+
+        github_api_url = "https://api.github.com/repos/fewtarius/PowerDeck/releases/latest"
+
+        # Try with proper SSL first, fallback to unverified for stripped-down environments
+        for ctx in (None, ssl._create_unverified_context()):
             try:
-                # Create SSL context that doesn't verify certificates (for compatibility)
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
-                
-                with urllib.request.urlopen(github_api_url, timeout=10, context=ssl_context) as response:
-                    data = json.loads(response.read().decode())
-                    
-                    # Extract version from tag_name (e.g., "v1.2.0" -> "1.2.0")
-                    tag_name = data.get('tag_name', '')
-                    if tag_name:
-                        # Remove 'v' prefix if present
-                        version_match = re.match(r'v?(.+)', tag_name)
-                        if version_match:
-                            latest_version = version_match.group(1)
-                            decky.logger.info(f"Latest version from GitHub: {latest_version}")
-                            return latest_version
-                    
-                    decky.logger.warning("No valid tag_name found in GitHub response")
-                    return await self.get_current_version()
-                    
+                kwargs = {"timeout": 10}
+                if ctx:
+                    kwargs["context"] = ctx
+                with urllib.request.urlopen(github_api_url, **kwargs) as response:
+                    return json.loads(response.read().decode())
+            except ssl.SSLError:
+                continue
             except urllib.error.HTTPError as e:
                 if e.code == 404:
                     decky.logger.info("No releases found in GitHub repository")
-                    return await self.get_current_version()
                 else:
-                    decky.logger.error(f"HTTP error fetching latest version: {e}")
-                    return await self.get_current_version()
+                    decky.logger.error(f"HTTP error fetching release: {e}")
+                return None
             except Exception as e:
-                decky.logger.error(f"Error fetching latest version: {e}")
-                return await self.get_current_version()
-                
+                if ctx is not None:
+                    decky.logger.error(f"Error fetching release: {e}")
+                continue
+        return None
+
+    async def get_latest_version(self) -> str:
+        """Get latest available version from GitHub API"""
+        try:
+
+            data = await self._fetch_github_release()
+            if data:
+                tag_name = data.get('tag_name', '')
+                if tag_name:
+                    version_match = re.match(r'v?(.+)', tag_name)
+                    if version_match:
+                        return version_match.group(1)
+
+            return await self.get_current_version()
         except Exception as e:
             decky.logger.error(f"Failed to get latest version: {e}")
             return get_plugin_version()
 
     async def check_for_updates(self) -> dict:
-        """Check for available updates without downloading - Plugin class method"""
+        """Check for available updates without downloading"""
         try:
-            import urllib.request
-            import urllib.error
-            import ssl
-            import re
             from packaging import version
-            
-            # Get current version
+
             current_version = await self.get_current_version()
-            decky.logger.info(f"Current PowerDeck version: {current_version}")
-            
-            # Check for updates from fewtarius/PowerDeck repository (public distribution repo)
-            github_api_url = "https://api.github.com/repos/fewtarius/PowerDeck/releases/latest"
-            
-            decky.logger.info("Checking for PowerDeck updates...")
-            
-            try:
-                # Create SSL context that doesn't verify certificates (for compatibility)
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
-                
-                with urllib.request.urlopen(github_api_url, timeout=10, context=ssl_context) as response:
-                    data = json.loads(response.read().decode())
-                    
-                    tag_name = data.get('tag_name', '')
-                    release_name = data.get('name', '')
-                    release_body = data.get('body', '')
-                    assets = data.get('assets', [])
-                    
-                    if tag_name:
-                        # Extract version from tag_name (e.g., "v1.2.0" -> "1.2.0")
-                        version_match = re.match(r'v?(.+)', tag_name)
-                        if version_match:
-                            latest_version = version_match.group(1)
-                            
-                            decky.logger.info(f"Latest version available: {latest_version}")
-                            decky.logger.info(f"Release: {release_name}")
-                            
-                            try:
-                                # Compare versions using packaging library
-                                if version.parse(latest_version) > version.parse(current_version):
-                                    decky.logger.info(f"UPDATE AVAILABLE: {current_version} -> {latest_version}")
-                                    
-                                    # Find the downloadable asset
-                                    download_url = None
-                                    for asset in assets:
-                                        asset_name = asset.get('name', '').lower()
-                                        if asset_name.endswith('.zip') or 'powerdeck' in asset_name:
-                                            download_url = asset.get('browser_download_url')
-                                            break
-                                    
-                                    # Fallback to source code zip if no specific asset found
-                                    if not download_url:
-                                        download_url = f"https://github.com/fewtarius/PowerDeck/archive/refs/tags/{tag_name}.zip"
-                                    
-                                    # Store update info for later installation
-                                    self.update_available = True
-                                    self.latest_available_version = latest_version
-                                    
-                                    return {
-                                        'update_available': True,
-                                        'current_version': current_version,
-                                        'latest_version': latest_version,
-                                        'release_name': release_name,
-                                        'release_notes': release_body,
-                                        'download_url': download_url,
-                                        'staged': False
-                                    }
-                                    
-                                else:
-                                    decky.logger.info(f"You have the latest version: {current_version}")
-                                    return {
-                                        'update_available': False,
-                                        'current_version': current_version,
-                                        'latest_version': current_version,
-                                        'message': 'You have the latest version'
-                                    }
-                                    
-                            except Exception as ve:
-                                # Fallback to string comparison if packaging fails
-                                decky.logger.warning(f"Version comparison failed, using string comparison: {ve}")
-                                if latest_version != current_version:
-                                    decky.logger.info(f"VERSION DIFFERENCE DETECTED: {current_version} vs {latest_version}")
-                                    
-                                    # Find downloadable asset
-                                    download_url = None
-                                    for asset in assets:
-                                        asset_name = asset.get('name', '').lower()
-                                        if asset_name.endswith('.zip') or 'powerdeck' in asset_name:
-                                            download_url = asset.get('browser_download_url')
-                                            break
-                                    
-                                    if not download_url:
-                                        download_url = f"https://github.com/fewtarius/PowerDeck/archive/refs/tags/{tag_name}.zip"
-                                    
-                                    self.update_available = True
-                                    self.latest_available_version = latest_version
-                                    
-                                    return {
-                                        'update_available': True,
-                                        'current_version': current_version,
-                                        'latest_version': latest_version,
-                                        'release_name': release_name,
-                                        'release_notes': release_body,
-                                        'download_url': download_url,
-                                        'staged': False
-                                    }
-                                else:
-                                    return {
-                                        'update_available': False,
-                                        'current_version': current_version,
-                                        'latest_version': current_version,
-                                        'message': 'No version difference detected'
-                                    }
-                    
-                    return {
-                        'update_available': False,
-                        'current_version': current_version,
-                        'error': 'No valid version information found in GitHub response'
-                    }
-                    
-            except urllib.error.HTTPError as e:
-                if e.code == 404:
-                    decky.logger.info("No releases found in repository (repository may be private)")
-                    return {
-                        'update_available': False,
-                        'current_version': current_version,
-                        'error': 'No releases found'
-                    }
-                else:
-                    decky.logger.error(f"HTTP error checking for updates: {e}")
-                    return {
-                        'update_available': False,
-                        'current_version': current_version,
-                        'error': f'HTTP error: {e}'
-                    }
-                    
-            except Exception as e:
-                decky.logger.error(f"Error checking for updates: {e}")
+
+            data = await self._fetch_github_release()
+            if not data:
                 return {
                     'update_available': False,
                     'current_version': current_version,
-                    'error': str(e)
+                    'error': 'Could not fetch release info'
                 }
+
+            tag_name = data.get('tag_name', '')
+            release_name = data.get('name', '')
+            release_body = data.get('body', '')
+            assets = data.get('assets', [])
+
+            if not tag_name:
+                return {
+                    'update_available': False,
+                    'current_version': current_version,
+                    'error': 'No valid version information found'
+                }
+
+            version_match = re.match(r'v?(.+)', tag_name)
+            if not version_match:
+                return {
+                    'update_available': False,
+                    'current_version': current_version,
+                    'error': 'Could not parse version from tag'
+                }
+
+            latest_version = version_match.group(1)
+
+            try:
+                is_newer = version.parse(latest_version) > version.parse(current_version)
+            except Exception:
+                is_newer = latest_version != current_version
+
+            if not is_newer:
+                return {
+                    'update_available': False,
+                    'current_version': current_version,
+                    'latest_version': current_version,
+                    'message': 'You have the latest version'
+                }
+
+            # Find downloadable asset
+            download_url = None
+            for asset in assets:
+                asset_name = asset.get('name', '').lower()
+                if asset_name.endswith('.zip') or 'powerdeck' in asset_name:
+                    download_url = asset.get('browser_download_url')
+                    break
+            if not download_url:
+                download_url = f"https://github.com/fewtarius/PowerDeck/archive/refs/tags/{tag_name}.zip"
+
+            self.update_available = True
+            self.latest_available_version = latest_version
+
+            return {
+                'update_available': True,
+                'current_version': current_version,
+                'latest_version': latest_version,
+                'release_name': release_name,
+                'release_notes': release_body,
+                'download_url': download_url,
+                'staged': False
+            }
                 
         except ImportError as e:
             decky.logger.warning(f"Update checking disabled due to missing dependencies: {e}")
@@ -4260,17 +4144,25 @@ class Plugin:
             update_file = os.path.join(self.update_staging_dir, f"powerdeck-{version}.zip")
             
             try:
-                # Create SSL context that bypasses certificate verification for embedded systems
                 import ssl
-                ssl_context = ssl.create_default_context()
-                ssl_context.check_hostname = False
-                ssl_context.verify_mode = ssl.CERT_NONE
-                
-                # Use urlopen with SSL context instead of urlretrieve
                 import urllib.request
-                with urllib.request.urlopen(download_url, timeout=30, context=ssl_context) as response:
-                    with open(update_file, 'wb') as f:
-                        f.write(response.read())
+                # Try proper SSL first, fallback to unverified for embedded systems
+                downloaded = False
+                for ctx in (None, ssl._create_unverified_context()):
+                    try:
+                        kwargs = {"timeout": 30}
+                        if ctx:
+                            kwargs["context"] = ctx
+                        with urllib.request.urlopen(download_url, **kwargs) as response:
+                            with open(update_file, 'wb') as f:
+                                f.write(response.read())
+                        downloaded = True
+                        break
+                    except ssl.SSLError:
+                        continue
+                
+                if not downloaded:
+                    raise Exception("All SSL methods failed for download")
                 
                 decky.logger.info(f"Downloaded update to {update_file}")
             except Exception as e:
@@ -4618,15 +4510,22 @@ class Plugin:
                 
                 try:
                     decky.logger.info(f"Downloading from {download_url}...")
-                    # Create SSL context that doesn't verify certificates (for compatibility)
-                    ssl_context = ssl.create_default_context()
-                    ssl_context.check_hostname = False
-                    ssl_context.verify_mode = ssl.CERT_NONE
+                    downloaded = False
+                    for ctx in (None, ssl._create_unverified_context()):
+                        try:
+                            kwargs = {"timeout": 30}
+                            if ctx:
+                                kwargs["context"] = ctx
+                            with urllib.request.urlopen(download_url, **kwargs) as response:
+                                with open(update_file, 'wb') as f:
+                                    f.write(response.read())
+                            downloaded = True
+                            break
+                        except ssl.SSLError:
+                            continue
                     
-                    # Download using urlopen with SSL context, then write to file
-                    with urllib.request.urlopen(download_url, timeout=30, context=ssl_context) as response:
-                        with open(update_file, 'wb') as f:
-                            f.write(response.read())
+                    if not downloaded:
+                        raise Exception("All SSL methods failed")
                     
                     decky.logger.info(f"Downloaded update to {update_file}")
                 except Exception as e:
@@ -5142,7 +5041,6 @@ class Plugin:
             return success
         except Exception as e:
             decky.logger.error(f"Plugin.set_game_profile failed for {game_id}: {e}")
-            import traceback
             traceback.print_exc()
             return False
 
@@ -5160,7 +5058,6 @@ class Plugin:
                 return None
         except Exception as e:
             decky.logger.error(f"Plugin.get_game_profile failed for {game_id}: {e}")
-            import traceback
             traceback.print_exc()
             return None
     
@@ -5201,7 +5098,7 @@ class Plugin:
                     try:
                         with open(events_file, 'r') as f:
                             events = json.load(f)
-                    except:
+                    except (OSError, json.JSONDecodeError):
                         events = []
                 
                 # Filter events by timeframe
@@ -5233,43 +5130,46 @@ class Plugin:
             return False
     
     async def monitor_system_wake(self):
-        """Monitor system wake events and reapply settings"""
+        """Fallback wake monitor using suspend counter when enhanced manager unavailable"""
         try:
-            decky.logger.info("Started wake from sleep monitoring")
-            last_uptime = None
-            
+            decky.logger.info("Started fallback wake monitoring (suspend counter)")
+            suspend_stats = "/sys/power/suspend_stats/success"
+            last_count = None
+
+            # Initialize counter
+            try:
+                if os.path.exists(suspend_stats):
+                    with open(suspend_stats, 'r') as f:
+                        last_count = int(f.read().strip())
+            except (ValueError, OSError):
+                pass
+
             while True:
                 try:
-                    # Check system uptime to detect sleep/wake cycles
-                    with open('/proc/uptime', 'r') as f:
-                        current_uptime = float(f.read().split()[0])
-                    
-                    # If this is not the first check and uptime decreased, system was suspended
-                    if last_uptime is not None and current_uptime < last_uptime:
-                        decky.logger.info("System wake detected - reapplying power profile")
-                        
-                        # Wait a moment for system to stabilize after wake
-                        await asyncio.sleep(3)
-                        
-                        # Reapply current profile to restore all settings
-                        try:
-                            success = await self.apply_profile(self.current_profile)
-                            if success:
-                                decky.logger.info("Power profile reapplied after wake")
-                            else:
-                                decky.logger.warning("Failed to reapply profile after wake")
-                        except Exception as e:
-                            decky.logger.error(f"Error reapplying profile after wake: {e}")
-                    
-                    last_uptime = current_uptime
-                    
-                    # Check every 30 seconds
-                    await asyncio.sleep(30)
-                    
+                    if os.path.exists(suspend_stats):
+                        with open(suspend_stats, 'r') as f:
+                            current_count = int(f.read().strip())
+
+                        if last_count is not None and current_count > last_count:
+                            decky.logger.info(f"Wake detected via suspend counter ({last_count} -> {current_count})")
+                            await asyncio.sleep(3)
+                            try:
+                                success = await self.apply_profile(self.current_profile)
+                                if success:
+                                    decky.logger.info("Power profile reapplied after wake")
+                                else:
+                                    decky.logger.warning("Failed to reapply profile after wake")
+                            except Exception as e:
+                                decky.logger.error(f"Error reapplying profile after wake: {e}")
+
+                        last_count = current_count
+
+                    await asyncio.sleep(5)
+
                 except Exception as e:
                     decky.logger.error(f"Wake monitoring error: {e}")
-                    await asyncio.sleep(60)  # Longer delay on error
-                    
+                    await asyncio.sleep(30)
+
         except Exception as e:
             decky.logger.error(f"Wake monitoring failed: {e}")
 
@@ -5701,7 +5601,6 @@ async def get_tdp_control_mode():
 
 async def get_current_profile():
     """Global function called by frontend"""
-    import traceback
     stack = traceback.format_stack()
     decky.logger.info("GET_CURRENT_PROFILE CALLED BY FRONTEND")
     decky.logger.info(f"Call stack (last 3 frames):")
@@ -5714,7 +5613,6 @@ async def get_current_profile():
 
 async def save_profile(profile_data):
     """Global function called by frontend"""
-    import traceback
     stack = traceback.format_stack()
     decky.logger.info("SAVE_PROFILE CALLED BY FRONTEND")
     decky.logger.info(f"Profile data to save: TDP={profile_data.get('tdp', 'NOT_SET')}, cpuBoost={profile_data.get('cpuBoost', 'NOT_SET')}")
@@ -5878,16 +5776,15 @@ async def get_gpu_frequency():
 # Game Profile Management Functions - CALLABLE FUNCTIONS FOR FRONTEND
 async def set_game_profile(game_id: str, profile_data):
     """Save a profile for a specific game/profile ID (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: set_game_profile({game_id})")
+    decky.logger.debug(f" set_game_profile({game_id})")
     decky.logger.info(f"Global set_game_profile called with: {profile_data}")
     if plugin:
         try:
             success = await plugin.set_game_profile(game_id, profile_data)
-            decky.logger.info(f"Global set_game_profile: Result for {game_id}: {success}")
+            decky.logger.debug(f"Global set_game_profile: Result for {game_id}: {success}")
             return success
         except Exception as e:
             decky.logger.error(f"Global set_game_profile failed for {game_id}: {e}")
-            import traceback
             traceback.print_exc()
             return False
     else:
@@ -5896,19 +5793,18 @@ async def set_game_profile(game_id: str, profile_data):
 
 async def get_game_profile(game_id: str):
     """Load a profile for a specific game/profile ID (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: get_game_profile({game_id})")
+    decky.logger.debug(f" get_game_profile({game_id})")
     if plugin:
         try:
             profile = await plugin.get_game_profile(game_id)
             if profile:
-                decky.logger.info(f"Global get_game_profile: Loaded profile for {game_id}: {profile}")
+                decky.logger.debug(f"Global get_game_profile: Loaded profile for {game_id}: {profile}")
                 return profile
             else:
-                decky.logger.info(f"Global get_game_profile: No profile found for {game_id}")
+                decky.logger.debug(f"Global get_game_profile: No profile found for {game_id}")
                 return None
         except Exception as e:
             decky.logger.error(f"Global get_game_profile failed for {game_id}: {e}")
-            import traceback
             traceback.print_exc()
             return None
     else:
@@ -5927,11 +5823,11 @@ async def load_game_profile(game_id: str):
 # Version and Update Functions - CALLABLE FUNCTIONS FOR FRONTEND
 async def get_current_version() -> str:
     """Get current plugin version (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_current_version()")
+    decky.logger.debug(" get_current_version()")
     if plugin:
         try:
             version = await plugin.get_current_version()
-            decky.logger.info(f"Global get_current_version: {version}")
+            decky.logger.debug(f"Global get_current_version: {version}")
             return version
         except Exception as e:
             decky.logger.error(f"Global get_current_version failed: {e}")
@@ -5942,11 +5838,11 @@ async def get_current_version() -> str:
 
 async def get_latest_version() -> str:
     """Get latest available version from GitHub (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_latest_version()")
+    decky.logger.debug(" get_latest_version()")
     if plugin:
         try:
             version = await plugin.get_latest_version()
-            decky.logger.info(f"Global get_latest_version: {version}")
+            decky.logger.debug(f"Global get_latest_version: {version}")
             return version
         except Exception as e:
             decky.logger.error(f"Global get_latest_version failed: {e}")
@@ -5957,12 +5853,12 @@ async def get_latest_version() -> str:
 
 async def update_plugin() -> bool:
     """Check for plugin updates (frontend callable) - DEPRECATED"""
-    decky.logger.info("GLOBAL FUNCTION: update_plugin() - DEPRECATED")
+    decky.logger.debug(" update_plugin() - DEPRECATED")
     decky.logger.warning("update_plugin() is deprecated, use check_for_updates() instead")
     if plugin:
         try:
             result = await plugin.update_plugin()
-            decky.logger.info(f"Global update_plugin: {result}")
+            decky.logger.debug(f"Global update_plugin: {result}")
             return result
         except Exception as e:
             decky.logger.error(f"Global update_plugin failed: {e}")
@@ -5973,11 +5869,11 @@ async def update_plugin() -> bool:
 
 async def check_for_updates() -> Dict[str, Any]:
     """Check for available updates (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: check_for_updates()")
+    decky.logger.debug(" check_for_updates()")
     if plugin:
         try:
             result = await plugin.check_for_updates()
-            decky.logger.info(f"Global check_for_updates: {result}")
+            decky.logger.debug(f"Global check_for_updates: {result}")
             return result
         except Exception as e:
             decky.logger.error(f"Global check_for_updates failed: {e}")
@@ -5988,11 +5884,11 @@ async def check_for_updates() -> Dict[str, Any]:
 
 async def stage_update(download_url: str, version: str) -> Dict[str, Any]:
     """Stage an update for installation (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: stage_update({version})")
+    decky.logger.debug(f" stage_update({version})")
     if plugin:
         try:
             result = await plugin.stage_update(download_url, version)
-            decky.logger.info(f"Global stage_update: {result}")
+            decky.logger.debug(f"Global stage_update: {result}")
             return result
         except Exception as e:
             decky.logger.error(f"Global stage_update failed: {e}")
@@ -6003,11 +5899,11 @@ async def stage_update(download_url: str, version: str) -> Dict[str, Any]:
 
 async def install_staged_update() -> Dict[str, Any]:
     """Install a staged update (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: install_staged_update()")
+    decky.logger.debug(" install_staged_update()")
     if plugin:
         try:
             result = await plugin.install_staged_update()
-            decky.logger.info(f"Global install_staged_update: {result}")
+            decky.logger.debug(f"Global install_staged_update: {result}")
             return result
         except Exception as e:
             decky.logger.error(f"Global install_staged_update failed: {e}")
@@ -6018,11 +5914,11 @@ async def install_staged_update() -> Dict[str, Any]:
 
 async def get_update_status() -> Dict[str, Any]:
     """Get background update check status (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_update_status()")
+    decky.logger.debug(" get_update_status()")
     if plugin:
         try:
             status = await plugin.get_update_status()
-            decky.logger.info(f"Global get_update_status: {status}")
+            decky.logger.debug(f"Global get_update_status: {status}")
             return status
         except Exception as e:
             decky.logger.error(f"Global get_update_status failed: {e}")
@@ -6034,11 +5930,11 @@ async def get_update_status() -> Dict[str, Any]:
 # Enhanced Sleep/Wake Management Global Functions
 async def get_sleep_wake_diagnostics() -> Dict[str, Any]:
     """Get sleep/wake system diagnostics (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_sleep_wake_diagnostics()")
+    decky.logger.debug(" get_sleep_wake_diagnostics()")
     if plugin:
         try:
             diagnostics = await plugin.get_sleep_wake_diagnostics()
-            decky.logger.info(f"Global get_sleep_wake_diagnostics: {diagnostics}")
+            decky.logger.debug(f"Global get_sleep_wake_diagnostics: {diagnostics}")
             return diagnostics
         except Exception as e:
             decky.logger.error(f"Global get_sleep_wake_diagnostics failed: {e}")
@@ -6049,11 +5945,11 @@ async def get_sleep_wake_diagnostics() -> Dict[str, Any]:
 
 async def get_recent_sleep_wake_events(hours: int = 24) -> list:
     """Get recent sleep/wake events (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: get_recent_sleep_wake_events({hours})")
+    decky.logger.debug(f" get_recent_sleep_wake_events({hours})")
     if plugin:
         try:
             events = await plugin.get_recent_sleep_wake_events(hours)
-            decky.logger.info(f"Global get_recent_sleep_wake_events: {len(events)} events")
+            decky.logger.debug(f"Global get_recent_sleep_wake_events: {len(events)} events")
             return events
         except Exception as e:
             decky.logger.error(f"Global get_recent_sleep_wake_events failed: {e}")
@@ -6064,11 +5960,11 @@ async def get_recent_sleep_wake_events(hours: int = 24) -> list:
 
 async def force_wake_state_restoration() -> bool:
     """Manually trigger wake state restoration (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: force_wake_state_restoration()")
+    decky.logger.debug(" force_wake_state_restoration()")
     if plugin:
         try:
             result = await plugin.force_wake_state_restoration()
-            decky.logger.info(f"Global force_wake_state_restoration: {result}")
+            decky.logger.debug(f"Global force_wake_state_restoration: {result}")
             return result
         except Exception as e:
             decky.logger.error(f"Global force_wake_state_restoration failed: {e}")
@@ -6080,16 +5976,16 @@ async def force_wake_state_restoration() -> bool:
 # ROG Ally Specific Callable Functions
 async def get_rog_ally_device_info() -> Dict[str, Any]:
     """Get comprehensive ROG Ally device information (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_rog_ally_device_info()")
+    decky.logger.debug(" get_rog_ally_device_info()")
     return await plugin.get_rog_ally_device_info()
 
 async def set_rog_ally_power_limits(fast_limit: int, sustained_limit: int, stapm_limit: int) -> bool:
     """Set ROG Ally power limits (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: set_rog_ally_power_limits({fast_limit}, {sustained_limit}, {stapm_limit})")
+    decky.logger.debug(f" set_rog_ally_power_limits({fast_limit}, {sustained_limit}, {stapm_limit})")
     if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
         try:
             result = plugin.device_controller.set_power_limits(fast_limit, sustained_limit, stapm_limit)
-            decky.logger.info(f"Global set_rog_ally_power_limits: {result}")
+            decky.logger.debug(f"Global set_rog_ally_power_limits: {result}")
             return result
         except Exception as e:
             decky.logger.error(f"Global set_rog_ally_power_limits failed: {e}")
@@ -6100,37 +5996,27 @@ async def set_rog_ally_power_limits(fast_limit: int, sustained_limit: int, stapm
 
 async def get_rog_ally_power_limits() -> Dict[str, Optional[int]]:
     """Get current ROG Ally power limits (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_rog_ally_power_limits()")
+    decky.logger.debug(" get_rog_ally_power_limits()")
     return await plugin.get_rog_ally_power_limits()
 
 async def set_rog_ally_platform_profile(profile: str) -> bool:
     """Set ROG Ally platform profile (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: set_rog_ally_platform_profile({profile})")
-    if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
-        try:
-            result = plugin.device_controller.set_platform_profile(profile)
-            decky.logger.info(f"set_rog_ally_platform_profile result: {result}")
-            return result
-        except Exception as e:
-            decky.logger.error(f"set_rog_ally_platform_profile failed: {e}")
-            return False
-    else:
-        decky.logger.warning("set_rog_ally_platform_profile: Not a ROG Ally device")
-        return False
+    decky.logger.debug(f" set_rog_ally_platform_profile({profile})")
+    return await plugin.set_rog_ally_platform_profile(profile)
 
 async def get_rog_ally_platform_profile() -> Optional[str]:
     """Get current ROG Ally platform profile (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_rog_ally_platform_profile()")
+    decky.logger.debug(" get_rog_ally_platform_profile()")
     return await plugin.get_rog_ally_platform_profile()
 
 async def set_rog_ally_mcu_powersave(enabled: bool) -> bool:
     """Set ROG Ally MCU power save mode (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: set_rog_ally_mcu_powersave({enabled})")
+    decky.logger.debug(f" set_rog_ally_mcu_powersave({enabled})")
     return await plugin.set_rog_ally_mcu_powersave(enabled)
 
 async def get_rog_ally_mcu_powersave() -> Optional[bool]:
     """Get ROG Ally MCU power save status (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_rog_ally_mcu_powersave()")
+    decky.logger.debug(" get_rog_ally_mcu_powersave()")
     return await plugin.get_rog_ally_mcu_powersave()
 
 # =========================================================================
@@ -6139,41 +6025,41 @@ async def get_rog_ally_mcu_powersave() -> Optional[bool]:
 
 async def get_inputplumber_status() -> Dict[str, Any]:
     """Get InputPlumber availability and status (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_inputplumber_status()")
+    decky.logger.debug(" get_inputplumber_status()")
     return await plugin.get_inputplumber_status()
 
 async def get_inputplumber_modes() -> List[Dict[str, str]]:
     """Get supported InputPlumber controller modes (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_inputplumber_modes()")
+    decky.logger.debug(" get_inputplumber_modes()")
     return await plugin.get_inputplumber_modes()
 
 async def set_inputplumber_mode(mode: str) -> bool:
     """Set InputPlumber controller mode (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: set_inputplumber_mode({mode})")
+    decky.logger.debug(f" set_inputplumber_mode({mode})")
     return await plugin.set_inputplumber_mode(mode)
 
 async def get_inputplumber_profile_for_game(game_id: str) -> Optional[Dict[str, Any]]:
     """Get InputPlumber settings for game profile (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: get_inputplumber_profile_for_game({game_id})")
+    decky.logger.debug(f" get_inputplumber_profile_for_game({game_id})")
     return await plugin.get_inputplumber_profile_for_game(game_id)
 
 async def save_inputplumber_profile_for_game(game_id: str, inputplumber_settings: Dict[str, Any]) -> bool:
     """Save InputPlumber settings to game profile (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: save_inputplumber_profile_for_game({game_id})")
+    decky.logger.debug(f" save_inputplumber_profile_for_game({game_id})")
     return await plugin.save_inputplumber_profile_for_game(game_id, inputplumber_settings)
 
 async def apply_inputplumber_profile_for_game(game_id: str) -> bool:
     """Apply InputPlumber profile for game (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: apply_inputplumber_profile_for_game({game_id})")
+    decky.logger.debug(f" apply_inputplumber_profile_for_game({game_id})")
     return await plugin.apply_inputplumber_profile_for_game(game_id)
 
 async def set_rog_ally_thermal_throttle_policy(policy: int) -> bool:
     """Set ROG Ally thermal throttling policy (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: set_rog_ally_thermal_throttle_policy({policy})")
+    decky.logger.debug(f" set_rog_ally_thermal_throttle_policy({policy})")
     if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
         try:
             result = plugin.device_controller.set_thermal_throttle_policy(policy)
-            decky.logger.info(f"Global set_rog_ally_thermal_throttle_policy: {result}")
+            decky.logger.debug(f"Global set_rog_ally_thermal_throttle_policy: {result}")
             return result
         except Exception as e:
             decky.logger.error(f"Global set_rog_ally_thermal_throttle_policy failed: {e}")
@@ -6184,11 +6070,11 @@ async def set_rog_ally_thermal_throttle_policy(policy: int) -> bool:
 
 async def get_rog_ally_thermal_throttle_policy() -> Optional[int]:
     """Get ROG Ally thermal throttling policy (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_rog_ally_thermal_throttle_policy()")
+    decky.logger.debug(" get_rog_ally_thermal_throttle_policy()")
     if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
         try:
             policy = plugin.device_controller.get_thermal_throttle_policy()
-            decky.logger.info(f"Global get_rog_ally_thermal_throttle_policy: {policy}")
+            decky.logger.debug(f"Global get_rog_ally_thermal_throttle_policy: {policy}")
             return policy
         except Exception as e:
             decky.logger.error(f"Global get_rog_ally_thermal_throttle_policy failed: {e}")
@@ -6199,11 +6085,11 @@ async def get_rog_ally_thermal_throttle_policy() -> Optional[int]:
 
 async def set_rog_ally_fan_mode(fan_id: int, mode: int) -> bool:
     """Set ROG Ally fan mode (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: set_rog_ally_fan_mode({fan_id}, {mode})")
+    decky.logger.debug(f" set_rog_ally_fan_mode({fan_id}, {mode})")
     if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
         try:
             result = plugin.device_controller.set_fan_mode(fan_id, mode)
-            decky.logger.info(f"Global set_rog_ally_fan_mode: {result}")
+            decky.logger.debug(f"Global set_rog_ally_fan_mode: {result}")
             return result
         except Exception as e:
             decky.logger.error(f"Global set_rog_ally_fan_mode failed: {e}")
@@ -6214,11 +6100,11 @@ async def set_rog_ally_fan_mode(fan_id: int, mode: int) -> bool:
 
 async def get_rog_ally_fan_status() -> Dict[str, Any]:
     """Get ROG Ally fan status (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_rog_ally_fan_status()")
+    decky.logger.debug(" get_rog_ally_fan_status()")
     if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
         try:
             status = plugin.device_controller.get_fan_status()
-            decky.logger.info(f"Global get_rog_ally_fan_status: {status}")
+            decky.logger.debug(f"Global get_rog_ally_fan_status: {status}")
             return status
         except Exception as e:
             decky.logger.error(f"Global get_rog_ally_fan_status failed: {e}")
@@ -6229,11 +6115,11 @@ async def get_rog_ally_fan_status() -> Dict[str, Any]:
 
 async def set_rog_ally_battery_charge_limit(limit: int) -> bool:
     """Set ROG Ally battery charge limit (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: set_rog_ally_battery_charge_limit({limit})")
+    decky.logger.debug(f" set_rog_ally_battery_charge_limit({limit})")
     if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
         try:
             result = plugin.device_controller.set_battery_charge_limit(limit)
-            decky.logger.info(f"Global set_rog_ally_battery_charge_limit: {result}")
+            decky.logger.debug(f"Global set_rog_ally_battery_charge_limit: {result}")
             return result
         except Exception as e:
             decky.logger.error(f"Global set_rog_ally_battery_charge_limit failed: {e}")
@@ -6244,11 +6130,11 @@ async def set_rog_ally_battery_charge_limit(limit: int) -> bool:
 
 async def get_rog_ally_battery_charge_limit() -> Optional[int]:
     """Get ROG Ally battery charge limit (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_rog_ally_battery_charge_limit()")
+    decky.logger.debug(" get_rog_ally_battery_charge_limit()")
     if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
         try:
             limit = plugin.device_controller.get_battery_charge_limit()
-            decky.logger.info(f"Global get_rog_ally_battery_charge_limit: {limit}")
+            decky.logger.debug(f"Global get_rog_ally_battery_charge_limit: {limit}")
             return limit
         except Exception as e:
             decky.logger.error(f"Global get_rog_ally_battery_charge_limit failed: {e}")
@@ -6259,13 +6145,13 @@ async def get_rog_ally_battery_charge_limit() -> Optional[int]:
 
 async def set_rog_ally_performance_mode(mode: str) -> bool:
     """Set ROG Ally comprehensive performance mode (frontend callable)"""
-    decky.logger.info(f"GLOBAL FUNCTION: set_rog_ally_performance_mode({mode})")
+    decky.logger.debug(f" set_rog_ally_performance_mode({mode})")
     if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
         try:
             # Import the performance mode function from ROG Ally module
             from devices.rog_ally import set_performance_mode
             result = set_performance_mode(mode)
-            decky.logger.info(f"Global set_rog_ally_performance_mode: {result}")
+            decky.logger.debug(f"Global set_rog_ally_performance_mode: {result}")
             return result
         except Exception as e:
             decky.logger.error(f"Global set_rog_ally_performance_mode failed: {e}")
@@ -6276,12 +6162,12 @@ async def set_rog_ally_performance_mode(mode: str) -> bool:
 
 async def get_rog_ally_comprehensive_status() -> Dict[str, Any]:
     """Get comprehensive ROG Ally status (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: get_rog_ally_comprehensive_status()")
+    decky.logger.debug(" get_rog_ally_comprehensive_status()")
     if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
         try:
             from devices.rog_ally import get_comprehensive_status
             status = get_comprehensive_status()
-            decky.logger.info(f"Global get_rog_ally_comprehensive_status: Retrieved status")
+            decky.logger.debug(f"Global get_rog_ally_comprehensive_status: Retrieved status")
             return status
         except Exception as e:
             decky.logger.error(f"Global get_rog_ally_comprehensive_status failed: {e}")
@@ -6293,7 +6179,7 @@ async def get_rog_ally_comprehensive_status() -> Dict[str, Any]:
 # Sleep/Wake Debug Functions for Ayaneo Flip Investigation
 async def debug_capture_pre_sleep_state():
     """Debug function to manually capture pre-sleep state (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: debug_capture_pre_sleep_state()")
+    decky.logger.debug(" debug_capture_pre_sleep_state()")
     if plugin and plugin.sleep_wake_manager:
         try:
             state = await plugin.sleep_wake_manager.manual_capture_pre_sleep_state()
@@ -6308,7 +6194,7 @@ async def debug_capture_pre_sleep_state():
 
 async def debug_test_wake_restoration():
     """Debug function to manually test wake restoration (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: debug_test_wake_restoration()")
+    decky.logger.debug(" debug_test_wake_restoration()")
     if plugin and plugin.sleep_wake_manager:
         try:
             success = await plugin.sleep_wake_manager.manual_test_wake_restoration()
@@ -6323,7 +6209,7 @@ async def debug_test_wake_restoration():
 
 async def debug_get_comprehensive_state():
     """Debug function to get current comprehensive system state (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: debug_get_comprehensive_state()")
+    decky.logger.debug(" debug_get_comprehensive_state()")
     if plugin and plugin.sleep_wake_manager:
         try:
             state = await plugin.sleep_wake_manager._capture_comprehensive_state()
@@ -6338,7 +6224,7 @@ async def debug_get_comprehensive_state():
 
 async def debug_get_state_comparison():
     """Debug function to get the latest state comparison data (frontend callable)"""
-    decky.logger.info("GLOBAL FUNCTION: debug_get_state_comparison()")
+    decky.logger.debug(" debug_get_state_comparison()")
     try:
         import json
         comparison_file = "/tmp/powerdeck_state_comparison.json"

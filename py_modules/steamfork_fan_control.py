@@ -296,7 +296,7 @@ class SteamForkFanController:
                 # Clean up temp file on error
                 try:
                     os.unlink(temp_path)
-                except:
+                except OSError:
                     pass
                 raise e
             
@@ -383,7 +383,7 @@ class SteamForkFanController:
                                     temp_celsius = temp_millic / 1000.0
                                     if temp_celsius > 15 and temp_celsius < 120:  # Reasonable CPU temp range
                                         temps.append(temp_celsius)
-                        except:
+                        except (OSError, ValueError):
                             continue
             
             # Fallback: Try PCI device temperature sensors
@@ -398,7 +398,7 @@ class SteamForkFanController:
                                     temp_celsius = temp_millic / 1000.0
                                     if temp_celsius > 15 and temp_celsius < 120:
                                         temps.append(temp_celsius)
-                            except:
+                            except (OSError, ValueError):
                                 continue
             
             if temps:
