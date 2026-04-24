@@ -192,6 +192,7 @@ class Plugin:
         # Backend game detection / profile auto-apply
         self.game_monitor_task = None
         self._last_detected_game_id: Optional[str] = None
+        self._last_ac_power_state: Optional[bool] = None
         
     def log_warning_once(self, message: str):
         """Log a warning message only once to prevent spam"""
@@ -1860,10 +1861,18 @@ class Plugin:
             try:
                 with open(gpu_path, 'w') as f:
                     f.write(dpm_mode)
+                    f.flush()
+                    os.fsync(f.fileno())
+                # Verify the write actually took effect
+                with open(gpu_path, 'r') as f:
+                    actual_dpm = f.read().strip()
+                if actual_dpm != dpm_mode:
+                    decky.logger.error(f"SET_GPU_MODE: DPM write verification FAILED! Wrote '{dpm_mode}' but read back '{actual_dpm}'")
+                    return False
                 # Only update current_profile for hardware state tracking
                 # DO NOT save settings here as it overwrites user customizations
                 self.current_profile["gpuMode"] = mode
-                decky.logger.info(f"SET_GPU_MODE: AMD GPU mode set to {mode} (DPM: {dpm_mode})")
+                decky.logger.info(f"SET_GPU_MODE: AMD GPU mode set to {mode} (DPM: {dpm_mode}, verified: {actual_dpm})")
                 return True
             except Exception as e:
                 decky.logger.error(f"AMD GPU mode set failed: {e}")
@@ -2262,11 +2271,13 @@ class Plugin:
             if supports_hardware_ac_detection():
                 hardware_status = get_hardware_ac_status()
                 if hardware_status is not None:
+                    decky.logger.info(f"AC_POWER: hardware_status={hardware_status}")
                     return hardware_status
             
             # Fallback to psutil if hardware detection unavailable
             battery = psutil.sensors_battery()
             if battery:
+                decky.logger.info(f"AC_POWER: psutil power_plugged={battery.power_plugged}")
                 return battery.power_plugged
                 
             return False
@@ -2592,10 +2603,6 @@ class Plugin:
                 except Exception as e:
                     decky.logger.error(f"Error applying PCIe ASPM: {e}")
 
-            # Apply FCLK pinning for gaming profiles on supported AMD devices
-            # Keeps GPU memory fabric clock at max state to reduce iGPU latency
-            is_gaming_profile = profile_data.get("tdp", 0) >= 15 or profile_data.get("fclkGaming", False)
-
             # Apply ROG Ally platform profile (e.g. low-power / balanced / performance)
             if "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally":
                 total_operations += 1
@@ -2622,41 +2629,6 @@ class Plugin:
                 except Exception as e:
                     decky.logger.error(f"Error applying ROG Ally thermal policy: {e}")
 
-            if is_gaming_profile and self.device_info.get("cpu_vendor") == "AMD":
-                total_operations += 1
-                try:
-                    fclk_success = await self._set_fclk_gaming()
-                    if fclk_success:
-                        success_count += 1
-                        decky.logger.info("Applied FCLK gaming pin")
-                    else:
-                        decky.logger.debug("FCLK pinning not available on this device (non-fatal)")
-                        total_operations -= 1  # Don't penalise success rate
-                except Exception as e:
-                    decky.logger.debug(f"FCLK pin skipped: {e}")
-                    total_operations -= 1
-
-            # Disable NVMe runtime power management for gaming profiles
-            # Prevents 2-30ms latency spikes on asset loads caused by NVMe autosuspend
-            if is_gaming_profile:
-                total_operations += 1
-                try:
-                    nvme_success = await self._set_nvme_gaming()
-                    if nvme_success:
-                        success_count += 1
-                        decky.logger.info("Applied NVMe gaming power mode (autosuspend disabled)")
-                    else:
-                        decky.logger.debug("NVMe power control not available (non-fatal)")
-                        total_operations -= 1
-                except Exception as e:
-                    decky.logger.debug(f"NVMe gaming power skipped: {e}")
-                    total_operations -= 1
-
-            # Restore power-saving settings for low-TDP / battery profiles
-            if not is_gaming_profile:
-                await self._restore_fclk_auto()
-                await self._restore_nvme_power_save()
-
             # Calculate success rate
             if total_operations > 0:
                 success_rate = success_count / total_operations
@@ -2668,162 +2640,6 @@ class Plugin:
                 
         except Exception as e:
             decky.logger.error(f"Failed to apply profile: {e}")
-            return False
-
-    # ---------------------------------------------------------------------------
-    # FCLK and NVMe power helpers
-    # ---------------------------------------------------------------------------
-
-    async def _set_fclk_gaming(self) -> bool:
-        """Ensure DPM is in 'auto' mode so FCLK scales under GPU load.
-
-        On RDNA3 APUs (Phoenix/Hawk Point/Strix) the Infinity Fabric clock
-        (FCLK) controls iGPU memory bandwidth. In 'auto' DPM mode the kernel
-        scales FCLK to ~1200 MHz under load (3× the 400 MHz idle floor).
-
-        IMPORTANT — do NOT use 'manual' DPM mode for FCLK pinning:
-          • pp_dpm_fclk state indices are REVERSED on Phoenix (write "0" =
-            highest freq, write "3" = lowest). The kernel accepts the write
-            silently but pins to the wrong state.
-          • 'manual' mode also freezes SCLK (shader clock) at its current
-            idle level, preventing the GPU from clocking up under load.
-          • Pinning FCLK to 1875 MHz (the max on Z1E/7840U) causes HIP
-            illegal-memory-access crashes at TDP ≤ 24 W — the memory
-            controller cannot sustain that frequency within the power budget.
-
-        The 'auto' DPM mode gives 1200 MHz FCLK + dynamic SCLK, which
-        benchmarks ~2.7× faster than the broken 400 MHz manual-mode pin.
-
-        Returns False gracefully if the sysfs paths don't exist.
-        """
-        try:
-            dpm_level_path = None
-            fclk_path = None
-            for card in sorted(os.listdir('/sys/class/drm')):
-                candidate = f'/sys/class/drm/{card}/device/pp_dpm_fclk'
-                if os.path.exists(candidate):
-                    fclk_path = candidate
-                    dpm_level_path = os.path.join(
-                        os.path.dirname(candidate),
-                        'power_dpm_force_performance_level')
-                    break
-
-            if not fclk_path or not dpm_level_path:
-                return False  # Not supported on this device
-
-            # Read current DPM level
-            with open(dpm_level_path, 'r') as f:
-                current_level = f.read().strip()
-
-            # If already in auto mode, nothing to do
-            if current_level == 'auto':
-                decky.logger.debug("FCLK gaming: DPM already in auto mode")
-            else:
-                # Switch to auto — kernel handles FCLK/SCLK scaling properly
-                with open(dpm_level_path, 'w') as f:
-                    f.write('auto\n')
-                decky.logger.info(
-                    f"FCLK gaming: switched DPM from '{current_level}' to 'auto' "
-                    f"via {dpm_level_path}")
-
-            # Verify FCLK actually scaled up (non-blocking check)
-            import time as _time
-            _time.sleep(0.5)
-            with open(fclk_path, 'r') as f:
-                for line in f:
-                    if '*' in line:
-                        freq = line.split(':')[1].strip().split()[0]
-                        decky.logger.info(f"FCLK active: {freq}")
-                        break
-
-            return True
-
-        except PermissionError:
-            decky.logger.warning("FCLK gaming failed: permission denied (need root)")
-            return False
-        except Exception as e:
-            decky.logger.debug(f"FCLK gaming not available: {e}")
-            return False
-
-    async def _restore_fclk_auto(self) -> bool:
-        """Restore FCLK to automatic DPM control (battery/idle profiles)."""
-        try:
-            for card in sorted(os.listdir('/sys/class/drm')):
-                dpm_path = f'/sys/class/drm/{card}/device/power_dpm_force_performance_level'
-                if os.path.exists(dpm_path):
-                    with open(dpm_path, 'w') as f:
-                        f.write('auto\n')
-                    decky.logger.debug(f"FCLK restored to auto via {dpm_path}")
-                    return True
-            return False
-        except Exception as e:
-            decky.logger.debug(f"FCLK restore skipped: {e}")
-            return False
-
-    async def _set_nvme_gaming(self) -> bool:
-        """Disable NVMe runtime power management for gaming.
-
-        Boot quirks (e.g. 003-powersaving on SteamFork/SteamOS) enable runtime
-        PM on NVMe drives, causing 2-30ms latency spikes when the drive wakes
-        from autosuspend during asset loads. Setting /power/control to 'on'
-        prevents the drive from suspending during active gaming.
-
-        Uses generic PCI class 0x010802 discovery — works on all Linux devices.
-        Returns False gracefully if no controllable NVMe devices are found.
-        """
-        try:
-            import glob as _glob
-            controlled = 0
-            for power_ctrl in _glob.glob('/sys/bus/pci/devices/*/power/control'):
-                class_path = os.path.join(
-                    os.path.dirname(os.path.dirname(power_ctrl)), 'class'
-                )
-                if not os.path.exists(class_path):
-                    continue
-                with open(class_path, 'r') as f:
-                    pci_class = f.read().strip()
-                if pci_class.lower() != '0x010802':
-                    continue
-                with open(power_ctrl, 'w') as f:
-                    f.write('on\n')
-                controlled += 1
-                decky.logger.debug(
-                    f"NVMe autosuspend disabled: "
-                    f"{os.path.dirname(os.path.dirname(power_ctrl))}"
-                )
-            return controlled > 0
-        except PermissionError:
-            decky.logger.warning("NVMe power control failed: permission denied")
-            return False
-        except Exception as e:
-            decky.logger.debug(f"NVMe gaming power not available: {e}")
-            return False
-
-    async def _restore_nvme_power_save(self) -> bool:
-        """Re-enable NVMe runtime PM for battery/idle profiles."""
-        try:
-            import glob as _glob
-            restored = 0
-            for power_ctrl in _glob.glob('/sys/bus/pci/devices/*/power/control'):
-                class_path = os.path.join(
-                    os.path.dirname(os.path.dirname(power_ctrl)), 'class'
-                )
-                if not os.path.exists(class_path):
-                    continue
-                with open(class_path, 'r') as f:
-                    pci_class = f.read().strip()
-                if pci_class.lower() != '0x010802':
-                    continue
-                with open(power_ctrl, 'w') as f:
-                    f.write('auto\n')
-                restored += 1
-                decky.logger.debug(
-                    f"NVMe autosuspend re-enabled: "
-                    f"{os.path.dirname(os.path.dirname(power_ctrl))}"
-                )
-            return restored > 0
-        except Exception as e:
-            decky.logger.debug(f"NVMe power save restore skipped: {e}")
             return False
 
     async def get_cpu_limits(self) -> Dict[str, int]:
@@ -4731,6 +4547,9 @@ class Plugin:
         auto-applies the matching power profile — without requiring the
         PowerDeck quick-access menu to be open.
 
+        Also monitors AC power state changes and switches between _ac/_battery
+        profiles when the power source changes, even while the same game is running.
+
         Detection method: look for the Steam Reaper process whose cmdline
         contains 'SteamLaunch AppId=<id>' (same approach as SimpleDeckyTDP).
         Returns '00000000' when no game is running (desktop/handheld mode).
@@ -4753,22 +4572,39 @@ class Plugin:
                     # Normalise: treat AppId 0 / 1 as desktop/handheld
                     game_id = raw_id if (match and raw_id not in ("0", "1")) else "00000000"
 
-                    if game_id == self._last_detected_game_id:
-                        continue  # No change — nothing to do
-
-                    prev = self._last_detected_game_id
-                    self._last_detected_game_id = game_id
-
-                    decky.logger.info(
-                        f"Game monitor: game changed {prev!r} -> {game_id!r}, "
-                        f"loading and applying profile"
-                    )
-
-                    # Determine AC/battery suffix via hardware detection
+                    # Detect AC power state change
                     try:
                         ac = await self.get_ac_power_status()
                     except Exception:
                         ac = True  # safe default
+
+                    ac_changed = (self._last_ac_power_state is not None and
+                                  ac != self._last_ac_power_state)
+                    prev_ac = self._last_ac_power_state
+                    self._last_ac_power_state = ac
+
+                    game_changed = (game_id != self._last_detected_game_id)
+
+                    if not game_changed and not ac_changed:
+                        continue  # No change — nothing to do
+
+                    prev_game = self._last_detected_game_id
+                    self._last_detected_game_id = game_id
+
+                    if ac_changed:
+                        decky.logger.info(
+                            f"Power monitor: AC power changed "
+                            f"{'AC' if prev_ac else 'Battery'} -> "
+                            f"{'AC' if ac else 'Battery'}, switching profile"
+                        )
+
+                    if game_changed:
+                        decky.logger.info(
+                            f"Game monitor: game changed {prev_game!r} -> {game_id!r}, "
+                            f"loading and applying profile"
+                        )
+
+                    # Determine AC/battery suffix via hardware detection
                     suffix = "_ac" if ac else "_battery"
                     profile_id = game_id + suffix
 
