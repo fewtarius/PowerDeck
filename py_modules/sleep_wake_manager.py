@@ -233,7 +233,7 @@ class EnhancedSleepWakeManager:
             
             # Get current AC power state
             try:
-                current_ac_power = await self.plugin.get_ac_power()
+                current_ac_power = await self.plugin.get_ac_power_status()
                 event.ac_power_after = current_ac_power
                 decky.logger.info(f"Current AC power state: {current_ac_power}")
             except Exception as e:
@@ -532,8 +532,8 @@ class EnhancedSleepWakeManager:
         
         try:
             # Basic PowerDeck state
-            if hasattr(self.plugin, 'get_ac_power'):
-                state['ac_power'] = await self.plugin.get_ac_power()
+            if hasattr(self.plugin, 'get_ac_power_status'):
+                state['ac_power'] = await self.plugin.get_ac_power_status()
             
             if hasattr(self.plugin, 'current_profile') and self.plugin.current_profile:
                 profile = self.plugin.current_profile
@@ -769,13 +769,13 @@ class EnhancedSleepWakeManager:
         """Validate system state after wake"""
         try:
             # Check GPU mode
-            if hasattr(self.plugin, 'get_gpu_mode'):
-                current_gpu_mode = await self.plugin.get_gpu_mode()
+            if hasattr(self.plugin, 'get_current_gpu_mode'):
+                current_gpu_mode = await self.plugin.get_current_gpu_mode()
                 decky.logger.info(f"Post-wake GPU mode: {current_gpu_mode}")
             
             # Check AC power
-            if hasattr(self.plugin, 'get_ac_power'):
-                current_ac_power = await self.plugin.get_ac_power()
+            if hasattr(self.plugin, 'get_ac_power_status'):
+                current_ac_power = await self.plugin.get_ac_power_status()
                 decky.logger.info(f"Post-wake AC power: {current_ac_power}")
             
             # Validate profile consistency
