@@ -387,8 +387,8 @@ class EnhancedSleepWakeManager:
                             freq_max = current_profile['gpuFreqMax']
                         
                         # Apply frequency limits if specified
-                        if freq_min and freq_max and hasattr(self.plugin, 'set_gpu_frequency_range'):
-                            await self.plugin.set_gpu_frequency_range(freq_min, freq_max)
+                        if freq_min and freq_max and hasattr(self.plugin, 'set_gpu_frequency'):
+                            await self.plugin.set_gpu_frequency(freq_min, freq_max)
                     else:
                         restoration_success = False
                 except Exception:
@@ -412,7 +412,8 @@ class EnhancedSleepWakeManager:
             # 4. Power Management Features Restoration
             await self._restore_power_management_features(current_profile)
             
-            # 5. Force profile application
+            # 5. Force profile application to ensure complete hardware state
+            # Note: This re-applies settings from steps 1-4, which provides a safety net.
             try:
                 if hasattr(self.plugin, 'apply_profile'):
                     profile_success = await self.plugin.apply_profile(current_profile)
@@ -452,8 +453,8 @@ class EnhancedSleepWakeManager:
             # CPU Governor
             if 'governor' in current_profile:
                 governor = current_profile['governor']
-                if hasattr(self.plugin, 'set_cpu_governor'):
-                    await self.plugin.set_cpu_governor(governor)
+                if hasattr(self.plugin, 'set_power_governor'):
+                    await self.plugin.set_power_governor(governor)
             
             # Energy Performance Preference
             if 'epp' in current_profile:
@@ -477,8 +478,8 @@ class EnhancedSleepWakeManager:
             # PCIe ASPM
             if 'pcieAspm' in current_profile:
                 pcie_aspm = current_profile['pcieAspm']
-                if hasattr(self.plugin, 'set_pcie_aspm'):
-                    await self.plugin.set_pcie_aspm(pcie_aspm)
+                if hasattr(self.plugin, 'set_pcie_aspm_policy'):
+                    await self.plugin.set_pcie_aspm_policy("powersave")
                     
         except Exception:
             # Silently handle power management restoration errors to prevent NVMe wake

@@ -2360,7 +2360,8 @@ class Plugin:
                     "smt": True,
                     "cpuCores": max_cores,  # Use processor max cores
                     "governor": "powersave",  # Always use powersave for efficiency
-                    "epp": "balance_performance"  # AC: favour responsiveness over pure efficiency
+                    "epp": "balance_performance",  # AC: favour responsiveness over pure efficiency
+                    "gpuMode": "balanced"  # AC: balanced GPU mode for responsiveness
                 }
             else:
                 # Battery Power: Maximum power efficiency profile (matching SimpleDeckyTDP efficiency)
@@ -2371,7 +2372,8 @@ class Plugin:
                     "smt": False,  # Disable SMT for maximum efficiency (saves ~1W like SimpleDeckyTDP)
                     "cpuCores": max(2, max_cores // 2),  # Half the cores for battery efficiency
                     "governor": "powersave",  # Always use powersave for efficiency
-                    "epp": "power"  # Maximum power efficiency
+                    "epp": "power",  # Maximum power efficiency
+                    "gpuMode": "battery"  # Battery: lowest GPU power mode
                 }
             
             decky.logger.info(f"Target profile: {target_profile_name}")
@@ -2392,7 +2394,8 @@ class Plugin:
                                 "smt": static_profile.get("cpu", {}).get("smt_enabled", fallback_profile["smt"]),
                                 "cpuCores": fallback_profile["cpuCores"],  # Use fallback cores
                                 "governor": static_profile.get("cpu", {}).get("governor", fallback_profile["governor"]),
-                                "epp": static_profile.get("cpu", {}).get("epp", fallback_profile["epp"])
+                                "epp": static_profile.get("cpu", {}).get("epp", fallback_profile["epp"]),
+                                "gpuMode": static_profile.get("gpu", {}).get("mode", fallback_profile["gpuMode"])
                             }
                             decky.logger.info(f"Loaded static profile {target_profile_name}: {profile_data}")
                         else:
