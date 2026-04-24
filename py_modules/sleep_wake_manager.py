@@ -478,8 +478,8 @@ class EnhancedSleepWakeManager:
             # PCIe ASPM
             if 'pcieAspm' in current_profile:
                 pcie_aspm = current_profile['pcieAspm']
-                if hasattr(self.plugin, 'set_pcie_aspm_policy'):
-                    await self.plugin.set_pcie_aspm_policy("powersave")
+                if hasattr(self.plugin, 'set_pcie_power_management'):
+                    await self.plugin.set_pcie_power_management(pcie_aspm)
                     
         except Exception:
             # Silently handle power management restoration errors to prevent NVMe wake
