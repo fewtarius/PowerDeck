@@ -1355,11 +1355,10 @@ class Plugin:
                     # Check if ROG Ally native TDP support is enabled
                     if self.rog_ally_native_tdp_enabled:
                         # Use ROG Ally native TDP control (armoury sysfs - persistent but non-live)
-                        fast_limit = min(tdp + 15, 45)
-                        slow_limit = min(int(tdp * 1.25), 43)
-                        native_success = self.device_controller.set_power_limits(fast_limit, slow_limit, tdp)
+                        # Pin all limits to TDP - user's TDP is the hard cap
+                        native_success = self.device_controller.set_power_limits(tdp, tdp, tdp)
                         if native_success:
-                            decky.logger.info(f"TDP set: sustained={tdp}W fast={fast_limit}W slow={slow_limit}W via ROG Ally native controller")
+                            decky.logger.info(f"TDP set to {tdp}W (all limits pinned) via ROG Ally native controller")
                         else:
                             decky.logger.warning(f"ROG Ally native TDP control failed, falling back to PowerDeck TDP")
                         # ALWAYS also apply via ryzenadj for immediate/live effect.
@@ -1375,11 +1374,10 @@ class Plugin:
                         success = native_success or live_success
                 elif self.device_type == "legion":
                     # Legion WMI control
-                    fast_limit = min(tdp + 15, 45)
-                    slow_limit = min(int(tdp * 1.25), 43)
-                    success = self.device_controller.set_power_limits_wmi(fast_limit, slow_limit, tdp)
+                    # Pin all limits to TDP - user's TDP is the hard cap
+                    success = self.device_controller.set_power_limits_wmi(tdp, tdp, tdp)
                     if success:
-                        decky.logger.info(f"TDP set: sustained={tdp}W fast={fast_limit}W slow={slow_limit}W via {self.device_type} controller")
+                        decky.logger.info(f"TDP set to {tdp}W (all limits pinned) via {self.device_type} controller")
                     else:
                         decky.logger.warning(f"{self.device_type} TDP control failed, falling back to generic")
                 elif self.device_type == "steam_deck":
@@ -1452,16 +1450,14 @@ class Plugin:
             return False
 
     async def set_amd_tdp(self, tdp: int) -> bool:
-        """Set AMD TDP using ryzenadj with tiered burst limits.
+        """Set AMD TDP using ryzenadj with all limits pinned to user's TDP.
 
-        STAPM (sustained) is set to `tdp`. fast_limit and slow_limit are
-        allowed to burst above STAPM, up to hardware-confirmed ceilings.
-        Values are read from the processor database when available and
-        fall back to conservative defaults safe for any AMD handheld/laptop.
-
-        Burst headroom formula:
-          fast_limit  = min(tdp_mw + burst_delta_mw, fast_max_mw)
-          slow_limit  = min(tdp_mw * 1.25,           slow_max_mw)
+        The user's TDP value is treated as a hard cap (max power), not a
+        nominal/sustained target. All three AMD power limits are set to
+        the same value to prevent burst spikes above the user's setting:
+          STAPM limit  = tdp  (sustained/long-term)
+          Fast limit   = tdp  (short burst)
+          Slow limit   = tdp  (medium burst)
         """
         try:
             if not self.ryzenadj_path:
@@ -1486,8 +1482,9 @@ class Plugin:
                 if db_delta:
                     burst_delta_mw = db_delta * 1000
 
-            fast_limit_mw = min(tdp_mw + burst_delta_mw, fast_max_mw)
-            slow_limit_mw = min(int(tdp_mw * 1.25), slow_max_mw)
+            # Pin all limits to user's TDP - the slider is the hard cap, not nominal
+            fast_limit_mw = tdp_mw
+            slow_limit_mw = tdp_mw
 
             cmd = [
                 self.ryzenadj_path,
