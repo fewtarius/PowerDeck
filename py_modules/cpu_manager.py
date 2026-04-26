@@ -37,6 +37,8 @@ class CPUManager:
         self._cpu_siblings_map = {}  # Maps CPU ID to list of sibling CPU IDs (for SMT)
         self._topology_initialized = False
         self._detect_possible_cpus()
+        # Detect scaling driver at init for amd-pstate-epp mode switching
+        self._scaling_driver = self._detect_scaling_driver()
         # Initialize online CPUs list for boost/governor management
         self._online_cpus = self._get_online_cpus()
         
@@ -267,30 +269,13 @@ class CPUManager:
             decky_plugin.logger.error(f"Failed to get current governor: {e}")
         
         return None
-    
-    def set_governor(self, governor: str) -> bool:
-        """Set CPU governor for all cores"""
-        if governor not in self.get_available_governors():
-            decky_plugin.logger.error(f"Governor {governor} not available")
-            return False
-        
+        """Check if we switched amd-pstate-epp to passive mode for boost-disable enforcement."""
         try:
-            success_count = 0
-            for cpu in self._online_cpus:
-                path = f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_governor"
-                if os.path.exists(path):
-                    try:
-                        with open(path, 'w') as f:
-                            f.write(governor)
-                        success_count += 1
-                    except Exception as e:
-                        decky_plugin.logger.error(f"Failed to set governor for CPU {cpu}: {e}")
-            
-            decky_plugin.logger.info(f"Set governor {governor} for {success_count}/{len(self._online_cpus)} CPUs")
-            return success_count > 0
-            
-        except Exception as e:
-            decky_plugin.logger.error(f"Failed to set governor: {e}")
+            if self._scaling_driver != ScalingDriver.AMD_PSTATE_EPP:
+                return False
+            current_mode = self.get_pstate_status()
+            return current_mode == "passive"
+        except Exception:
             return False
     
     # Energy Performance Preference (EPP) Management
@@ -401,9 +386,23 @@ class CPUManager:
         return None
     
     def set_cpu_boost(self, enabled: bool) -> bool:
-        """Set CPU boost enabled/disabled with proper AMD/Intel handling and frequency limits"""
+        """Set CPU boost enabled/disabled with proper AMD/Intel handling and frequency limits.
+        
+    For amd-pstate-epp in active mode: boost=0 is not enforced by the hardware
+    (kernel bug/feature). Instead of switching to passive mode (which increases
+    idle power draw significantly), we rely on EPP=power + powersave governor
+    to autonomously manage frequencies for optimal power efficiency, matching
+    the v1.0.14 behavior that achieved ~5W idle."""
         try:
             boost_success = False
+            
+            # amd-pstate-epp: Do NOT switch to passive mode for boost disable.
+            # Passive mode with schedutil governor increases idle power from ~5W to ~7.5W.
+            # Active mode with EPP=power + powersave governor achieves the best idle power
+            # by letting the hardware autonomously manage P-states efficiently.
+            if self._scaling_driver == ScalingDriver.AMD_PSTATE_EPP:
+                if not enabled:
+                    decky_plugin.logger.info("amd-pstate-epp: boost=0 requested but not enforced in active mode; EPP=power + powersave governor manages frequencies autonomously for optimal power efficiency")
             
             # Intel: no_turbo (inverted logic)
             intel_path = "/sys/devices/system/cpu/intel_pstate/no_turbo"
@@ -446,12 +445,14 @@ class CPUManager:
                     decky_plugin.logger.error(f"Per-CPU boost partially failed: {success_count}/{total_attempts} CPUs succeeded")
                     return False
             
-            # Enforce frequency limits based on boost state
-            if boost_success:
+            # For amd-pstate-epp active mode: frequency limits are managed autonomously
+            # by the EPP scheduler. Do NOT set scaling_max_freq as it's ignored in active
+            # mode and switching to passive mode for enforcement increases idle power.
+            # For Intel and other drivers: enforce frequency limits based on boost state.
+            if boost_success and self._scaling_driver != ScalingDriver.AMD_PSTATE_EPP:
                 freq_range = self.get_cpu_frequency_range()
                 if freq_range:
                     if enabled:
-                        # Boost enabled: Allow full frequency range
                         limit_success = self.set_cpu_frequency_limits(
                             min_freq_khz=freq_range['min_freq_khz'],
                             max_freq_khz=freq_range['max_freq_khz']
@@ -459,18 +460,13 @@ class CPUManager:
                         if limit_success:
                             decky_plugin.logger.info(f"Set frequency limits to full range for boost enabled")
                     else:
-                        # Boost disabled: Limit to base frequency (cpuinfo_max_freq)
-                        base_freq = freq_range['max_freq_khz']  # This is the base frequency when boost is disabled
+                        base_freq = freq_range['max_freq_khz']
                         limit_success = self.set_cpu_frequency_limits(
                             min_freq_khz=freq_range['min_freq_khz'],
                             max_freq_khz=base_freq
                         )
                         if limit_success:
                             decky_plugin.logger.info(f"Set frequency limits to base frequency {base_freq//1000}MHz for boost disabled")
-                        else:
-                            decky_plugin.logger.warning(f"Failed to set frequency limits for boost disabled")
-                else:
-                    decky_plugin.logger.warning("Could not determine frequency range for boost-based limits")
             
             return boost_success
                 
@@ -479,7 +475,33 @@ class CPUManager:
         
         decky_plugin.logger.error("No working CPU boost control method found")
         return False
-    
+   
+   
+   
+    def set_governor(self, governor: str) -> bool:
+        """Set CPU governor for all cores."""
+        if governor not in self.get_available_governors():
+            decky_plugin.logger.error(f"Governor {governor} not available")
+            return False
+        
+        try:
+            success_count = 0
+            for cpu in self._online_cpus:
+                path = f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_governor"
+                if os.path.exists(path):
+                    try:
+                        with open(path, 'w') as f:
+                            f.write(governor)
+                        success_count += 1
+                    except Exception as e:
+                        decky_plugin.logger.error(f"Failed to set governor for CPU {cpu}: {e}")
+            
+            decky_plugin.logger.info(f"Set governor {governor} for {success_count}/{len(self._online_cpus)} CPUs")
+            return success_count > 0
+            
+        except Exception as e:
+            decky_plugin.logger.error(f"Failed to set governor: {e}")
+            return False
     # SMT (Simultaneous Multithreading) Management
     def supports_smt(self) -> bool:
         """Check if SMT control is supported"""
@@ -528,25 +550,19 @@ class CPUManager:
         
         return None
     
-    def get_pstate_active(self) -> bool:
-        """Set P-State to active mode"""
+    def set_pstate_mode(self, mode: str) -> bool:
+        """Set AMD/Intel P-State mode (active, passive, guided)"""
         try:
             # AMD P-State
             amd_path = "/sys/devices/system/cpu/amd_pstate/status"
             if os.path.exists(amd_path):
                 with open(amd_path, 'w') as f:
-                    f.write("active")
-                return True
-            
-            # Intel P-State
-            intel_path = "/sys/devices/system/cpu/intel_pstate/status"
-            if os.path.exists(intel_path):
-                with open(intel_path, 'w') as f:
-                    f.write("active")
+                    f.write(mode)
+                decky_plugin.logger.info(f"Set amd_pstate mode to {mode}")
                 return True
                 
         except Exception as e:
-            decky_plugin.logger.error(f"Failed to set P-State active: {e}")
+            decky_plugin.logger.error(f"Failed to set P-State mode to {mode}: {e}")
         
         return False
     

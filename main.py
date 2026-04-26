@@ -1984,6 +1984,16 @@ class Plugin:
     async def set_power_governor(self, governor: str) -> bool:
         """Set CPU power governor with fallback for unavailable governors"""
         try:
+            # amd-pstate-epp passive mode override: use schedutil for dynamic scaling
+            # within the frequency cap instead of powersave which locks to minimum freq
+            if governor == "powersave" and hasattr(self, 'cpu_manager'):
+                try:
+                    if self.cpu_manager._is_passive_mode_for_epp():
+                        governor = "schedutil"
+                        decky.logger.info("amd-pstate passive mode: using schedutil instead of powersave for dynamic scaling within freq cap")
+                except Exception:
+                    pass  # Fall through to normal governor setting
+
             # Get available governors
             available_governors_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"
             if os.path.exists(available_governors_path):
@@ -2459,6 +2469,12 @@ class Plugin:
                     decky.logger.error(f"Error applying TDP: {e}")
             
             # Apply CPU boost setting
+            # CPU boost: On amd-pstate-epp, boost=0 is not enforced in active mode.
+            # We stay in active EPP mode and rely on EPP=power + powersave governor
+            # for autonomous frequency management (matching v1.0.14 ~5W idle behavior).
+            # The boost toggle has been removed from the UI. We still apply it for
+            # Intel devices and as a best-effort on AMD (the write succeeds but
+            # hardware may ignore it in active mode).
             if "cpuBoost" in profile_data:
                 total_operations += 1
                 try:
