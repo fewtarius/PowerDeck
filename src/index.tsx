@@ -216,7 +216,6 @@ async function updateBackendGameDetection() {
 
 // Backend callable functions - Core System
 const setTdp = callable<[tdp: number], boolean>("set_tdp");
-const setCpuBoost = callable<[enabled: boolean], boolean>("set_cpu_boost");
 const setCpuCores = callable<[cores: number], boolean>("set_cpu_cores");
 const setGovernor = callable<[governor: string], boolean>("set_governor");
 const setFanProfile = callable<[profile: string], boolean>("set_fan_profile");
@@ -1410,13 +1409,6 @@ const Content: React.FC = () => {
     );
   }, [applySettingAndUpdateProfile]);
 
-  const handleCpuBoostChange = useCallback(async (enabled: boolean) => {
-    await applySettingAndUpdateProfile(
-      () => setCpuBoost(enabled),
-      { cpuBoost: enabled },
-      'CPU boost setting'
-    );
-  }, [applySettingAndUpdateProfile]);
 
   const handleCpuCoresChange = useCallback(async (cores: number) => {
     await applySettingAndUpdateProfile(
@@ -1919,16 +1911,9 @@ const Content: React.FC = () => {
           })()}
           step={1}
           onChange={() => {}} // Handle immediate visual updates
-          onChangeEnd={handleCpuCoresChange} // Handle actual setting application
-        />
-        <PanelSectionRow>
-          <ToggleField
-            label="CPU Boost"
-            checked={currentProfile.cpuBoost}
-            onChange={handleCpuBoostChange}
-          />
-        </PanelSectionRow>
-        {deviceInfo?.supports_smt && (
+         onChangeEnd={handleCpuCoresChange} // Handle actual setting application
+       />
+       {deviceInfo?.supports_smt && (
           <PanelSectionRow>
             <ToggleField
               label="SMT (Hyperthreading)"
