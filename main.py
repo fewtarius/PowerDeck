@@ -2278,13 +2278,13 @@ class Plugin:
             if supports_hardware_ac_detection():
                 hardware_status = get_hardware_ac_status()
                 if hardware_status is not None:
-                    decky.logger.info(f"AC_POWER: hardware_status={hardware_status}")
+                    decky.logger.debug(f"AC_POWER: hardware_status={hardware_status}")
                     return hardware_status
             
             # Fallback to psutil if hardware detection unavailable
             battery = psutil.sensors_battery()
             if battery:
-                decky.logger.info(f"AC_POWER: psutil power_plugged={battery.power_plugged}")
+                decky.logger.debug(f"AC_POWER: psutil power_plugged={battery.power_plugged}")
                 return battery.power_plugged
                 
             return False
@@ -2325,10 +2325,10 @@ class Plugin:
 
     async def debug_frontend_state(self, frontend_ac_power: bool, backend_ac_power: bool, action: str) -> bool:
         """Log frontend state for debugging real-time AC monitoring"""
-        decky.logger.info(f"FRONTEND DEBUG: {action}")
-        decky.logger.info(f"  Frontend AC Power: {frontend_ac_power}")
-        decky.logger.info(f"  Backend AC Power: {backend_ac_power}")
-        decky.logger.info(f"  States Match: {frontend_ac_power == backend_ac_power}")
+        decky.logger.debug(f"FRONTEND DEBUG: {action}")
+        decky.logger.debug(f"  Frontend AC Power: {frontend_ac_power}")
+        decky.logger.debug(f"  Backend AC Power: {backend_ac_power}")
+        decky.logger.debug(f"  States Match: {frontend_ac_power == backend_ac_power}")
         return True
 
     async def supports_hardware_ac_detection(self) -> bool:
@@ -3833,8 +3833,14 @@ class Plugin:
                     kwargs["context"] = ctx
                 with urllib.request.urlopen(github_api_url, **kwargs) as response:
                     return json.loads(response.read().decode())
-            except ssl.SSLError:
+            except ssl.SSLError as e:
+                decky.logger.debug(f"SSL error with context {ctx}, trying fallback: {e}")
                 continue
+            except urllib.error.URLError as e:
+                # urllib wraps SSL errors in URLError - check if it's an SSL issue
+                if isinstance(e.reason, ssl.SSLError):
+                    decky.logger.debug(f"URLError with SSL reason, trying fallback: {e.reason}")
+                    continue
             except urllib.error.HTTPError as e:
                 if e.code == 404:
                     decky.logger.info("No releases found in GitHub repository")
@@ -3990,11 +3996,17 @@ class Plugin:
                                 f.write(response.read())
                         downloaded = True
                         break
-                    except ssl.SSLError:
+                    except ssl.SSLError as e:
+                        decky.logger.debug(f"SSL error in stage_update, trying fallback: {e}")
                         continue
-                
-                if not downloaded:
-                    raise Exception("All SSL methods failed for download")
+                    except Exception as e:
+                        # Check if this is a URLError wrapping an SSL error
+                        if hasattr(e, 'reason') and isinstance(e.reason, ssl.SSLError):
+                            decky.logger.debug(f"URLError with SSL reason in stage_update, trying fallback: {e.reason}")
+                            continue
+                    
+                    if not downloaded:
+                        raise Exception("All SSL methods failed for download")
                 
                 decky.logger.info(f"Downloaded update to {update_file}")
             except Exception as e:
@@ -4353,11 +4365,18 @@ class Plugin:
                                     f.write(response.read())
                             downloaded = True
                             break
-                        except ssl.SSLError:
+                        except ssl.SSLError as e:
+                            decky.logger.debug(f"SSL error in download, trying fallback: {e}")
                             continue
+                        except Exception as e:
+                            # Check if this is a URLError wrapping an SSL error
+                            if hasattr(e, 'reason') and isinstance(e.reason, ssl.SSLError):
+                                decky.logger.debug(f"URLError with SSL reason in download, trying fallback: {e.reason}")
+                                continue
+                            raise  # Re-raise non-SSL exceptions
                     
                     if not downloaded:
-                        raise Exception("All SSL methods failed")
+                        raise Exception("All SSL methods failed for download")
                     
                     decky.logger.info(f"Downloaded update to {update_file}")
                 except Exception as e:
@@ -5397,22 +5416,22 @@ async def get_current_game_info():
 
 async def get_device_info():
     """Global function called by frontend"""  
-    decky.logger.info(f"FRONTEND CALL: get_device_info()")
+    decky.logger.debug(f"FRONTEND CALL: get_device_info()")
     result = await plugin.get_device_info()
-    decky.logger.info(f"DEVICE INFO RETURNED TO FRONTEND: {result}")
-    decky.logger.info(f"GPU FIELDS IN RESPONSE: min_gpu_freq={result.get('min_gpu_freq')}, max_gpu_freq={result.get('max_gpu_freq')}")
+    decky.logger.debug(f"DEVICE INFO RETURNED TO FRONTEND: {result}")
+    decky.logger.debug(f"GPU FIELDS IN RESPONSE: min_gpu_freq={result.get('min_gpu_freq')}, max_gpu_freq={result.get('max_gpu_freq')}")
     return result
 
 async def get_ac_power_status():
     """Global function called by frontend"""
-    decky.logger.info(f"FRONTEND CALL: get_ac_power_status()")
+    decky.logger.debug(f"FRONTEND CALL: get_ac_power_status()")
     result = await plugin.get_ac_power_status()
-    decky.logger.info(f"AC Power Status: {result}")
+    decky.logger.debug(f"AC Power Status: {result}")
     return result
 
 async def set_tdp(tdp: int, save_to_profile: bool = False):
     """Global function called by frontend"""
-    decky.logger.info(f"FRONTEND CALL: set_tdp({tdp})")
+    decky.logger.debug(f"FRONTEND CALL: set_tdp({tdp})")
     return await plugin.set_tdp(tdp, save_to_profile)
 
 async def get_current_tdp():
@@ -5454,26 +5473,17 @@ async def get_tdp_control_mode():
 async def get_current_profile():
     """Global function called by frontend"""
     stack = traceback.format_stack()
-    decky.logger.info("GET_CURRENT_PROFILE CALLED BY FRONTEND")
-    decky.logger.info(f"Call stack (last 3 frames):")
-    for i, frame in enumerate(stack[-3:]):
-        decky.logger.info(f"  Frame {i}: {frame.strip()}")
-    
+    decky.logger.debug("GET_CURRENT_PROFILE CALLED BY FRONTEND")
     result = await plugin.get_current_profile()
-    decky.logger.info(f"RETURNING PROFILE TO FRONTEND: TDP={result.get('tdp', 'NOT_SET')}, cpuBoost={result.get('cpuBoost', 'NOT_SET')}")
+    decky.logger.debug(f"RETURNING PROFILE TO FRONTEND: TDP={result.get('tdp', 'NOT_SET')}, cpuBoost={result.get('cpuBoost', 'NOT_SET')}")
     return result
 
 async def save_profile(profile_data):
     """Global function called by frontend"""
     stack = traceback.format_stack()
-    decky.logger.info("SAVE_PROFILE CALLED BY FRONTEND")
-    decky.logger.info(f"Profile data to save: TDP={profile_data.get('tdp', 'NOT_SET')}, cpuBoost={profile_data.get('cpuBoost', 'NOT_SET')}")
-    decky.logger.info(f"Call stack (last 3 frames):")
-    for i, frame in enumerate(stack[-3:]):
-        decky.logger.info(f"  Frame {i}: {frame.strip()}")
-    
+    decky.logger.debug("SAVE_PROFILE CALLED BY FRONTEND")
     result = await plugin.save_profile(profile_data)
-    decky.logger.info(f"SAVE_PROFILE RESULT: {result}")
+    decky.logger.debug(f"SAVE_PROFILE RESULT: {result}")
     return result
 
 async def set_cpu_cores(cores: int):
@@ -5541,7 +5551,7 @@ async def get_cpu_frequency_info():
 
 async def debug_frontend_state(ui_state: bool, ac_power: bool, message: str):
     """Global function for frontend debugging"""
-    decky.logger.info(f"FRONTEND DEBUG: {message} | UI State: {ui_state} | AC Power: {ac_power}")
+    decky.logger.debug(f"FRONTEND DEBUG: {message} | UI State: {ui_state} | AC Power: {ac_power}")
     return True
 
 async def get_available_fan_profiles():
