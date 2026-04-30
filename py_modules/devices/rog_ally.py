@@ -163,11 +163,17 @@ class ROGAllyController:
             if not os.path.exists(path):
                 return False
             
-            result = subprocess.run([
-                'pkexec', 'bash', '-c', f'echo "{value}" > "{path}"'
-            ], capture_output=True, text=True, timeout=10)
-            
-            return result.returncode == 0
+            # Plugin runs as root, write directly (pkexec may not work in Decky context)
+            try:
+                with open(path, 'w') as f:
+                    f.write(value)
+                return True
+            except PermissionError:
+                # Fallback to subprocess if direct write fails
+                result = subprocess.run([
+                    'bash', '-c', f'echo "{value}" > "{path}"'
+                ], capture_output=True, text=True, timeout=10)
+                return result.returncode == 0
         except Exception as e:
             decky_plugin.logger.error(f"Failed to write {value} to {path}: {e}")
             return False
@@ -231,9 +237,14 @@ class ROGAllyController:
         """
         try:
             import subprocess as _sp
+            import os as _os
+            # Clear LD_LIBRARY_PATH to avoid Decky's bundled libs breaking bash
+            clean_env = dict(_os.environ)
+            clean_env.pop("LD_LIBRARY_PATH", None)
             rmmod = _sp.run(
-                ["pkexec", "/usr/bin/bash", "-c", "rmmod amd_pmf 2>/dev/null; modprobe amd_pmf"],
-                capture_output=True, text=True, timeout=10
+                ["bash", "-c", "rmmod amd_pmf 2>/dev/null; modprobe amd_pmf"],
+                capture_output=True, text=True, timeout=10,
+                env=clean_env
             )
             if rmmod.returncode == 0:
                 decky_plugin.logger.info("amd_pmf reloaded — PMF will now hold new armoury power limits")

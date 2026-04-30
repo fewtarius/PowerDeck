@@ -12,6 +12,12 @@ import shutil
 import time
 from typing import Dict, Any, Optional, List, Tuple
 
+# SteamOS Manager (steamos-manager) DBus integration
+# Available on SteamFork 3.8+ and SteamOS 3.5+
+STEAMOS_MANAGER_DBUS_NAME = "com.steampowered.SteamOSManager1"
+STEAMOS_MANAGER_DBUS_PATH = "/com/steampowered/SteamOSManager1"
+STEAMOS_MANAGER_DBUS_IFACE = "com.steampowered.SteamOSManager1.RootManager"
+
 # Add py_modules directory to Python path for dynamic imports
 py_modules_path = os.path.join(os.path.dirname(__file__), 'py_modules')
 if py_modules_path not in sys.path:
@@ -153,7 +159,8 @@ class Plugin:
             "smt": True,
             "cpuCores": None,  # Will be detected from hardware during initialization
             "governor": "powersave",  # Always use powersave for efficiency
-            "epp": "balance_power"  # Conservative EPP setting for efficiency
+            "governor": "performance",  # Performance governor for gaming
+            "epp": "balance_performance"  # Balanced performance as safe default
         }
         # TDP limits will be set from processor database or sysfs during initialization
         self.tdp_limits = {"min": 4, "max": None}  # Min is hard-coded 4W, max from database
@@ -177,6 +184,9 @@ class Plugin:
         self.ryzenadj_path = None
         self.warning_cache = set()  # Track warnings to prevent duplicates
         
+        # SteamOS Manager integration (SteamFork 3.8+ / SteamOS 3.5+)
+        self.steamos_manager_available = False  # Will be detected during init
+        
         # Enhanced sleep/wake management
         self.sleep_wake_manager = None
         
@@ -199,9 +209,216 @@ class Plugin:
         if message not in self.warning_cache:
             self.warning_cache.add(message)
             decky.logger.warning(message)
+
+    # ── SteamOS Manager DBus Integration ──────────────────────────────
+    # SteamFork 3.8+ and SteamOS 3.5+ provide steamos-manager, a system
+    # daemon that manages TDP, CPU boost, governor, performance profiles,
+    # and GPU power via a DBus interface.  When available, we prefer it
+    # over direct ryzenadj/WMI writes because:
+    #   1. It coordinates with amd_pmf to prevent fights over SMU registers
+    #   2. It uses the firmware-attributes (Armoury) interface for persistence
+    #   3. It's the "official" power management path on SteamFork/SteamOS
+    #   4. It avoids the WMI sysfs showing garbage values (5mW bug)
+    #
+    # We still fall back to ryzenadj for live application when
+    # steamos-manager is not available or when the DBus call fails.
+
+    def _detect_steamos_manager(self) -> bool:
+        """Check if steamos-manager DBus service is available on the system bus."""
+        try:
+            # Decky's PyInstaller bundle sets LD_LIBRARY_PATH to its bundled libs,
+            # which can break system binaries like busctl (OpenSSL version mismatch).
+            # Clear LD_LIBRARY_PATH when calling system commands.
+            clean_env = dict(os.environ)
+            clean_env.pop("LD_LIBRARY_PATH", None)
+            
+            result = subprocess.run(
+                ["busctl", "list", "--system"],
+                capture_output=True, text=True, timeout=5,
+                env=clean_env
+            )
+            decky.logger.info(f"SteamOS Manager detection: busctl rc={result.returncode}, "
+                             f"found={STEAMOS_MANAGER_DBUS_NAME in result.stdout}, "
+                             f"stdout_len={len(result.stdout)}")
+            if result.returncode == 0 and STEAMOS_MANAGER_DBUS_NAME in result.stdout:
+                decky.logger.info("SteamOS Manager DBus service detected")
+                return True
+            # Fallback: try checking systemd for the service
+            result2 = subprocess.run(
+                ["systemctl", "is-active", "steamos-manager.service"],
+                capture_output=True, text=True, timeout=5,
+                env=clean_env
+            )
+            if result2.returncode == 0 and "active" in result2.stdout:
+                decky.logger.info("SteamOS Manager detected via systemd (active)")
+                return True
+            decky.logger.info("SteamOS Manager not detected")
+            return False
+        except Exception as e:
+            decky.logger.info(f"SteamOS Manager detection failed: {e}")
+            return False
+
+    def _steamos_manager_call(self, method: str, *args) -> bool:
+        """Call a method on the steamos-manager DBus interface.
+        
+        Uses busctl for simplicity (no Python DBus binding dependency).
+        Returns True if the call succeeded, False otherwise.
+        """
+        if not self.steamos_manager_available:
+            return False
+        try:
+            # Build the busctl command
+            # Clear LD_LIBRARY_PATH to avoid Decky's bundled libs breaking busctl
+            clean_env = dict(os.environ)
+            clean_env.pop("LD_LIBRARY_PATH", None)
+            
+            cmd = [
+                "busctl", "call",
+                STEAMOS_MANAGER_DBUS_NAME,
+                STEAMOS_MANAGER_DBUS_PATH,
+                STEAMOS_MANAGER_DBUS_IFACE,
+                method
+            ]
+            
+            # Add type signatures and arguments
+            if args:
+                # Build type signature string
+                sig_parts = []
+                str_args = []
+                for arg in args:
+                    if isinstance(arg, int):
+                        sig_parts.append("u")  # uint32
+                        str_args.append(str(arg))
+                    elif isinstance(arg, str):
+                        sig_parts.append("s")  # string
+                        str_args.append(f'"{arg}"')
+                    elif isinstance(arg, bool):
+                        sig_parts.append("b")  # boolean
+                        str_args.append("true" if arg else "false")
+                    else:
+                        sig_parts.append("s")
+                        str_args.append(f'"{arg}"')
+                
+                cmd.append("".join(sig_parts))
+                cmd.extend(str_args)
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
+                                   env=clean_env)
+            if result.returncode == 0:
+                decky.logger.info(f"SteamOS Manager: {method}({', '.join(str(a) for a in args)}) succeeded")
+                return True
+            else:
+                decky.logger.warning(
+                    f"SteamOS Manager: {method}({', '.join(str(a) for a in args)}) "
+                    f"failed: {result.stderr.strip()}"
+                )
+                return False
+        except subprocess.TimeoutExpired:
+            decky.logger.warning(f"SteamOS Manager: {method} call timed out")
+            return False
+        except Exception as e:
+            decky.logger.warning(f"SteamOS Manager: {method} call exception: {e}")
+            return False
+
+    async def set_tdp_via_steamos_manager(self, tdp: int) -> bool:
+        """Set TDP via steamos-manager DBus interface.
+        
+        This is the preferred method on SteamFork 3.8+ because it:
+        - Uses the firmware-attributes (Armoury) interface for persistence
+        - Coordinates with amd_pmf to prevent register fights
+        - Sets the platform profile appropriately
+        
+        IMPORTANT: The "performance" profile must be set first to enable
+        TDP limiting. Other profiles like "balanced" may not support TDP control.
+        Valid profile names: "low-power", "balanced", "performance"
+        
+        Returns True if the call succeeded.
+        """
+        try:
+            # Set "performance" profile first - this enables TDP limiting
+            # Valid profiles: low-power, balanced, performance
+            # "game" and "custom" are NOT valid and will fail
+            profile_success = self._steamos_manager_call("SetPerformanceProfile", "performance")
+            if not profile_success:
+                decky.logger.warning("SteamOS Manager: Failed to set 'performance' profile, TDP limiting may not be active")
+            
+            # Set TDP limit (works after performance profile is set)
+            success = self._steamos_manager_call("SetTdpLimit", tdp)
+            
+            if success:
+                decky.logger.info(f"TDP set to {tdp}W via SteamOS Manager")
+            return success
+        except Exception as e:
+            decky.logger.error(f"SteamOS Manager TDP set failed: {e}")
+            return False
+
+    async def set_cpu_boost_via_steamos_manager(self, enabled: bool) -> bool:
+        """Set CPU boost state via steamos-manager DBus interface."""
+        try:
+            success = self._steamos_manager_call("SetCpuBoostState", 1 if enabled else 0)
+            if success:
+                decky.logger.info(f"CPU boost set to {enabled} via SteamOS Manager")
+            return success
+        except Exception as e:
+            decky.logger.error(f"SteamOS Manager CPU boost set failed: {e}")
+            return False
+
+    async def set_governor_via_steamos_manager(self, governor: str) -> bool:
+        """Set CPU scaling governor via steamos-manager DBus interface."""
+        try:
+            success = self._steamos_manager_call("SetCpuScalingGovernor", governor)
+            if success:
+                decky.logger.info(f"CPU governor set to {governor} via SteamOS Manager")
+            return success
+        except Exception as e:
+            decky.logger.error(f"SteamOS Manager governor set failed: {e}")
+            return False
+
+    async def set_gpu_performance_via_steamos_manager(self, level: str) -> bool:
+        """Set GPU performance level via steamos-manager DBus interface."""
+        try:
+            success = self._steamos_manager_call("SetGpuPerformanceLevel", level)
+            if success:
+                decky.logger.info(f"GPU performance level set to {level} via SteamOS Manager")
+            return success
+        except Exception as e:
+            decky.logger.error(f"SteamOS Manager GPU performance set failed: {e}")
+            return False
+
+    async def set_performance_profile_via_steamos_manager(self, profile: str) -> bool:
+        """Set performance profile via steamos-manager DBus interface.
+        
+        Valid steamos-manager profiles: "low-power", "balanced", "performance"
+        "game" and "custom" are NOT valid and will fail.
+        Map common PowerDeck profile names to working ones.
+        """
+        try:
+            # Map profile names to steamos-manager compatible values
+            profile_map = {
+                "performance": "performance",
+                "balanced": "balanced",
+                "battery_saver": "low-power",
+                "power-saver": "low-power",
+                "low-power": "low-power",
+                "game": "performance",  # "game" is not valid, map to "performance"
+                "custom": "balanced",  # "custom" is not valid, map to "balanced"
+            }
+            mapped_profile = profile_map.get(profile, profile)
+            
+            success = self._steamos_manager_call("SetPerformanceProfile", mapped_profile)
+            if success:
+                decky.logger.info(f"Performance profile set to {mapped_profile} (mapped from {profile}) via SteamOS Manager")
+            return success
+        except Exception as e:
+            decky.logger.error(f"SteamOS Manager performance profile set failed: {e}")
+            return False
         
     async def _main(self):
         decky.logger.info("PowerDeck initializing...")
+        
+        # Detect SteamOS Manager availability (SteamFork 3.8+ / SteamOS 3.5+)
+        self.steamos_manager_available = self._detect_steamos_manager()
+        decky.logger.info(f"SteamOS Manager available: {self.steamos_manager_available}")
         
         # Log device support status
         decky.logger.info(f"Device support available: {device_support_available}")
@@ -1198,6 +1415,11 @@ class Plugin:
             
             decky.logger.info(f"FINAL DEVICE INFO scalingDriver: {self.device_info.get('scalingDriver', 'MISSING')}")
             decky.logger.info(f"Device info keys: {list(self.device_info.keys())}")
+            
+            # Include SteamOS Manager availability for frontend
+            self.device_info["steamosManagerAvailable"] = self.steamos_manager_available
+            self.device_info["tdpControlMode"] = await self.get_tdp_control_mode()
+            
             return self.device_info
         except Exception as e:
             decky.logger.error(f"Failed to get device info: {e}")
@@ -1221,13 +1443,13 @@ class Plugin:
                 elif field == 'cpuCores':
                     result[field] = 8
                 elif field == 'cpuBoost':
-                    result[field] = False
+                    result[field] = True
                 elif field == 'smt':
                     result[field] = True
                 elif field == 'governor':
-                    result[field] = 'powersave'
+                    result[field] = 'performance'
                 elif field == 'epp':
-                    result[field] = 'balance_power'
+                    result[field] = 'balance_performance'
         
         decky.logger.info(f"GET_CURRENT_PROFILE: Final result: {result}")
         return result
@@ -1250,7 +1472,14 @@ class Plugin:
             debug_log(f"Full profile: {profile_copy}")
             
             # Create profiles directory structure
-            profiles_dir = os.path.expanduser("~/.config/powerdeck/profiles")
+            # Use decky plugin settings dir instead of ~/.config (which is /root/.config
+            # and read-only on SteamFork).  Fall back to /tmp if settings dir unavailable.
+            try:
+                import decky_plugin
+                profiles_dir = os.path.join(decky_plugin.DECKY_PLUGIN_SETTINGS_DIR, "profiles")
+            except (ImportError, AttributeError):
+                # Fallback: use /tmp which is always writable
+                profiles_dir = "/tmp/powerdeck/profiles"
             os.makedirs(profiles_dir, exist_ok=True)
             debug_log(f"Created profiles directory: {profiles_dir}")
             
@@ -1290,7 +1519,13 @@ class Plugin:
             decky.logger.info(f"PowerDeck Backend: Loading profile for {game_id}")
             
             # Try to load from individual JSON file first (unified schema)
-            profiles_dir = os.path.expanduser("~/.config/powerdeck/profiles")
+            # Use decky plugin settings dir instead of ~/.config (which is /root/.config
+            # and read-only on SteamFork).  Fall back to /tmp if settings dir unavailable.
+            try:
+                import decky_plugin
+                profiles_dir = os.path.join(decky_plugin.DECKY_PLUGIN_SETTINGS_DIR, "profiles")
+            except (ImportError, AttributeError):
+                profiles_dir = "/tmp/powerdeck/profiles"
             profile_filename = f"{game_id}.json"
             profile_filepath = os.path.join(profiles_dir, profile_filename)
             
@@ -1336,7 +1571,14 @@ class Plugin:
             return None
 
     async def set_tdp(self, tdp: int, save_to_profile: bool = False) -> bool:
-        """Set TDP limit using device-specific controller when available"""
+        """Set TDP limit using the best available method.
+        
+        Priority order:
+        1. SteamOS Manager DBus (SteamFork 3.8+) - coordinates with amd_pmf
+        2. Device-specific native controller (ROG Ally Armoury, Legion WMI, etc.)
+        3. ryzenadj for live application (always used as supplement to #1/#2)
+        4. Generic fallback (ryzenadj only)
+        """
         try:
             # Validate TDP range
             min_tdp = self.tdp_limits["min"]
@@ -1348,9 +1590,29 @@ class Plugin:
                 tdp = max_tdp
             
             success = False
+            steamos_success = False
             
-            # Use device-specific controller if available
-            if self.device_controller:
+            # ── Priority 1: SteamOS Manager DBus ──────────────────────
+            # On SteamFork 3.8+ and SteamOS 3.5+, steamos-manager provides
+            # the canonical power management interface. It uses the
+            # firmware-attributes (Armoury) sysfs for persistence and
+            # coordinates with amd_pmf to prevent register fights.
+            if self.steamos_manager_available:
+                steamos_success = await self.set_tdp_via_steamos_manager(tdp)
+                if steamos_success:
+                    decky.logger.info(f"TDP set to {tdp}W via SteamOS Manager (primary)")
+                    # Also apply via ryzenadj for immediate live effect.
+                    # steamos-manager sets Armoury values which amd_pmf
+                    # picks up, but ryzenadj provides instant SMU writes.
+                    live_success = await self.set_amd_tdp(tdp)
+                    if live_success:
+                        decky.logger.info(f"TDP also applied live via ryzenadj: {tdp}W")
+                    success = True
+                else:
+                    decky.logger.warning("SteamOS Manager TDP failed, falling back to device controller")
+            
+            # ── Priority 2: Device-specific native controller ─────────
+            if not success and self.device_controller:
                 if self.device_type == "rog_ally":
                     # Check if ROG Ally native TDP support is enabled
                     if self.rog_ally_native_tdp_enabled:
@@ -1495,7 +1757,11 @@ class Plugin:
                 '--apu-skin-temp', '95'
             ]
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            # Clear LD_LIBRARY_PATH to avoid Decky's bundled libs interfering
+            clean_env = dict(os.environ)
+            clean_env.pop("LD_LIBRARY_PATH", None)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
+                                   env=clean_env)
             if result.returncode == 0:
                 decky.logger.info(
                     f"AMD TDP set: sustained={tdp}W "
@@ -2370,15 +2636,15 @@ class Plugin:
                     decky.logger.warning(f"Failed to get processor database values: {e}")
             
             if is_ac_power:
-                # AC Power: Balanced profile optimized for power efficiency (not max performance)
+                # AC Power: Performance profile for gaming
                 target_profile_name = "performance"
                 fallback_profile = {
                     "tdp": tdp_max,  # Use processor database max TDP (e.g., 30W for 7840U)
-                    "cpuBoost": False,  # Disabled for better power efficiency (matching SimpleDeckyTDP)
+                    "cpuBoost": True,  # Enable boost for gaming performance
                     "smt": True,
                     "cpuCores": max_cores,  # Use processor max cores
-                    "governor": "powersave",  # Always use powersave for efficiency
-                    "epp": "balance_performance",  # AC: favour responsiveness over pure efficiency
+                    "governor": "performance",  # Performance governor for gaming
+                    "epp": "performance",  # AC: maximum performance
                     "gpuMode": "balanced"  # AC: balanced GPU mode for responsiveness
                 }
             else:
@@ -2469,16 +2735,14 @@ class Plugin:
                     decky.logger.error(f"Error applying TDP: {e}")
             
             # Apply CPU boost setting
-            # CPU boost: On amd-pstate-epp, boost=0 is not enforced in active mode.
-            # We stay in active EPP mode and rely on EPP=power + powersave governor
-            # for autonomous frequency management (matching v1.0.14 ~5W idle behavior).
-            # The boost toggle has been removed from the UI. We still apply it for
-            # Intel devices and as a best-effort on AMD (the write succeeds but
-            # hardware may ignore it in active mode).
             if "cpuBoost" in profile_data:
                 total_operations += 1
                 try:
-                    boost_success = await self.set_cpu_boost(profile_data["cpuBoost"])
+                    # Prefer SteamOS Manager for CPU boost on supported systems
+                    if self.steamos_manager_available:
+                        boost_success = await self.set_cpu_boost_via_steamos_manager(profile_data["cpuBoost"])
+                    else:
+                        boost_success = await self.set_cpu_boost(profile_data["cpuBoost"])
                     if boost_success:
                         success_count += 1
                         decky.logger.info(f"Applied CPU boost: {profile_data['cpuBoost']}")
@@ -2525,7 +2789,11 @@ class Plugin:
                 if "governor" in profile_data or "powerGovernor" in profile_data:
                     total_operations += 1
                     try:
-                        governor_success = await self.set_power_governor(governor)
+                        # Prefer SteamOS Manager for governor on supported systems
+                        if self.steamos_manager_available:
+                            governor_success = await self.set_governor_via_steamos_manager(governor)
+                        else:
+                            governor_success = await self.set_power_governor(governor)
                         if governor_success:
                             success_count += 1
                             decky.logger.info(f"Applied CPU governor: {governor}")
@@ -2566,7 +2834,24 @@ class Plugin:
                 total_operations += 1
                 try:
                     gpu_mode = profile_data["gpuMode"]
-                    gpu_success = await self.set_gpu_mode(gpu_mode)
+                    # Prefer SteamOS Manager for GPU performance level on supported systems
+                    if self.steamos_manager_available:
+                        # Map PowerDeck GPU modes to steamos-manager performance levels
+                        gpu_level_map = {
+                            "auto": "auto",
+                            "balanced": "auto",
+                            "low": "low",
+                            "high": "high",
+                            "manual": "high",
+                            "range": "high"
+                        }
+                        gpu_level = gpu_level_map.get(gpu_mode, "auto")
+                        gpu_success = await self.set_gpu_performance_via_steamos_manager(gpu_level)
+                        if not gpu_success:
+                            # Fall back to direct GPU mode setting
+                            gpu_success = await self.set_gpu_mode(gpu_mode)
+                    else:
+                        gpu_success = await self.set_gpu_mode(gpu_mode)
                     if gpu_success:
                         success_count += 1
                         decky.logger.info(f"Applied GPU mode: {gpu_mode}")
@@ -2620,7 +2905,11 @@ class Plugin:
             if "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally":
                 total_operations += 1
                 try:
-                    pp_success = await self.set_rog_ally_platform_profile(profile_data["platformProfile"])
+                    # Prefer SteamOS Manager for platform profile on supported systems
+                    if self.steamos_manager_available:
+                        pp_success = await self.set_performance_profile_via_steamos_manager(profile_data["platformProfile"])
+                    else:
+                        pp_success = await self.set_rog_ally_platform_profile(profile_data["platformProfile"])
                     if pp_success:
                         success_count += 1
                         decky.logger.info(f"Applied ROG Ally platform profile: {profile_data['platformProfile']}")
@@ -3519,8 +3808,11 @@ class Plugin:
             return False
 
     async def get_tdp_control_mode(self) -> str:
-        """Get current TDP control mode (powerdeck, rog_ally_native, etc.)"""
+        """Get current TDP control mode (steamos_manager, rog_ally_native, powerdeck, etc.)"""
         try:
+            # SteamOS Manager takes priority when available
+            if self.steamos_manager_available:
+                return "steamos_manager"
             if self.device_type == "rog_ally":
                 if self.rog_ally_native_tdp_enabled:
                     return "rog_ally_native"
