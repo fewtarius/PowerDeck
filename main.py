@@ -328,16 +328,45 @@ class Plugin:
         - Coordinates with amd_pmf to prevent register fights
         - Sets the platform profile appropriately
         
-        IMPORTANT: The "performance" profile must be set first to enable
-        TDP limiting. Other profiles like "balanced" may not support TDP control.
+        IMPORTANT: The "performance" profile must be active FIRST to enable
+        TDP limiting. If the current profile is "custom", steamos-manager's
+        SetPerformanceProfile will fail. We write directly to sysfs to ensure
+        the transition happens, then call steamos-manager to coordinate.
+        
         Valid profile names: "low-power", "balanced", "performance"
         
         Returns True if the call succeeded.
         """
         try:
-            # Set "performance" profile first - this enables TDP limiting
-            # Valid profiles: low-power, balanced, performance
-            # "game" and "custom" are NOT valid and will fail
+            ACPI_PLATFORM_PROFILE = '/sys/firmware/acpi/platform_profile'
+            ACPI_PLATFORM_CHOICES = '/sys/firmware/acpi/platform_profile_choices'
+            
+            # First, check and set the ACPI platform profile directly
+            # steamos-manager SetPerformanceProfile fails when transitioning
+            # from "custom" profile, so we do it directly here
+            try:
+                if os.path.exists(ACPI_PLATFORM_PROFILE):
+                    current_profile = open(ACPI_PLATFORM_PROFILE, 'r').read().strip()
+                    
+                    # Only change if not already "performance"
+                    if current_profile != "performance":
+                        decky.logger.info(f"ACPI platform profile transitioning from '{current_profile}' to 'performance'")
+                        
+                        # Get valid choices
+                        valid_profiles = []
+                        if os.path.exists(ACPI_PLATFORM_CHOICES):
+                            valid_profiles = open(ACPI_PLATFORM_CHOICES, 'r').read().strip().split()
+                        
+                        if "performance" in valid_profiles:
+                            with open(ACPI_PLATFORM_PROFILE, 'w') as f:
+                                f.write("performance\n")
+                                f.flush()
+                                os.fsync(f.fileno())
+                            decky.logger.info("ACPI platform profile set to 'performance' directly")
+            except Exception as e:
+                decky.logger.warning(f"Failed to set ACPI platform profile directly: {e}")
+            
+            # Now call steamos-manager (should succeed since profile is already "performance")
             profile_success = self._steamos_manager_call("SetPerformanceProfile", "performance")
             if not profile_success:
                 decky.logger.warning("SteamOS Manager: Failed to set 'performance' profile, TDP limiting may not be active")
@@ -391,8 +420,16 @@ class Plugin:
         Valid steamos-manager profiles: "low-power", "balanced", "performance"
         "game" and "custom" are NOT valid and will fail.
         Map common PowerDeck profile names to working ones.
+        
+        IMPORTANT: When transitioning from "custom" profile, we must write
+        directly to sysfs first because steamos-manager's SetPerformanceProfile
+        fails on "custom" state.
         """
         try:
+            ACPI_PLATFORM_PROFILE = '/sys/firmware/acpi/platform_profile'
+            ASUS_PLATFORM_PROFILE = '/sys/devices/platform/asus-nb-wmi/platform-profile/platform-profile-1/profile'
+            ACPI_PLATFORM_CHOICES = '/sys/firmware/acpi/platform_profile_choices'
+            
             # Map profile names to steamos-manager compatible values
             profile_map = {
                 "performance": "performance",
@@ -405,6 +442,41 @@ class Plugin:
             }
             mapped_profile = profile_map.get(profile, profile)
             
+            # Write to both ACPI and ASUS platform profiles
+            # Writing to ASUS profile syncs to ACPI, but we write both for reliability
+            profile_paths = [
+                (ASUS_PLATFORM_PROFILE, "ASUS"),
+                (ACPI_PLATFORM_PROFILE, "ACPI"),
+            ]
+            
+            for profile_path, profile_name in profile_paths:
+                try:
+                    if os.path.exists(profile_path):
+                        # Read current value
+                        current_value = open(profile_path, 'r').read().strip()
+                        
+                        if current_value != mapped_profile:
+                            # Check if value is valid (for ACPI profile)
+                            if profile_name == "ACPI":
+                                valid_profiles = []
+                                if os.path.exists(ACPI_PLATFORM_CHOICES):
+                                    valid_profiles = open(ACPI_PLATFORM_CHOICES, 'r').read().strip().split()
+                                
+                                if valid_profiles and mapped_profile not in valid_profiles:
+                                    decky.logger.warning(f"Invalid {profile_name} profile '{mapped_profile}', available: {valid_profiles}")
+                                    continue
+                            
+                            decky.logger.info(f"{profile_name} platform profile: '{current_value}' -> '{mapped_profile}'")
+                            with open(profile_path, 'w') as f:
+                                f.write(mapped_profile + "\n")
+                                f.flush()
+                                os.fsync(f.fileno())
+                        else:
+                            decky.logger.info(f"{profile_name} platform profile already set to '{mapped_profile}'")
+                except Exception as e:
+                    decky.logger.warning(f"Failed to set {profile_name} platform profile: {e}")
+            
+            # Call steamos-manager to coordinate with amd_pmf
             success = self._steamos_manager_call("SetPerformanceProfile", mapped_profile)
             if success:
                 decky.logger.info(f"Performance profile set to {mapped_profile} (mapped from {profile}) via SteamOS Manager")
@@ -569,6 +641,33 @@ class Plugin:
                     decky.logger.info(f"Detected system default online cores: {online_cores}")
             except (OSError, ValueError):
                 system_defaults["cpuCores"] = 8
+            
+            # Detect current ACPI platform profile (for ROG Ally and similar devices)
+            # This is critical for preserving performance mode during profile operations
+            try:
+                platform_profile_path = "/sys/firmware/acpi/platform_profile"
+                if os.path.exists(platform_profile_path):
+                    with open(platform_profile_path, 'r') as f:
+                        platform_profile = f.read().strip()
+                        system_defaults["platformProfile"] = platform_profile
+                        decky.logger.info(f"Detected system default platform profile: {platform_profile}")
+            except (OSError, ValueError):
+                # Platform profile not available (not ROG Ally), skip silently
+                pass
+                
+            # Detect current GPU mode (for AMD GPUs)
+            try:
+                gpu_dpm_path = "/sys/class/drm/card0/device/power_dpm_force_performance_level"
+                if os.path.exists(gpu_dpm_path):
+                    with open(gpu_dpm_path, 'r') as f:
+                        gpu_mode = f.read().strip()
+                        # Map DPM levels to PowerDeck modes
+                        gpu_mode_map = {"low": "battery", "auto": "balanced", "high": "performance", "manual": "manual"}
+                        system_defaults["gpuMode"] = gpu_mode_map.get(gpu_mode, gpu_mode)
+                        decky.logger.info(f"Detected system default GPU mode: {system_defaults['gpuMode']} (DPM: {gpu_mode})")
+            except (OSError, ValueError):
+                # GPU mode not available, skip silently
+                pass
                 
             decky.logger.info(f"Detected system defaults: {system_defaults}")
             return system_defaults
@@ -1307,12 +1406,36 @@ class Plugin:
                     for field in required_fields:
                         if field not in system_profile:
                             system_profile[field] = self.current_profile.get(field)
+                    
+                    # Add platform profile and GPU mode if detected and available
+                    # These are critical for ROG Ally and similar devices to maintain performance
+                    if self.device_type == "rog_ally":
+                        # On ROG Ally, default to "performance" for AC profiles (gaming focus)
+                        # The detected value may be "custom" which is not a valid ACPI profile
+                        if power_mode == "ac":
+                            system_profile["platformProfile"] = "performance"
+                            decky.logger.info("Setting platformProfile to 'performance' for ROG Ally AC profile")
+                        else:
+                            # Battery profiles can use "balanced" for power saving
+                            system_profile["platformProfile"] = "balanced"
+                            decky.logger.info("Setting platformProfile to 'balanced' for ROG Ally battery profile")
+                    elif "platformProfile" in self.original_hardware_defaults:
+                        # For other devices, use the detected value if available
+                        system_profile["platformProfile"] = self.original_hardware_defaults["platformProfile"]
+                    if "gpuMode" in self.original_hardware_defaults:
+                        system_profile["gpuMode"] = self.original_hardware_defaults["gpuMode"]
                             
-                    debug_log(f"Creating profiles from original hardware defaults: {system_profile}")
+                    decky.logger.info(f"Creating profiles from original hardware defaults: {system_profile}")
                 else:
                     # Fallback to current profile if original defaults not available
                     system_profile = self.current_profile.copy()
-                    debug_log(f"Fallback: Creating profiles from current profile: {system_profile}")
+                    decky.logger.info(f"Fallback: Creating profiles from current profile: {system_profile}")
+                
+                # Log platform profile if detected
+                if "platformProfile" in system_profile:
+                else:
+                    decky.logger.warning("No platformProfile in system_profile, will use default 'performance'")
+                    system_profile["platformProfile"] = "performance"
                 
                 # Create identical AC and battery profiles from true system defaults
                 await self.save_profile({"gameId": "00000000_ac", **system_profile})
@@ -2901,7 +3024,24 @@ class Plugin:
                 except Exception as e:
                     decky.logger.error(f"Error applying PCIe ASPM: {e}")
 
-            # Apply ROG Ally platform profile (e.g. low-power / balanced / performance)
+            # Apply ROG Ally thermal throttle policy FIRST
+            # IMPORTANT: This must be applied BEFORE platform profile, because thermal policy 2
+            # causes the ASUS firmware to revert platform profile to "low-power". Setting platform
+            # profile LAST overrides this revert behavior.
+            if "thermalPolicy" in profile_data and getattr(self, 'device_type', None) == "rog_ally":
+                total_operations += 1
+                try:
+                    tp_success = await self.set_rog_ally_thermal_throttle_policy(profile_data["thermalPolicy"])
+                    if tp_success:
+                        success_count += 1
+                        decky.logger.info(f"Applied ROG Ally thermal policy: {profile_data['thermalPolicy']}")
+                    else:
+                        decky.logger.warning(f"Failed to apply ROG Ally thermal policy: {profile_data['thermalPolicy']}")
+                except Exception as e:
+                    decky.logger.error(f"Error applying ROG Ally thermal policy: {e}")
+            
+            # Apply ROG Ally platform profile LAST
+            # Setting platform profile AFTER thermal policy overrides any reverts caused by thermal policy
             if "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally":
                 total_operations += 1
                 try:
@@ -2917,19 +3057,6 @@ class Plugin:
                         decky.logger.warning(f"Failed to apply ROG Ally platform profile: {profile_data['platformProfile']}")
                 except Exception as e:
                     decky.logger.error(f"Error applying ROG Ally platform profile: {e}")
-
-            # Apply ROG Ally thermal throttle policy
-            if "thermalPolicy" in profile_data and getattr(self, 'device_type', None) == "rog_ally":
-                total_operations += 1
-                try:
-                    tp_success = await self.set_rog_ally_thermal_throttle_policy(profile_data["thermalPolicy"])
-                    if tp_success:
-                        success_count += 1
-                        decky.logger.info(f"Applied ROG Ally thermal policy: {profile_data['thermalPolicy']}")
-                    else:
-                        decky.logger.warning(f"Failed to apply ROG Ally thermal policy: {profile_data['thermalPolicy']}")
-                except Exception as e:
-                    decky.logger.error(f"Error applying ROG Ally thermal policy: {e}")
 
             # Calculate success rate
             if total_operations > 0:
