@@ -1433,6 +1433,7 @@ class Plugin:
                 
                 # Log platform profile if detected
                 if "platformProfile" in system_profile:
+                    decky.logger.info(f"Creating default profiles with platformProfile: {system_profile['platformProfile']}")
                 else:
                     decky.logger.warning("No platformProfile in system_profile, will use default 'performance'")
                     system_profile["platformProfile"] = "performance"
