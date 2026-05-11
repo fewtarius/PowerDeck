@@ -342,6 +342,7 @@ interface DeviceInfo {
   supports_gpu_control: boolean;
   min_gpu_freq: number;
   max_gpu_freq: number;
+  scalingDriver?: string;
 }
 
 // Component for slider with React icon overlays
@@ -1923,79 +1924,80 @@ const Content: React.FC = () => {
             />
           </PanelSectionRow>
         )}
-        <PanelSectionRow>
-          <SliderWithIcons
-            label="CPU Governor"
-            value={(() => {
-              const gov = currentProfile.governor || "powersave";
-              const govOrder = ['powersave', 'conservative', 'ondemand', 'schedutil', 'performance'];
-              const sortedAvailableGovs = availableGovernors
-                .filter(g => govOrder.includes(g))
-                .sort((a, b) => govOrder.indexOf(a) - govOrder.indexOf(b));
-              const govIndex = sortedAvailableGovs.indexOf(gov);
-              return Math.max(0, govIndex);
-            })()}
-            min={0}
-            max={(() => {
-              const govOrder = ['powersave', 'conservative', 'ondemand', 'schedutil', 'performance'];
-              const sortedAvailableGovs = availableGovernors
-                .filter(g => govOrder.includes(g))
-                .sort((a, b) => govOrder.indexOf(a) - govOrder.indexOf(b));
-              return sortedAvailableGovs.length - 1;
-            })()}
-            step={1}
-            icons={(() => {
-              const govOrder = ['powersave', 'conservative', 'ondemand', 'schedutil', 'performance'];
-              const iconMap: { [key: string]: React.ReactNode } = {
-                'powersave': <FaBatteryThreeQuarters />,
-                'conservative': <FaLightbulb />,
-                'ondemand': <FaChartBar />,
-                'schedutil': <FaCogs />,
-                'performance': <FaRocket />
-              };
-              const sortedAvailableGovs = availableGovernors
-                .filter(g => govOrder.includes(g))
-                .sort((a, b) => govOrder.indexOf(a) - govOrder.indexOf(b));
-              return sortedAvailableGovs.map(gov => iconMap[gov] || <FaCogs />);
-            })()}
-            onChange={(value) => {
-              const govOrder = ['powersave', 'conservative', 'ondemand', 'schedutil', 'performance'];
-              const sortedAvailableGovs = availableGovernors
-                .filter(g => govOrder.includes(g))
-                .sort((a, b) => govOrder.indexOf(a) - govOrder.indexOf(b));
-              const selectedGovernor = sortedAvailableGovs[value] || "powersave";
-              handleGovernorChange(selectedGovernor);
-            }}
-          />
-        </PanelSectionRow>
-        <PanelSectionRow>
-          <div style={{ display: 'flex', alignItems: 'center', fontSize: "14px", opacity: 0.7, marginTop: "-6px", marginBottom: "8px", gap: '8px' }}>
-            <span style={{ color: '#00d4ff', fontSize: '1.2em', display: 'flex', alignItems: 'center' }}>
-              {getGovernorIcon(currentProfile.governor || "powersave")}
-            </span>
-            <span>
-              {(() => {
+        {/* CPU Governor - hide when using amd-pstate (guided) where governor is not meaningful */}
+        {deviceInfo?.scalingDriver !== "amd-pstate" && (
+          <PanelSectionRow>
+            <SliderWithIcons
+              label="CPU Governor"
+              value={(() => {
                 const gov = currentProfile.governor || "powersave";
-                const govMap: { [key: string]: string } = {
-                  "powersave": "Power Saving Mode",
-                  "conservative": "Conservative Mode", 
-                  "ondemand": "On Demand Mode",
-                  "schedutil": "Scheduler Utility",
-                  "performance": "Performance Mode"
-                };
-                return govMap[gov] || gov;
+                const govOrder = ['powersave', 'conservative', 'ondemand', 'schedutil', 'performance'];
+                const sortedAvailableGovs = availableGovernors
+                  .filter(g => govOrder.includes(g))
+                  .sort((a, b) => govOrder.indexOf(a) - govOrder.indexOf(b));
+                const govIndex = sortedAvailableGovs.indexOf(gov);
+                return Math.max(0, govIndex);
               })()}
-            </span>
-          </div>
-        </PanelSectionRow>
+              min={0}
+              max={(() => {
+                const govOrder = ['powersave', 'conservative', 'ondemand', 'schedutil', 'performance'];
+                const sortedAvailableGovs = availableGovernors
+                  .filter(g => govOrder.includes(g))
+                  .sort((a, b) => govOrder.indexOf(a) - govOrder.indexOf(b));
+                return sortedAvailableGovs.length - 1;
+              })()}
+              step={1}
+              icons={(() => {
+                const govOrder = ['powersave', 'conservative', 'ondemand', 'schedutil', 'performance'];
+                const iconMap: { [key: string]: React.ReactNode } = {
+                  'powersave': <FaBatteryThreeQuarters />,
+                  'conservative': <FaLightbulb />,
+                  'ondemand': <FaChartBar />,
+                  'schedutil': <FaCogs />,
+                  'performance': <FaRocket />
+                };
+                const sortedAvailableGovs = availableGovernors
+                  .filter(g => govOrder.includes(g))
+                  .sort((a, b) => govOrder.indexOf(a) - govOrder.indexOf(b));
+                return sortedAvailableGovs.map(gov => iconMap[gov] || <FaCogs />);
+              })()}
+              onChange={(value) => {
+                const govOrder = ['powersave', 'conservative', 'ondemand', 'schedutil', 'performance'];
+                const sortedAvailableGovs = availableGovernors
+                  .filter(g => govOrder.includes(g))
+                  .sort((a, b) => govOrder.indexOf(a) - govOrder.indexOf(b));
+                const selectedGovernor = sortedAvailableGovs[value] || "powersave";
+                handleGovernorChange(selectedGovernor);
+              }}
+            />
+          </PanelSectionRow>
+        )}
+        {/* Governor description - show when governor is visible */}
+        {deviceInfo?.scalingDriver !== "amd-pstate" && (
+          <PanelSectionRow>
+            <div style={{ display: 'flex', alignItems: 'center', fontSize: "14px", opacity: 0.7, marginTop: "-6px", marginBottom: "8px", gap: '8px' }}>
+              <span style={{ color: '#00d4ff', fontSize: '1.2em', display: 'flex', alignItems: 'center' }}>
+                {getGovernorIcon(currentProfile.governor || "powersave")}
+              </span>
+              <span>
+                {(() => {
+                  const gov = currentProfile.governor || "powersave";
+                  const govMap: { [key: string]: string } = {
+                    "powersave": "Power Saving Mode",
+                    "conservative": "Conservative Mode", 
+                    "ondemand": "On Demand Mode",
+                    "schedutil": "Scheduler Utility",
+                    "performance": "Performance Mode"
+                  };
+                  return govMap[gov] || gov;
+                })()}
+              </span>
+            </div>
+          </PanelSectionRow>
+        )}
         
-        {/* EPP Section - only show when EPP control is meaningful */}
-        {(() => {
-          const currentGov = currentProfile.governor || "powersave";
-          // Hide EPP when using performance governor with limited EPP options
-          const showEpp = !(currentGov === "performance" && availableGovernors.includes("performance") && availableGovernors.includes("powersave"));
-          return showEpp;
-        })() && (
+        {/* EPP Section - show when using amd-pstate (guided) where EPP controls scheduler behavior */}
+        {deviceInfo?.scalingDriver === "amd-pstate" && (
           <>
             <PanelSectionRow>
               <SliderWithIcons
