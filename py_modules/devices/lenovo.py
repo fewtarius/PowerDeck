@@ -86,13 +86,23 @@ class LenovoLegionController:
                 decky_plugin.logger.error(f"Path does not exist: {path}")
                 return False
             
-            result = subprocess.run([
-                'pkexec', 'bash', '-c', f'echo "{value}" > "{path}"'
-            ], capture_output=True, text=True, timeout=15)
+            # Try direct write first (plugin may run as root)
+            try:
+                with open(path, 'w') as f:
+                    f.write(value)
+                return True
+            except PermissionError:
+                pass
+            
+            # Fallback: use tee to avoid shell interpolation
+            result = subprocess.run(
+                ['pkexec', 'tee', path],
+                input=value.encode(), capture_output=True, timeout=15
+            )
             
             success = result.returncode == 0
             if not success:
-                decky_plugin.logger.error(f"Failed to write {value} to {path}: {result.stderr}")
+                decky_plugin.logger.error(f"Failed to write {value} to {path}: {result.stderr.decode()}")
             
             return success
         except Exception as e:
@@ -193,10 +203,13 @@ class LenovoLegionController:
         # Fallback to ACPI platform profile
         if os.path.exists(ACPI_PLATFORM_PROFILE):
             # Map Legion modes to ACPI profiles
+            # Note: ACPI profile choices vary by device. Common options:
+            #   low-power, balanced, performance (most AMD handhelds)
+            #   powersaver, balanced, performance (some Intel devices)
             acpi_mode_map = {
                 'performance': 'performance',
                 'balanced': 'balanced',
-                'quiet': 'power-saver',
+                'quiet': 'low-power',
                 'custom': 'balanced'
             }
             acpi_mode = acpi_mode_map.get(mode, 'balanced')

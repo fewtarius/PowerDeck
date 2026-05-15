@@ -79,7 +79,7 @@ DEFAULT_THERMAL_THROTTLE_POLICY = 0
 DEFAULT_NV_TEMP_TARGET = 75
 DEFAULT_BOOT_SOUND = True
 DEFAULT_FAN1_PWM_MODE = 2  # Automatic
-DEFAULT_FAN2_PWM_MODE = 0  # Disabled/Manual
+DEFAULT_FAN2_PWM_MODE = 0  # Manual (GPU fan typically not auto-controlled on ROG Ally)
 DEFAULT_CHARGE_MODE = 0    # Standard charging
 
 class ROGAllyController:
@@ -170,9 +170,11 @@ class ROGAllyController:
                 return True
             except PermissionError:
                 # Fallback to subprocess if direct write fails
-                result = subprocess.run([
-                    'bash', '-c', f'echo "{value}" > "{path}"'
-                ], capture_output=True, text=True, timeout=10)
+                # Use tee instead of shell interpolation to avoid injection risk
+                result = subprocess.run(
+                    ['tee', path],
+                    input=value.encode(), capture_output=True, timeout=10
+                )
                 return result.returncode == 0
         except Exception as e:
             decky_plugin.logger.error(f"Failed to write {value} to {path}: {e}")
@@ -238,19 +240,24 @@ class ROGAllyController:
         try:
             import subprocess as _sp
             import os as _os
-            # Clear LD_LIBRARY_PATH to avoid Decky's bundled libs breaking bash
+            # Clear LD_LIBRARY_PATH to avoid Decky's bundled libs breaking system binaries
             clean_env = dict(_os.environ)
             clean_env.pop("LD_LIBRARY_PATH", None)
             rmmod = _sp.run(
-                ["bash", "-c", "rmmod amd_pmf 2>/dev/null; modprobe amd_pmf"],
+                ["rmmod", "amd_pmf"],
                 capture_output=True, text=True, timeout=10,
                 env=clean_env
             )
-            if rmmod.returncode == 0:
+            modprobe = _sp.run(
+                ["modprobe", "amd_pmf"],
+                capture_output=True, text=True, timeout=10,
+                env=clean_env
+            )
+            if modprobe.returncode == 0:
                 decky_plugin.logger.info("amd_pmf reloaded — PMF will now hold new armoury power limits")
             else:
                 # Not fatal — ryzenadj in main.py will still apply live limits
-                decky_plugin.logger.warning(f"amd_pmf reload failed (non-fatal): {rmmod.stderr.strip()}")
+                decky_plugin.logger.warning(f"amd_pmf reload failed (non-fatal): {modprobe.stderr.strip() or rmmod.stderr.strip()}")
         except Exception as e:
             decky_plugin.logger.warning(f"amd_pmf reload exception (non-fatal): {e}")
     
@@ -334,7 +341,13 @@ class ROGAllyController:
         return limits
     
     def set_platform_profile(self, profile: str) -> bool:
-        """Set ACPI platform profile for thermal management"""
+        """Set ACPI platform profile for thermal management
+        
+        Note: If the current profile is 'custom' (a transient state not in
+        the choices list), we force a transition by writing directly to sysfs
+        first. The 'custom' state occurs when firmware-attributes have been
+        modified but the platform profile hasn't been explicitly set.
+        """
         # Map PowerDeck profiles to system profiles
         profile_map = {
             'power-saver': 'low-power',
@@ -350,6 +363,12 @@ class ROGAllyController:
         if choices and system_profile not in choices:
             decky_plugin.logger.error(f"Invalid platform profile: {system_profile}. Available: {choices}")
             return False
+        
+        # Handle the "custom" profile trap: if current profile is 'custom',
+        # we need to force a transition by writing directly
+        current = self.get_platform_profile()
+        if current == 'custom':
+            decky_plugin.logger.info(f"Current profile is 'custom' (transient), forcing transition to {system_profile}")
         
         success = self._write_sysfs_value(ACPI_PLATFORM_PROFILE, system_profile)
         if success:
@@ -381,11 +400,19 @@ class ROGAllyController:
         return success
     
     def get_battery_charge_limit(self) -> Optional[int]:
-        """Get current battery charge limit"""
+        """Get current battery charge limit
+        
+        Note: The charge_control_end_threshold sysfs file may read as 0
+        if no explicit limit has been set since boot. In this case, the
+        actual hardware default is 100% (no limit). We return 100 for a
+        read value of 0 to reflect the true hardware state.
+        """
         limit_str = self._read_sysfs_value(BATTERY_CHARGE_LIMIT)
         if limit_str:
             try:
-                return int(limit_str)
+                val = int(limit_str)
+                # 0 means "not set" / "full charge" - return 100%
+                return 100 if val == 0 else val
             except ValueError:
                 pass
         return None
@@ -537,13 +564,23 @@ class ROGAllyController:
         return None
     
     def set_fan_mode(self, fan_id: int, mode: int) -> bool:
-        """Set fan PWM mode (0=manual, 1=auto-low, 2=auto-normal, 3=auto-high)"""
+        """Set fan PWM mode
+        
+        Valid modes for the ASUS WMI fan controller (hwmon "asus"):
+          0 = Manual (user controls PWM duty cycle)
+          2 = Automatic (firmware controls fan speed)
+        
+        Modes 1 and 3 are NOT supported by the ASUS WMI hwmon interface
+        and will return EINVAL.  The "asus_custom_fan_curve" hwmon supports
+        different mode values but that interface is for curve editing, not
+        basic fan control.
+        """
         if fan_id not in [1, 2]:
             decky_plugin.logger.error(f"Invalid fan ID: {fan_id} (must be 1 or 2)")
             return False
         
-        if not 0 <= mode <= 3:
-            decky_plugin.logger.error(f"Invalid fan mode: {mode} (must be 0-3)")
+        if mode not in [0, 2]:
+            decky_plugin.logger.error(f"Invalid fan mode: {mode} (must be 0=Manual or 2=Auto)")
             return False
         
         if not self.hwmon_path:
@@ -556,7 +593,7 @@ class ROGAllyController:
         success = self._write_sysfs_value(pwm_path, str(mode))
         if success:
             fan_name = "CPU" if fan_id == 1 else "GPU"
-            mode_names = ['Manual', 'Auto Low', 'Auto Normal', 'Auto High']
+            mode_names = {0: 'Manual', 2: 'Auto'}
             decky_plugin.logger.info(f"ROG Ally {fan_name} fan mode set to: {mode_names[mode]}")
         
         return success
@@ -797,21 +834,19 @@ def set_performance_mode(mode: str) -> bool:
         success &= controller.set_platform_profile('low-power')
         success &= controller.set_mcu_powersave(True)
         success &= controller.set_thermal_throttle_policy(1)  # Conservative
-        success &= controller.set_fan_mode(1, 1)  # CPU fan auto-low
+        # Fan stays in Auto (2) for all modes - manual (0) is for advanced users
         if controller.amd_gpu_available:
             success &= controller.set_amd_gpu_power_mode('low')
     elif mode == 'balanced':
         success &= controller.set_platform_profile('balanced')
         success &= controller.set_mcu_powersave(True)
         success &= controller.set_thermal_throttle_policy(0)  # Auto
-        success &= controller.set_fan_mode(1, 2)  # CPU fan auto-normal
         if controller.amd_gpu_available:
             success &= controller.set_amd_gpu_power_mode('auto')
     elif mode == 'performance':
         success &= controller.set_platform_profile('performance')
         success &= controller.set_mcu_powersave(False)
         success &= controller.set_thermal_throttle_policy(0)  # Auto
-        success &= controller.set_fan_mode(1, 3)  # CPU fan auto-high
         if controller.amd_gpu_available:
             success &= controller.set_amd_gpu_power_mode('high')
     else:
