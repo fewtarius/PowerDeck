@@ -402,7 +402,7 @@ const SliderWithIcons: React.FC<{
         max={max}
         step={step}
         notchCount={notchCount}
-        notchLabels={icons.map((_, index) => ({ notchIndex: index, label: "", value: index }))}
+        notchLabels={icons.map((_, index) => ({ notchIndex: index, label: "", value: min + index * step }))}
         notchTicksVisible={true}
         showValue={showValue}
         bottomSeparator={bottomSeparator}
@@ -422,11 +422,15 @@ const SliderWithIcons: React.FC<{
         pointerEvents: 'none',
         zIndex: 10
       }}>
-        {icons.map((icon, index) => (
+        {icons.map((icon, index) => {
+          // Map icon index to slider value: for step=1, value=index*step+min
+          // For step>1 or non-zero min, compute the value this icon represents
+          const iconValue = min + index * step;
+          return (
           <div 
             key={index}
             style={{ 
-              color: value === index ? '#00d4ff' : '#888',
+              color: value === iconValue ? '#00d4ff' : '#888',
               fontSize: '1.2em',
               display: 'flex',
               alignItems: 'center',
@@ -436,7 +440,7 @@ const SliderWithIcons: React.FC<{
           >
             {icon}
           </div>
-        ))}
+        )})}
       </div>
     </div>
   );
@@ -1776,9 +1780,9 @@ const Content: React.FC = () => {
               label="CPU Fan Mode"
               value={rogAllyFanStatus?.cpu_fan?.mode || 2}
               min={0}
-              max={3}
-              step={1}
-              icons={[<FaStopCircle />, <FaVolumeOff />, <FaBalanceScale />, <FaFan />]}
+              max={2}
+              step={2}
+              icons={[<FaStopCircle />, <FaFan />]}
               onChange={async (value) => {
                 const newFanStatus = {
                   ...rogAllyFanStatus,
@@ -1786,7 +1790,7 @@ const Content: React.FC = () => {
                 };
                 setRogAllyFanStatus(newFanStatus);
                 try {
-                  await setRogAllyFanModeBackend(0, value); // CPU fan ID is 0
+                  await setRogAllyFanModeBackend(1, value); // CPU fan ID is 1
                   debug.log(`ROG Ally CPU fan mode set to: ${value}`);
                 } catch (error) {
                   debug.error("Failed to set ROG Ally CPU fan mode:", error);
@@ -1799,9 +1803,9 @@ const Content: React.FC = () => {
               label="GPU Fan Mode"
               value={rogAllyFanStatus?.gpu_fan?.mode || 0}
               min={0}
-              max={3}
-              step={1}
-              icons={[<FaStopCircle />, <FaVolumeOff />, <FaBalanceScale />, <FaFan />]}
+              max={2}
+              step={2}
+              icons={[<FaStopCircle />, <FaFan />]}
               onChange={async (value) => {
                 const newFanStatus = {
                   ...rogAllyFanStatus,
@@ -1809,7 +1813,7 @@ const Content: React.FC = () => {
                 };
                 setRogAllyFanStatus(newFanStatus);
                 try {
-                  await setRogAllyFanModeBackend(1, value); // GPU fan ID is 1
+                  await setRogAllyFanModeBackend(2, value); // GPU fan ID is 2
                   debug.log(`ROG Ally GPU fan mode set to: ${value}`);
                 } catch (error) {
                   debug.error("Failed to set ROG Ally GPU fan mode:", error);

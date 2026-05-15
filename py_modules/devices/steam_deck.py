@@ -91,20 +91,6 @@ class SteamDeckController:
         
         return interfaces
     
-    def _execute_privileged_command(self, command: List[str]) -> bool:
-        """Execute privileged command safely"""
-        try:
-            result = subprocess.run(
-                ['pkexec'] + command,
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            return result.returncode == 0
-        except Exception as e:
-            decky_plugin.logger.error(f"Privileged command failed: {e}")
-            return False
-    
     def _read_sysfs_file(self, path: str) -> Optional[str]:
         """Safely read from sysfs file"""
         try:
@@ -121,9 +107,20 @@ class SteamDeckController:
         if not os.path.exists(path):
             return False
         
-        return self._execute_privileged_command([
-            'bash', '-c', f'echo "{value}" > "{path}"'
-        ])
+        # Try direct write first (plugin may run as root)
+        try:
+            with open(path, 'w') as f:
+                f.write(value)
+            return True
+        except PermissionError:
+            pass
+        
+        # Fallback: use tee to avoid shell interpolation
+        result = subprocess.run(
+            ['pkexec', 'tee', path],
+            input=value.encode(), capture_output=True, timeout=10
+        )
+        return result.returncode == 0
     
     def set_tdp(self, watts: int) -> bool:
         """Set Steam Deck TDP in watts"""
