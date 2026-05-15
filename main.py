@@ -204,6 +204,12 @@ class Plugin:
         self._last_detected_game_id: Optional[str] = None
         self._last_ac_power_state: Optional[bool] = None
         
+        # amd-pstate CPU driver mode (active, passive, guided)
+        # Active: Full EPP control, powersave governor only, best power efficiency
+        # Passive: Scheduler-driven, all governors available, standard cpufreq
+        # Guided: Hybrid, EPP as hint for scheduler, performance/powersave only
+        self.pstate_mode = "guided"  # Default to guided for compatibility
+        
     def log_warning_once(self, message: str):
         """Log a warning message only once to prevent spam"""
         if message not in self.warning_cache:
@@ -2371,9 +2377,216 @@ class Plugin:
             decky.logger.error(f"Failed to set fixed GPU frequency: {e}")
             return False
 
-    async def set_power_governor(self, governor: str) -> bool:
-        """Set CPU power governor with fallback for unavailable governors"""
+    # ── AMD P-State Mode Management ──────────────────────────────────────
+    # amd-pstate supports three operation modes:
+    # - active:  Full hardware control via CPPC (Collaborative Processor Performance Control)
+    #            Provides best power efficiency with EPP (Energy Performance Preference)
+    #            Available governors: performance, powersave only
+    # - passive: Traditional software control via the Linux cpufreq subsystem
+    #            Available governors: all standard governors (schedutil, ondemand, etc.)
+    # - guided:  Hybrid mode where hardware suggests frequencies but kernel can adjust
+    #            Available governors: performance, powersave only
+    PSTATE_MODES = ["active", "passive", "guided"]
+    PSTATE_STATUS_PATH = "/sys/devices/system/cpu/amd_pstate/status"
+
+    async def get_pstate_mode(self) -> str:
+        """Get current amd-pstate operation mode (active, passive, guided)"""
         try:
+            if os.path.exists(self.PSTATE_STATUS_PATH):
+                with open(self.PSTATE_STATUS_PATH, 'r') as f:
+                    current_mode = f.read().strip()
+                    # Cache the mode for quick access
+                    self.pstate_mode = current_mode
+                    return current_mode
+            # Fallback: try to infer from available governors
+            gov_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"
+            if os.path.exists(gov_path):
+                with open(gov_path, 'r') as f:
+                    available = f.read().strip().split()
+                # Active/guided modes only have performance and powersave
+                if set(available) == {"performance", "powersave"}:
+                    # Distinguish active from guided by checking EPP availability
+                    # EPP (energy_performance_preference) is only exposed in active mode
+                    epp_path = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
+                    if os.path.exists(epp_path):
+                        self.pstate_mode = "active"
+                        return "active"
+                    else:
+                        self.pstate_mode = "guided"
+                        return "guided"
+                else:
+                    self.pstate_mode = "passive"
+                    return "passive"
+            return "guided"  # Safe default
+        except Exception as e:
+            decky.logger.error(f"Failed to get pstate mode: {e}")
+            return self.pstate_mode
+    
+    async def set_pstate_mode(self, mode: str) -> bool:
+        """Set amd-pstate operation mode (active, passive, guided)
+        
+        Requires root privileges. Changes take effect immediately.
+        
+        Args:
+            mode: One of "active", "passive", or "guided"
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if mode not in self.PSTATE_MODES:
+            decky.logger.error(f"Invalid pstate mode: {mode}. Valid modes: {self.PSTATE_MODES}")
+            return False
+        
+        try:
+            if not os.path.exists(self.PSTATE_STATUS_PATH):
+                decky.logger.error(f"amd-pstate status file not found at {self.PSTATE_STATUS_PATH}")
+                return False
+            
+            # Check if we have write permissions
+            try:
+                with open(self.PSTATE_STATUS_PATH, 'w') as f:
+                    f.write(mode)
+            except PermissionError:
+                # Need elevated privileges - try via subprocess
+                # Note: mode is validated against PSTATE_MODES above, so it's safe to pass
+                import subprocess
+                clean_env = dict(os.environ)
+                clean_env.pop("LD_LIBRARY_PATH", None)
+                result = subprocess.run(
+                    ["pkexec", "tee", self.PSTATE_STATUS_PATH],
+                    input=mode.encode(), capture_output=True, timeout=10,
+                    env=clean_env
+                )
+                if result.returncode != 0:
+                    decky.logger.error(f"Failed to set pstate mode via pkexec: {result.stderr}")
+                    return False
+            except Exception as e:
+                decky.logger.error(f"Failed to write pstate mode: {e}")
+                return False
+            
+            # Verify the change took effect
+            with open(self.PSTATE_STATUS_PATH, 'r') as f:
+                verified = f.read().strip()
+            
+            if verified != mode:
+                decky.logger.error(f"Pstate mode change failed: requested={mode}, actual={verified}")
+                return False
+            
+            self.pstate_mode = mode
+            decky.logger.info(f"Pstate mode set to: {mode}")
+            
+            # In active/guided modes, ensure a valid governor is set (performance or powersave)
+            # since older governors like ondemand/schedutil won't be available
+            if mode in ("active", "guided"):
+                await self._ensure_valid_governor_for_mode(mode)
+            
+            return True
+            
+        except Exception as e:
+            decky.logger.error(f"Failed to set pstate mode: {e}")
+            return False
+    
+    async def _ensure_valid_governor_for_mode(self, mode: str) -> bool:
+        """Ensure current governor is valid for the given pstate mode
+        
+        In active/guided modes, only 'performance' and 'powersave' governors are valid.
+        If the current governor is invalid (e.g., schedutil, ondemand), switch to
+        'performance' using the standard set_power_governor method which handles
+        per-CPU writes and error reporting.
+        """
+        try:
+            gov_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+            if not os.path.exists(gov_path):
+                return False
+            
+            with open(gov_path, 'r') as f:
+                current = f.read().strip()
+            
+            # In active/guided mode, only performance and powersave are valid
+            valid_governors = ["performance", "powersave"]
+            
+            if current not in valid_governors:
+                decky.logger.warning(f"Governor '{current}' invalid for {mode} mode, switching to 'performance'")
+                return await self.set_power_governor("performance")
+            return False  # Governor was already valid
+            
+        except Exception as e:
+            decky.logger.error(f"Failed to ensure valid governor: {e}")
+            return False
+    
+    async def get_pstate_mode_capabilities(self) -> Dict[str, Any]:
+        """Get capabilities and info based on current pstate mode"""
+        try:
+            current_mode = await self.get_pstate_mode()
+            
+            # Get available governors
+            gov_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"
+            available_governors = []
+            if os.path.exists(gov_path):
+                with open(gov_path, 'r') as f:
+                    available_governors = f.read().strip().split()
+            
+            # Check EPP availability (only in active mode)
+            epp_path = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
+            epp_available = os.path.exists(epp_path)
+            epp_preferences = []
+            epp_pref_path = "/sys/devices/system/cpu/cpufreq/policy0/energy_performance_available_preferences"
+            if os.path.exists(epp_pref_path):
+                with open(epp_pref_path, 'r') as f:
+                    epp_preferences = f.read().strip().split()
+            
+            # Determine mode characteristics
+            characteristics = {
+                "active": {
+                    "description": "Full hardware control (CPPC) - Best power efficiency",
+                    "supports_epp": True,
+                    "available_governors": ["performance", "powersave"],
+                    "epp_options": ["default", "performance", "balance_performance", "balance_power", "power"],
+                    "recommended_for": ["Battery life", "Silent operation", "Power-constrained workloads"]
+                },
+                "passive": {
+                    "description": "Software control (cpufreq) - Full flexibility",
+                    "supports_epp": False,
+                    "available_governors": ["conservative", "ondemand", "userspace", "powersave", "performance", "schedutil"],
+                    "epp_options": [],
+                    "recommended_for": ["Maximum control", "Custom tuning", "Legacy compatibility"]
+                },
+                "guided": {
+                    "description": "Hardware-guided with kernel hints - Balanced approach",
+                    "supports_epp": False,
+                    "available_governors": ["performance", "powersave"],
+                    "epp_options": [],
+                    "recommended_for": ["Balanced performance", "Quick transitions", "General use"]
+                }
+            }
+            
+            return {
+                "current_mode": current_mode,
+                "available_modes": self.PSTATE_MODES,
+                "characteristics": characteristics.get(current_mode, characteristics["guided"]),
+                "available_governors": available_governors,
+                "epp_available": epp_available,
+                "epp_preferences": epp_preferences,
+                # Note: os.access(W_OK) is unreliable for sysfs; we report supported if
+                # the status file exists since pkexec fallback can handle privilege escalation
+                "mode_switch_supported": os.path.exists(self.PSTATE_STATUS_PATH)
+            }
+        except Exception as e:
+            decky.logger.error(f"Failed to get pstate capabilities: {e}")
+            return {"error": str(e)}
+
+    async def set_power_governor(self, governor: str) -> bool:
+        """Set CPU power governor with fallback for unavailable governors
+        
+        In amd-pstate active/guided modes, only 'performance' and 'powersave' are available.
+        In passive mode, all standard governors (schedutil, ondemand, etc.) are available.
+        This method automatically maps unavailable governors to valid alternatives.
+        """
+        try:
+            # Check current pstate mode to understand governor constraints
+            pstate_mode = await self.get_pstate_mode()
+            decky.logger.info(f"SET_POWER_GOVERNOR: Requested '{governor}', current pstate mode: {pstate_mode}")
+            
             # amd-pstate-epp passive mode override: use schedutil for dynamic scaling
             # within the frequency cap instead of powersave which locks to minimum freq
             if governor == "powersave" and hasattr(self, 'cpu_manager'):
@@ -3264,6 +3477,14 @@ class Plugin:
     async def get_available_governors(self) -> List[str]:
         """Get list of available power governors"""
         try:
+            # Get current pstate mode to determine valid governors
+            current_pstate_mode = await self.get_pstate_mode()
+            
+            # In active/guided modes, ondemand is NOT available (only performance/powersave)
+            if current_pstate_mode in ("active", "guided"):
+                decky.logger.info(f"GET_AVAILABLE_GOVERNORS: {current_pstate_mode} mode - limiting to performance/powersave only")
+                return ["performance", "powersave"]
+            
             # First check scaling driver to determine correct governors
             scaling_driver = await self.get_scaling_driver()
             decky.logger.info(f"GET_AVAILABLE_GOVERNORS: Scaling driver: {scaling_driver}")
@@ -6011,6 +6232,21 @@ async def get_current_governor():
 async def get_available_governors():
     """Global function called by frontend"""
     return await plugin.get_available_governors()
+
+async def get_pstate_mode():
+    """Get current amd-pstate operation mode (active, passive, guided) (frontend callable)"""
+    decky.logger.debug(" get_pstate_mode()")
+    return await plugin.get_pstate_mode()
+
+async def set_pstate_mode(mode: str):
+    """Set amd-pstate operation mode (active, passive, guided) (frontend callable)"""
+    decky.logger.debug(f" set_pstate_mode({mode})")
+    return await plugin.set_pstate_mode(mode)
+
+async def get_pstate_mode_capabilities():
+    """Get pstate mode capabilities and info (frontend callable)"""
+    decky.logger.debug(" get_pstate_mode_capabilities()")
+    return await plugin.get_pstate_mode_capabilities()
 
 async def get_tdp_limits():
     """Global function called by frontend - get TDP limits using processor database"""
