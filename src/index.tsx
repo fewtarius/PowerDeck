@@ -243,6 +243,30 @@ const applyProfile = callable<[profile: any], boolean>("apply_profile");
 const getTdpLimits = callable<[], { min: number; max: number }>("get_tdp_limits");
 const getAvailableFanProfiles = callable<[], string[]>("get_available_fan_profiles");
 
+// AMD P-State mode control (active, passive, guided)
+interface PStateModeCharacteristics {
+  description: string;
+  supports_epp: boolean;
+  available_governors: string[];
+  epp_options: string[];
+  recommended_for: string[];
+}
+
+interface PStateModeCapabilities {
+  current_mode: string;
+  available_modes: string[];
+  characteristics: PStateModeCharacteristics;
+  available_governors: string[];
+  epp_available: boolean;
+  epp_preferences: string[];
+  mode_switch_supported: boolean;
+  error?: string;
+}
+
+const getPStateMode = callable<[], string>("get_pstate_mode");
+const setPStateMode = callable<[mode: string], boolean>("set_pstate_mode");
+const getPStateModeCapabilities = callable<[], PStateModeCapabilities>("get_pstate_mode_capabilities");
+
 // ROG Ally specific callable functions
 const getRogAllyDeviceInfo = callable<[], any>("get_rog_ally_device_info");
 const setRogAllyPowerLimitsBackend = callable<[fast_limit: number, sustained_limit: number, stapm_limit: number], boolean>("set_rog_ally_power_limits");
@@ -564,6 +588,11 @@ const Content: React.FC = () => {
   });
   const [rogAllyBatteryChargeLimit, setRogAllyBatteryChargeLimit] = useState<number>(100);
   const [defaultTdp, setDefaultTdp] = useState<number>(15);  // Database default (ctdp_min)
+
+  // AMD P-State Mode Control State
+  const [pstateMode, setLocalPStateMode] = useState<string>("guided");
+  const [pstateCapabilities, setLocalPStateCapabilities] = useState<PStateModeCapabilities | null>(null);
+  const [pstateAvailable, setLocalPStateAvailable] = useState<boolean>(false);
 
   // InputPlumber Integration State
   const [inputPlumberAvailable, setInputPlumberAvailable] = useState<boolean>(false);
@@ -990,6 +1019,20 @@ const Content: React.FC = () => {
         const fanProfiles = await getAvailableFanProfiles();
         setAvailableGovernors(governors);
         setAvailableFanProfiles(fanProfiles);
+        
+        // Load AMD P-State mode info (only on AMD devices)
+        try {
+          const pstateModeData = await getPStateMode();
+          setLocalPStateMode(pstateModeData);
+          const pstateCaps = await getPStateModeCapabilities();
+          setLocalPStateCapabilities(pstateCaps);
+          setLocalPStateAvailable(true);
+          debug.log(`AMD P-State mode: ${pstateModeData}, capabilities loaded`);
+        } catch (error) {
+          // Not an AMD device or amd-pstate not available
+          setLocalPStateAvailable(false);
+          debug.log("AMD P-State not available on this device");
+        }
         
         // Load additional power management settings
         try {
@@ -1778,6 +1821,87 @@ const Content: React.FC = () => {
       )}
 
       {/* TDP Control Section - Hidden on ROG Ally (use Platform Profiles instead) */}
+      
+      {/* AMD P-State Mode Control - Only shown on AMD devices with amd-pstate */}
+      {pstateAvailable && (
+        <PanelSection title="CPU Driver Mode">
+          <PanelSectionRow>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', width: '100%' }}>
+              <span style={{ fontSize: '0.75em', color: '#888888' }}>
+                amd-pstate mode: {pstateCapabilities?.current_mode || pstateMode}
+              </span>
+              <div style={{ display: 'flex', gap: '8px', justifyContent: 'space-between' }}>
+                {[
+                  { id: "active", label: "Active", icon: <FaBolt /> },
+                  { id: "passive", label: "Passive", icon: <FaCogs /> },
+                  { id: "guided", label: "Guided", icon: <FaSlidersH /> }
+                ].map((mode) => (
+                  <button
+                    key={mode.id}
+                    onClick={async () => {
+                      const previousMode = pstateMode;
+                      setLocalPStateMode(mode.id);
+                      try {
+                        const success = await setPStateMode(mode.id);
+                        if (success) {
+                          // Refresh capabilities after mode change
+                          const caps = await getPStateModeCapabilities();
+                          setLocalPStateCapabilities(caps);
+                          // Also refresh available governors since they change with pstate mode
+                          const governors = await getAvailableGovernors();
+                          setAvailableGovernors(governors);
+                          debug.log(`PState mode changed to: ${mode.id}`);
+                        } else {
+                          // Backend rejected the change, rollback UI
+                          setLocalPStateMode(previousMode);
+                          debug.error(`Failed to set pstate mode to ${mode.id}: backend returned false`);
+                        }
+                      } catch (error) {
+                        // Rollback UI on error
+                        setLocalPStateMode(previousMode);
+                        debug.error("Failed to set pstate mode:", error);
+                      }
+                    }}
+                    style={{
+                      flex: 1,
+                      padding: '8px 4px',
+                      background: pstateMode === mode.id ? '#4a9eff' : '#2a2a2a',
+                      border: 'none',
+                      borderRadius: '6px',
+                      color: pstateMode === mode.id ? '#fff' : '#888',
+                      cursor: 'pointer',
+                      fontSize: '0.75em',
+                      display: 'flex',
+                      flexDirection: 'column',
+                      alignItems: 'center',
+                      gap: '4px'
+                    }}
+                  >
+                    <span style={{ fontSize: '1.2em' }}>{mode.icon}</span>
+                    <span>{mode.label}</span>
+                  </button>
+                ))}
+              </div>
+              {pstateCapabilities?.current_mode === "active" && (
+                <span style={{ fontSize: '0.7em', color: '#4CAF50' }}>
+                  EPP control available in this mode
+                </span>
+              )}
+              {pstateCapabilities?.current_mode === "passive" && (
+                <span style={{ fontSize: '0.7em', color: '#FF9800' }}>
+                  All governors available in this mode
+                </span>
+              )}
+              {pstateCapabilities?.current_mode === "guided" && (
+                <span style={{ fontSize: '0.7em', color: '#2196F3' }}>
+                  Hardware-guided scheduling with kernel hints
+                </span>
+              )}
+            </div>
+          </PanelSectionRow>
+        </PanelSection>
+      )}
+      
       {(() => {
         const shouldShow = !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled);
         debug.log(`TDP Control visibility: isRogAllyDeviceDetected=${isRogAllyDeviceDetected}, rogAllyNativeTdpEnabled=${rogAllyNativeTdpEnabled}, shouldShow=${shouldShow}`);
