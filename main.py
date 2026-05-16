@@ -703,11 +703,12 @@ class Plugin:
                     # Get TDP limits from processor database
                     tdp_min, tdp_max = get_processor_tdp_limits()  # Returns (4, database_max)
                     
-                    # CORRECTED: Use processor tdp_min as PowerDeck default (NOT default_tdp)
+                    # Use processor default_tdp as PowerDeck default - this is the nominal TDP
+                    # Users can lower it for battery saving or raise it for performance
                     processor_info = get_current_processor_info()
                     if processor_info.get("detected"):
-                        # Use the processor's minimum TDP as PowerDeck default (15W for 7840U)
-                        tdp_default = processor_info.get("tdp_min", 15)
+                        # Use the processor's default (nominal) TDP, not the minimum
+                        tdp_default = processor_info.get("default_tdp", processor_info.get("tdp_min", 15))
                     else:
                         # Fallback conservative default
                         tdp_default = 15
@@ -720,7 +721,7 @@ class Plugin:
                     # Set PowerDeck default TDP from processor minimum TDP
                     if self.current_profile["tdp"] is None:
                         self.current_profile["tdp"] = tdp_default
-                        decky.logger.info(f"Set PowerDeck default TDP to processor minimum: {tdp_default}W")
+                        decky.logger.info(f"Set PowerDeck default TDP to processor nominal: {tdp_default}W")
                     
                     decky.logger.info(f"Applied processor database TDP limits: {tdp_min}W - {tdp_max}W (PowerDeck default: {tdp_default}W)")
                     
@@ -839,14 +840,14 @@ class Plugin:
                         self.device_info["min_tdp"] = proc_tdp_min
                         self.device_info["max_tdp"] = proc_tdp_max
                         
-                        # CORRECTED: Set PowerDeck default TDP from processor tdp_min (NOT default_tdp)
-                        # PowerDeck default = processor minimum TDP for conservative startup
-                        processor_min_tdp = self.processor_info.get('tdp_min')
-                        if processor_min_tdp:
-                            self.current_profile["tdp"] = processor_min_tdp
-                            decky.logger.info(f"Set PowerDeck default TDP to processor minimum: {processor_min_tdp}W")
+                        # Set PowerDeck default TDP from processor default_tdp (nominal TDP)
+                        # Users can lower it for battery saving or raise it for performance
+                        processor_default_tdp = self.processor_info.get('default_tdp', self.processor_info.get('tdp_min'))
+                        if processor_default_tdp:
+                            self.current_profile["tdp"] = processor_default_tdp
+                            decky.logger.info(f"Set PowerDeck default TDP to processor nominal: {processor_default_tdp}W")
                         else:
-                            decky.logger.warning("No processor tdp_min found, keeping current default")
+                            decky.logger.warning("No processor default_tdp found, keeping current default")
                         
                         # Check if it's a handheld device
                         if is_handheld_device():
@@ -1317,45 +1318,46 @@ class Plugin:
             if profile_data:
                 debug_log(f"Successfully loaded unified profile {profile_id}: {profile_data}")
                 
-                # CRITICAL FIX: Use processor tdp_min as PowerDeck default (NOT default_tdp)
-                # PowerDeck default TDP = processor minimum TDP, range = 4W to processor max TDP
-                processor_min_tdp = 15  # Fallback default
+                # Use processor default_tdp (nominal TDP) as the PowerDeck default
+                # Users can adjust up or down from this starting point
+                processor_default_tdp = 25  # Fallback default (reasonable for most handhelds)
                 if processor_support_available:
                     try:
                         from processor_detection import get_current_processor_info
                         proc_info = get_current_processor_info()
                         if proc_info and proc_info.get('detected', False):
-                            processor_min_tdp = proc_info.get('tdp_min', 15)
+                            processor_default_tdp = proc_info.get('default_tdp', proc_info.get('tdp_min', 25))
                     except Exception:
                         pass
                 
                 loaded_tdp = profile_data.get("tdp", 10)  # TDP from saved profile
                 
                 # SAFETY CHECK: Never force TDP to unreasonable values
-                if processor_min_tdp <= 0 or processor_min_tdp > 30:
-                    processor_min_tdp = 15  # Safe fallback for handheld devices
-                    decky.logger.warning(f"Processor database returned invalid minimum TDP {processor_min_tdp}W, using fallback 15W")
+                if processor_default_tdp <= 0 or processor_default_tdp > 100:
+                    processor_default_tdp = 25  # Safe fallback for handheld devices
+                    decky.logger.warning(f"Processor database returned invalid default TDP {processor_default_tdp}W, using fallback 25W")
                 
-                # CRITICAL FIX: Validate CPU boost against true system defaults (enabled by default)
-                # CPU boost should be enabled by default on most systems - PowerDeck should not disable it by default
-                expected_cpu_boost = True  # True system default - users can disable manually if desired
-                loaded_cpu_boost = profile_data.get("cpuBoost", False)  # CPU boost from saved profile
+                # Validate profile values - only fix truly invalid values, never override user preferences
+                loaded_cpu_boost = profile_data.get("cpuBoost", None)  # CPU boost from saved profile
                 
                 profile_updated = False
                 
-                # IMPORTANT: Only update profiles if they have clearly invalid values (0W TDP)
-                # Do NOT override user preferences with processor database values
+                # Only fix profiles with clearly invalid values (0W TDP, None values)
+                # User preferences are ALWAYS preserved - if they set TDP to 15W or cpuBoost to False, that stays
                 if loaded_tdp <= 0:
-                    decky.logger.info(f"INVALID TDP: Profile has {loaded_tdp}W, setting to processor minimum {processor_min_tdp}W")
-                    profile_data["tdp"] = processor_min_tdp
+                    decky.logger.info(f"INVALID TDP: Profile has {loaded_tdp}W, setting to processor default {processor_default_tdp}W")
+                    profile_data["tdp"] = processor_default_tdp
                     profile_updated = True
                 else:
                     decky.logger.info(f"USER TDP PRESERVED: Profile TDP {loaded_tdp}W is valid, keeping user preference")
                     
-                if loaded_cpu_boost != expected_cpu_boost:
-                    decky.logger.info(f"CPU BOOST MISMATCH: Profile has {loaded_cpu_boost}, system default should be {expected_cpu_boost} - updating profile")
-                    profile_data["cpuBoost"] = expected_cpu_boost
+                # Only fix cpuBoost if it's explicitly None (missing/undefined), not if user set it to False
+                if loaded_cpu_boost is None:
+                    decky.logger.info(f"CPU BOOST UNSET: Profile has no cpuBoost value, defaulting to True")
+                    profile_data["cpuBoost"] = True
                     profile_updated = True
+                else:
+                    decky.logger.info(f"USER CPU BOOST PRESERVED: Profile cpuBoost={loaded_cpu_boost}, keeping user preference")
                 
                 if profile_updated:
                     # Save the corrected profile back to disk
@@ -1371,11 +1373,12 @@ class Plugin:
                         companion_tdp = companion_profile.get("tdp", 0)
                         # Only fix companion profile if it has invalid TDP (0W or negative)
                         if companion_tdp <= 0:
-                            companion_profile["tdp"] = processor_min_tdp
+                            companion_profile["tdp"] = processor_default_tdp
                             companion_updated = True
-                            decky.logger.info(f"Fixed companion profile {companion_id} invalid TDP: {companion_tdp}W -> {processor_min_tdp}W")
-                        if companion_profile.get("cpuBoost") != expected_cpu_boost:
-                            companion_profile["cpuBoost"] = expected_cpu_boost
+                            decky.logger.info(f"Fixed companion profile {companion_id} invalid TDP: {companion_tdp}W -> {processor_default_tdp}W")
+                        # Only fix companion cpuBoost if it's None (unset), not if user deliberately set it to False
+                        if companion_profile.get("cpuBoost") is None:
+                            companion_profile["cpuBoost"] = True
                             companion_updated = True
                         if companion_updated:
                             await self.save_profile({"gameId": companion_id, **companion_profile})
@@ -1416,15 +1419,10 @@ class Plugin:
                     # Add platform profile and GPU mode if detected and available
                     # These are critical for ROG Ally and similar devices to maintain performance
                     if self.device_type == "rog_ally":
-                        # On ROG Ally, default to "performance" for AC profiles (gaming focus)
-                        # The detected value may be "custom" which is not a valid ACPI profile
-                        if power_mode == "ac":
-                            system_profile["platformProfile"] = "performance"
-                            decky.logger.info("Setting platformProfile to 'performance' for ROG Ally AC profile")
-                        else:
-                            # Battery profiles can use "balanced" for power saving
-                            system_profile["platformProfile"] = "balanced"
-                            decky.logger.info("Setting platformProfile to 'balanced' for ROG Ally battery profile")
+                        # On ROG Ally, default to "performance" for both AC and battery profiles
+                        # Users can change this in the UI if they want power saving on battery
+                        system_profile["platformProfile"] = "performance"
+                        decky.logger.info(f"Setting platformProfile to 'performance' for ROG Ally {power_mode} profile")
                     elif "platformProfile" in self.original_hardware_defaults:
                         # For other devices, use the detected value if available
                         system_profile["platformProfile"] = self.original_hardware_defaults["platformProfile"]
@@ -1747,23 +1745,28 @@ class Plugin:
                     # Check if ROG Ally native TDP support is enabled
                     if self.rog_ally_native_tdp_enabled:
                         # Use ROG Ally native TDP control (armoury sysfs - persistent but non-live)
-                        # Pin all limits to TDP - user's TDP is the hard cap
-                        native_success = self.device_controller.set_power_limits(tdp, tdp, tdp)
+                        # Use tiered limits: fast > sustained > stapm for better burst performance.
+                        # The Armoury Crate firmware has max limits per attribute (e.g. STAPM max 25W
+                        # on Z1 Extreme), and set_power_limits() clamps values to those maximums.
+                        fast_limit = min(tdp + 15, 45)   # Z1 Extreme ceiling: 45W
+                        sustained_limit = min(int(tdp * 1.25), 43)  # Z1 Extreme ceiling: 43W
+                        native_success = self.device_controller.set_power_limits(fast_limit, sustained_limit, tdp)
                         if native_success:
-                            decky.logger.info(f"TDP set to {tdp}W (all limits pinned) via ROG Ally native controller")
+                            decky.logger.info(f"TDP set to {tdp}W via ROG Ally native controller (STAPM={tdp}W, sustained={sustained_limit}W, fast={fast_limit}W)")
                         else:
-                            decky.logger.warning(f"ROG Ally native TDP control failed, falling back to PowerDeck TDP")
+                            decky.logger.error(f"ROG Ally native TDP control failed - Armoury Crate writes may be rejected. Check firmware max limits.")
                         # ALWAYS also apply via ryzenadj for immediate/live effect.
-                        # Armoury writes are persistent but only take effect at firmware init,
-                        # not at runtime.  ryzenadj writes via /dev/mem and is effective
-                        # immediately.  Both paths are kept: armoury for persistence,
-                        # ryzenadj for live application.
+                        # Armoury writes are persistent but only take effect after amd_pmf
+                        # reload, while ryzenadj writes via /dev/mem are effective immediately.
+                        # Both paths are needed: armoury for persistence, ryzenadj for live.
                         live_success = await self.set_amd_tdp(tdp)
                         if live_success:
                             decky.logger.info(f"TDP applied live via ryzenadj: {tdp}W")
                         else:
                             decky.logger.warning(f"ryzenadj live TDP apply failed for {tdp}W")
-                        success = native_success or live_success
+                        # Native controller success is authoritative - ryzenadj alone is not
+                        # sufficient because amd_pmf overrides ryzenadj values within 1 second.
+                        success = native_success
                 elif self.device_type == "legion":
                     # Legion WMI control
                     # Pin all limits to TDP - user's TDP is the hard cap
@@ -1842,14 +1845,14 @@ class Plugin:
             return False
 
     async def set_amd_tdp(self, tdp: int) -> bool:
-        """Set AMD TDP using ryzenadj with all limits pinned to user's TDP.
+        """Set AMD TDP using ryzenadj with tiered burst limits.
 
-        The user's TDP value is treated as a hard cap (max power), not a
-        nominal/sustained target. All three AMD power limits are set to
-        the same value to prevent burst spikes above the user's setting:
+        The user's TDP value is the sustained/STAPM target. Fast and slow
+        limits are set higher to allow burst performance while keeping
+        sustained power at the user's setting:
           STAPM limit  = tdp  (sustained/long-term)
-          Fast limit   = tdp  (short burst)
-          Slow limit   = tdp  (medium burst)
+          Fast limit   = min(tdp + 15, 45)  (short burst, Z1E ceiling 45W)
+          Slow limit   = min(tdp * 1.25, 43)  (medium burst, Z1E ceiling 43W)
         """
         try:
             if not self.ryzenadj_path:
@@ -1858,25 +1861,10 @@ class Plugin:
 
             tdp_mw = tdp * 1000
 
-            # Pull burst ceilings from processor database if available
-            fast_max_mw   = 45000  # Conservative default (7840U / Z1E confirmed)
-            slow_max_mw   = 43000  # Conservative default
-            burst_delta_mw = 15000  # Default headroom above STAPM for fast burst
-
-            if self.processor_info:
-                db_fast = self.processor_info.get('tdp_fast_limit_max')
-                db_slow = self.processor_info.get('tdp_slow_limit_max')
-                db_delta = self.processor_info.get('tdp_burst_delta')
-                if db_fast:
-                    fast_max_mw = db_fast * 1000
-                if db_slow:
-                    slow_max_mw = db_slow * 1000
-                if db_delta:
-                    burst_delta_mw = db_delta * 1000
-
-            # Pin all limits to user's TDP - the slider is the hard cap, not nominal
-            fast_limit_mw = tdp_mw
-            slow_limit_mw = tdp_mw
+            # Tiered burst limits: fast > slow > stapm for better responsiveness
+            # Z1 Extreme ceiling: fast 45W, slow 43W (confirmed hardware values)
+            fast_limit_mw = min(tdp_mw + 15000, 45000)
+            slow_limit_mw = min(int(tdp_mw * 1.25), 43000)
 
             cmd = [
                 self.ryzenadj_path,
@@ -2944,7 +2932,13 @@ class Plugin:
             return False
 
     async def auto_switch_power_profile(self) -> bool:
-        """Automatically switch between AC and battery profiles based on power state"""
+        """Automatically switch between AC and battery profiles based on power state.
+        
+        Uses the user's saved profiles as the source of truth. Never forces
+        conservative defaults - the user's settings always take priority.
+        Only creates a new profile from current hardware state if no saved
+        profile exists for the power mode.
+        """
         try:
             decky.logger.info("=== AUTO POWER PROFILE SWITCHING ===")
             
@@ -2952,82 +2946,44 @@ class Plugin:
             is_ac_power = await self.get_ac_power_status()
             decky.logger.info(f"Current power state: {'AC' if is_ac_power else 'Battery'}")
             
-            # Get TDP values using new processor database logic
-            tdp_min = 4  # Hard-coded minimum for underclocking  
-            tdp_max = 25  # Fallback maximum
-            tdp_default = 15  # Fallback default
-            max_cores = 8  # Fallback default
+            # Determine the profile suffix based on power state
+            suffix = "_ac" if is_ac_power else "_battery"
             
-            # Get dynamic values from processor database if available
-            if processor_support_available:
-                try:
-                    # Get TDP limits: (hard_coded_min=4W, database_max)
-                    tdp_min, tdp_max = get_processor_tdp_limits()
-                    # Get default TDP from database ctdp_min
-                    tdp_default = get_processor_default_tdp()
-                    processor_info = get_current_processor_info()
-                    if processor_info and processor_info.get("detected", False):
-                        max_cores = processor_info.get("max_cpu_cores", 8)
-                        decky.logger.info(f"Using processor database: min={tdp_min}W (hard-coded), default={tdp_default}W (DB ctdp_min), max={tdp_max}W (DB ctdp_max), cores={max_cores}")
-                except Exception as e:
-                    decky.logger.warning(f"Failed to get processor database values: {e}")
+            # Priority 1: Load the user's saved default profile for this power state
+            # The user's saved profiles are the source of truth - never override them
+            default_profile_id = f"00000000{suffix}"
+            profile_data = await self.load_profile(default_profile_id)
             
-            if is_ac_power:
-                # AC Power: Performance profile for gaming
-                target_profile_name = "performance"
-                fallback_profile = {
-                    "tdp": tdp_max,  # Use processor database max TDP (e.g., 30W for 7840U)
-                    "cpuBoost": True,  # Enable boost for gaming performance
-                    "smt": True,
-                    "cpuCores": max_cores,  # Use processor max cores
-                    "governor": "performance",  # Performance governor for gaming
-                    "epp": "performance",  # AC: maximum performance
-                    "gpuMode": "balanced"  # AC: balanced GPU mode for responsiveness
-                }
+            if profile_data:
+                decky.logger.info(f"Auto-switch: Loaded user profile {default_profile_id}: {profile_data}")
             else:
-                # Battery Power: Maximum power efficiency profile (matching SimpleDeckyTDP efficiency)
-                target_profile_name = "battery_saver"
-                fallback_profile = {
-                    "tdp": max(4, tdp_default - 3),  # More conservative TDP for battery (e.g., 12W for 7840U)
-                    "cpuBoost": False,  # Always disabled on battery
-                    "smt": False,  # Disable SMT for maximum efficiency (saves ~1W like SimpleDeckyTDP)
-                    "cpuCores": max(2, max_cores // 2),  # Half the cores for battery efficiency
-                    "governor": "powersave",  # Always use powersave for efficiency
-                    "epp": "power",  # Maximum power efficiency
-                    "gpuMode": "battery"  # Battery: lowest GPU power mode
-                }
-            
-            decky.logger.info(f"Target profile: {target_profile_name}")
-            
-            # Try to load the target profile from saved profiles
-            profile_data = None
-            try:
-                profiles_file = os.path.join(os.path.dirname(__file__), "..", "settings", "PowerDeck", "PowerDeck", "profiles.json")
-                if os.path.exists(profiles_file):
-                    with open(profiles_file, 'r') as f:
-                        profiles = json.load(f)
-                        if target_profile_name in profiles.get("profiles", {}):
-                            static_profile = profiles["profiles"][target_profile_name]
-                            # Convert static profile format to PowerDeck format
-                            profile_data = {
-                                "tdp": static_profile.get("tdp", fallback_profile["tdp"]),
-                                "cpuBoost": static_profile.get("cpu", {}).get("boost_enabled", fallback_profile["cpuBoost"]),
-                                "smt": static_profile.get("cpu", {}).get("smt_enabled", fallback_profile["smt"]),
-                                "cpuCores": fallback_profile["cpuCores"],  # Use fallback cores
-                                "governor": static_profile.get("cpu", {}).get("governor", fallback_profile["governor"]),
-                                "epp": static_profile.get("cpu", {}).get("epp", fallback_profile["epp"]),
-                                "gpuMode": static_profile.get("gpu", {}).get("mode", fallback_profile["gpuMode"])
-                            }
-                            decky.logger.info(f"Loaded static profile {target_profile_name}: {profile_data}")
-                        else:
-                            decky.logger.warning(f"Static profile {target_profile_name} not found, using fallback")
-                            profile_data = fallback_profile
-                else:
-                    decky.logger.warning(f"Profiles file not found, using fallback")
-                    profile_data = fallback_profile
-            except Exception as e:
-                decky.logger.warning(f"Failed to load static profile {target_profile_name}: {e}")
-                profile_data = fallback_profile
+                decky.logger.warning(f"Auto-switch: No user profile found for {default_profile_id}, creating from current profile")
+                # Create a profile from current settings rather than using hardcoded conservative values
+                profile_data = dict(self.current_profile)
+                # Ensure essential fields are present from processor database
+                if "tdp" not in profile_data or profile_data["tdp"] is None:
+                    if processor_support_available:
+                        try:
+                            profile_data["tdp"] = get_processor_default_tdp()
+                        except Exception:
+                            profile_data["tdp"] = self.tdp_limits.get("max", 25)
+                    else:
+                        profile_data["tdp"] = self.tdp_limits.get("max", 25)
+                if "cpuBoost" not in profile_data or profile_data["cpuBoost"] is None:
+                    profile_data["cpuBoost"] = True
+                if "smt" not in profile_data or profile_data["smt"] is None:
+                    profile_data["smt"] = True
+                if "cpuCores" not in profile_data or profile_data["cpuCores"] is None:
+                    profile_data["cpuCores"] = self.device_info.get("max_cpu_cores", 8)
+                if "governor" not in profile_data or profile_data["governor"] is None:
+                    profile_data["governor"] = "performance" if is_ac_power else "schedutil"
+                if "epp" not in profile_data or profile_data["epp"] is None:
+                    profile_data["epp"] = "performance" if is_ac_power else "balance_performance"
+                if "gpuMode" not in profile_data or profile_data["gpuMode"] is None:
+                    profile_data["gpuMode"] = "auto"
+                # Save it so it exists next time
+                await self.save_profile({"gameId": default_profile_id, **profile_data})
+                decky.logger.info(f"Auto-switch: Created default profile {default_profile_id} from current settings")
             
             # Apply the profile
             if profile_data:
@@ -3037,10 +2993,10 @@ class Plugin:
                 # Apply the settings to hardware
                 success = await self.apply_profile(profile_data)
                 if success:
-                    decky.logger.info(f"Successfully applied {target_profile_name} profile for {'AC' if is_ac_power else 'Battery'} power")
+                    decky.logger.info(f"Successfully applied {default_profile_id} profile for {'AC' if is_ac_power else 'Battery'} power")
                     return True
                 else:
-                    decky.logger.error(f"Failed to apply {target_profile_name} profile")
+                    decky.logger.error(f"Failed to apply {default_profile_id} profile")
                     return False
             
             return False

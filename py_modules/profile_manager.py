@@ -134,18 +134,19 @@ class ProfileManager:
         """Ensure default profiles exist"""
         capabilities = get_device_capabilities()
         
-        # Battery Saver profile
+        # Battery Saver profile - conservative but not crippled
+        # Users can further reduce settings if they want more battery life
         if 'battery_saver' not in self._profiles:
             self._profiles['battery_saver'] = PowerProfileData(
                 name="Battery Saver",
                 tdp=max(3, capabilities.min_tdp),
                 cpu=CPUProfile(
-                    governor="powersave",
-                    epp="power",
-                    boost_enabled=False,
+                    governor="schedutil",
+                    epp="balance_power",
+                    boost_enabled=True,
                     smt_enabled=True
                 ),
-                gpu=GPUProfile(mode="battery")
+                gpu=GPUProfile(mode="auto")
             )
         
         # Balanced profile
@@ -193,11 +194,11 @@ class ProfileManager:
                 gpu=GPUProfile(mode="range")
             )
         
-        # Default profile (current active profile)
+        # Default profile - uses processor default TDP, not hardcoded minimum
         if 'default' not in self._profiles:
             self._profiles['default'] = PowerProfileData(
                 name="Default",
-                tdp=min(15, capabilities.max_tdp),
+                tdp=capabilities.default_tdp if hasattr(capabilities, 'default_tdp') and capabilities.default_tdp else min(15, capabilities.max_tdp),
                 cpu=CPUProfile(
                     governor="schedutil",
                     epp="balance_power",
