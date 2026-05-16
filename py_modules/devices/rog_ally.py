@@ -240,9 +240,10 @@ class ROGAllyController:
             success &= self._write_sysfs_value(ARMOURY_STAPM_LIMIT, str(stapm_limit))
             # Armoury writes are persistent (NVRAM) but NOT live — amd_pmf (AMD
             # Platform Management Framework) runs a 1s loop that continuously
-            # pushes OEM limits to the SMU, overriding anything written via
-            # ryzenadj.  Reloading amd_pmf forces it to re-read the armoury
-            # values and then hold them indefinitely.  This avoids any polling.
+            # pushes OEM limits to the SMU.  Reloading amd_pmf forces it to
+            # re-read the armoury values and then hold them indefinitely.
+            # This avoids any polling.  When native TDP is enabled, ryzenadj
+            # is NOT used — amd_pmf manages all power limits exclusively.
             if success:
                 self._reload_amd_pmf()
         elif self.wmi_available:
@@ -288,7 +289,7 @@ class ROGAllyController:
             if modprobe.returncode == 0:
                 decky_plugin.logger.info("amd_pmf reloaded — PMF will now hold new armoury power limits")
             else:
-                # Not fatal — ryzenadj in main.py will still apply live limits
+                # Not fatal — the user may have native TDP disabled
                 decky_plugin.logger.warning(f"amd_pmf reload failed (non-fatal): {modprobe.stderr.strip() or rmmod.stderr.strip()}")
         except Exception as e:
             decky_plugin.logger.warning(f"amd_pmf reload exception (non-fatal): {e}")
