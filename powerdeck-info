@@ -1,0 +1,651 @@
+#!/bin/bash
+# powerdeck-info - Show current power/performance state of the device
+# Reads live hardware state, not saved configuration.
+# Usage: powerdeck-info [--json] [--section SECTION]
+
+set -eo pipefail
+
+source /etc/profile 2>/dev/null || true
+source /etc/os-release 2>/dev/null || true
+
+# Colors
+BOLD='\033[1m'
+DIM='\033[2m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+CYAN='\033[36m'
+RESET='\033[0m'
+
+JSON_MODE=false
+SECTION=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json) JSON_MODE=true; shift ;;
+    --section) SECTION="$2"; shift 2 ;;
+    -h|--help)
+      echo "Usage: powerdeck-info [--json] [--section SECTION]"
+      echo "  --json           Output as JSON"
+      echo "  --section SECTION Show only one section (cpu,gpu,tdp,power,wifi,usb,pcie,memory,disk,thermal,fan,misc)"
+      echo "  -h, --help       Show this help"
+      exit 0
+      ;;
+    *) shift ;;
+  esac
+done
+
+# Helper: read sysfs value safely
+sysfs() { cat "$1" 2>/dev/null || echo "N/A"; }
+
+# Helper: format frequency from kHz to MHz/GHz
+fmt_freq() {
+  local hz="$1"
+  if [[ "$hz" == "N/A" || -z "$hz" ]]; then echo "N/A"; return; fi
+  local mhz=$(( hz / 1000 ))
+  if [[ $mhz -ge 1000 ]]; then
+    local ghz=$(echo "scale=2; $mhz / 1000" | bc 2>/dev/null || echo "${mhz}MHz")
+    echo "${ghz}GHz"
+  else
+    echo "${mhz}MHz"
+  fi
+}
+
+# Helper: format millidegrees to degrees
+fmt_temp() {
+  local mdeg="$1"
+  if [[ "$mdeg" == "N/A" || -z "$mdeg" ]]; then echo "N/A"; return; fi
+  local deg=$(( mdeg / 1000 ))
+  echo "${deg}°C"
+}
+
+# Helper: format milliwatts to watts
+fmt_mw() {
+  local mw="$1"
+  if [[ "$mw" == "N/A" || -z "$mw" ]]; then echo "N/A"; return; fi
+  if [[ $mw -ge 1000 ]]; then
+    echo "scale=1; $mw / 1000" | bc 2>/dev/null | xargs -I{} echo "{}W" || echo "${mw}mW"
+  else
+    echo "${mw}mW"
+  fi
+}
+
+# Helper: format microwatts to watts
+fmt_uw() {
+  local uw="$1"
+  if [[ "$uw" == "N/A" || -z "$uw" ]]; then echo "N/A"; return; fi
+  local mw=$(( uw / 1000 ))
+  fmt_mw "$mw"
+}
+
+# Collect all data
+collect_cpu() {
+  local driver=$(sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_driver)
+  local governor=$(sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
+  local avail_govs=$(sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors)
+  local min_freq=$(sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq)
+  local max_freq=$(sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)
+  local cur_freq=$(sysfs /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq)
+  local boost=$(sysfs /sys/devices/system/cpu/cpufreq/boost)
+  local smt=$(sysfs /sys/devices/system/cpu/smt/control)
+  local pstate_status=$(sysfs /sys/devices/system/cpu/amd_pstate/status)
+  local epp=""
+  if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference ]]; then
+    epp=$(sysfs /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference)
+  fi
+
+  # Count online/offline CPUs
+  local total=0 online=0 offline=0
+  for i in /sys/devices/system/cpu/cpu[0-9]*; do
+    total=$((total + 1))
+    if [[ -f "$i/online" ]]; then
+      if [[ "$(cat "$i/online" 2>/dev/null)" == "1" ]]; then
+        online=$((online + 1))
+      else
+        offline=$((offline + 1))
+      fi
+    else
+      online=$((online + 1))
+    fi
+  done
+
+  # C-states
+  local cstates=""
+  for c in /sys/devices/system/cpu/cpu0/cpuidle/state*; do
+    [[ -f "$c/name" ]] || continue
+    local name=$(cat "$c/name" 2>/dev/null)
+    local lat=$(cat "$c/latency" 2>/dev/null)
+    local disable=$(cat "$c/disable" 2>/dev/null)
+    local state="enabled"
+    [[ "$disable" == "1" ]] && state="disabled"
+    cstates="${cstates}${name}(${state},${lat}us) "
+  done
+
+  if $JSON_MODE; then
+    local min_f=$([[ "$min_freq" == "N/A" ]] && echo "null" || echo "$min_freq")
+    local max_f=$([[ "$max_freq" == "N/A" ]] && echo "null" || echo "$max_freq")
+    local cur_f=$([[ "$cur_freq" == "N/A" ]] && echo "null" || echo "$cur_freq")
+    local boost_v=$([[ "$boost" == "N/A" ]] && echo "null" || echo "$boost")
+    local cstates_str=$(echo $cstates | xargs | sed 's/"/\\"/g')
+    echo "{\"driver\":\"${driver}\",\"governor\":\"${governor}\",\"available_governors\":\"${avail_govs}\",\"frequency_min_khz\":${min_f},\"frequency_max_khz\":${max_f},\"frequency_cur_khz\":${cur_f},\"boost\":${boost_v},\"smt\":\"${smt}\",\"amd_pstate\":\"${pstate_status}\",\"epp\":\"${epp}\",\"cores_total\":${total},\"cores_online\":${online},\"cores_offline\":${offline},\"cstates\":\"${cstates_str}\"}"
+  else
+    echo -e "${BOLD}CPU${RESET}"
+    echo "  Driver:          $driver"
+    echo "  AMD P-State:     $pstate_status"
+    echo "  Governor:        $governor (available: $avail_govs)"
+    [[ -n "$epp" && "$epp" != "N/A" ]] && echo "  EPP:             $epp"
+    echo "  Frequency:       $(fmt_freq $cur_freq) (range: $(fmt_freq $min_freq) - $(fmt_freq $max_freq))"
+    echo "  Boost:           $([[ "$boost" == "1" ]] && echo -e "${GREEN}enabled${RESET}" || echo -e "${YELLOW}disabled${RESET}")"
+    echo "  SMT:             $([[ "$smt" == "on" ]] && echo -e "${GREEN}on${RESET}" || echo -e "${YELLOW}$smt${RESET}")"
+    echo "  Cores:           $online online / $offline offline / $total total"
+    echo "  C-States:        $(echo $cstates | xargs)"
+  fi
+}
+
+collect_gpu() {
+  local dpm_level=$(sysfs /sys/class/drm/card0/device/power_dpm_force_performance_level)
+  local sclk=$(sysfs /sys/class/drm/card0/device/pp_dpm_sclk)
+  local profile=$(sysfs /sys/class/drm/card0/device/pp_power_profile_mode)
+
+  # Parse current sclk
+  local cur_sclk=""
+  if [[ -n "$sclk" && "$sclk" != "N/A" ]]; then
+    cur_sclk=$(echo "$sclk" | grep -oP '\d+Mhz\s*\*' | head -1 | tr -d '* ')
+    [[ -z "$cur_sclk" ]] && cur_sclk=$(echo "$sclk" | grep '\*' | awk '{print $2}' | head -1)
+  fi
+
+  if $JSON_MODE; then
+    local sclk_json="N/A"
+    if [[ -n "$sclk" && "$sclk" != "N/A" ]]; then
+      sclk_json=$(echo "$sclk" | tr '\n' ' ' | xargs | sed 's/"/\\"/g')
+    fi
+    echo "{\"dpm_performance_level\":\"${dpm_level}\",\"current_sclk\":\"${cur_sclk:-N/A}\",\"sclk_states\":\"${sclk_json}\"}"
+  else
+    echo -e "${BOLD}GPU${RESET}"
+    echo "  DPM Level:       $dpm_level"
+    echo "  Current SCLK:    ${cur_sclk:-N/A}"
+    if [[ -n "$sclk" && "$sclk" != "N/A" ]]; then
+      echo "  SCLK States:     $(echo "$sclk" | tr '\n' ' ' | xargs)"
+    fi
+  fi
+}
+
+collect_tdp() {
+  local ryzenadj="/usr/bin/ryzenadj"
+  local info=""
+
+  if [[ -x "$ryzenadj" ]]; then
+    info=$(sudo "$ryzenadj" --info 2>/dev/null | grep -E '^\|' | tail -n +3)
+  fi
+
+  if $JSON_MODE; then
+    if [[ -n "$info" ]]; then
+      local json_items=""
+      while IFS='|' read -r _ name value param _; do
+        name=$(echo "$name" | xargs)
+        value=$(echo "$value" | xargs)
+        param=$(echo "$param" | xargs)
+        [[ -z "$name" ]] && continue
+        local key=$(echo "$name" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -d '/')
+        json_items="${json_items}\"${key}\":\"${value}\","
+      done <<< "$info"
+      # Remove trailing comma
+      json_items="${json_items%,}"
+      echo "{${json_items}}"
+    else
+      echo '{"error":"RyzenAdj not available"}'
+    fi
+  else
+    echo -e "${BOLD}TDP / Power Limits (RyzenAdj)${RESET}"
+    if [[ -n "$info" ]]; then
+      echo "$info" | while IFS='|' read -r _ name value param _; do
+        name=$(echo "$name" | xargs)
+        value=$(echo "$value" | xargs)
+        param=$(echo "$param" | xargs)
+        [[ -z "$name" ]] && continue
+        printf "  %-20s %10s  (%s)\n" "$name" "$value" "$param"
+      done
+    else
+      echo "  RyzenAdj not available or no SMU access"
+    fi
+  fi
+}
+
+collect_power() {
+  local ac_status=""
+  local bat_status=""
+  local bat_cap=""
+  local bat_health=""
+  local bat_energy_full=""
+  local bat_energy_full_design=""
+
+  for ps in /sys/class/power_supply/*; do
+    local name=$(basename "$ps")
+    local type=$(sysfs "$ps/type")
+    if [[ "$type" == "Mains" ]]; then
+      ac_status=$(sysfs "$ps/online")
+    elif [[ "$type" == "Battery" ]]; then
+      bat_status=$(sysfs "$ps/status")
+      bat_cap=$(sysfs "$ps/capacity")
+      bat_health=$(sysfs "$ps/health")
+      bat_energy_full=$(sysfs "$ps/energy_full")
+      bat_energy_full_design=$(sysfs "$ps/energy_full_design")
+    fi
+  done
+
+  # Power draw from battery
+  local power_now=""
+  for ps in /sys/class/power_supply/[Bb][Aa][Tt]*/; do
+    if [[ -f "$ps/power_now" ]]; then
+      power_now=$(sysfs "$ps/power_now")
+    fi
+  done
+
+  if $JSON_MODE; then
+    local ac_v=$([[ "$ac_status" == "1" ]] && echo "true" || echo "false")
+    local cap_v=$([[ "$bat_cap" == "N/A" ]] && echo "null" || echo "$bat_cap")
+    local pw_v=$([[ "$power_now" == "N/A" || -z "$power_now" ]] && echo "null" || echo "$power_now")
+    echo "{\"ac_online\":${ac_v},\"battery_status\":\"${bat_status}\",\"battery_capacity\":${cap_v},\"battery_health\":\"${bat_health}\",\"battery_power_draw_uw\":${pw_v}}"
+  else
+    echo -e "${BOLD}Power${RESET}"
+    echo "  AC Power:        $([[ "$ac_status" == "1" ]] && echo -e "${GREEN}connected${RESET}" || echo -e "${YELLOW}disconnected${RESET}")"
+    echo "  Battery:         $bat_status, $bat_cap%"
+    [[ -n "$bat_health" && "$bat_health" != "N/A" ]] && echo "  Battery Health:  $bat_health"
+    if [[ -n "$power_now" && "$power_now" != "N/A" ]]; then
+      local pw_w=$(echo "scale=2; $power_now / 1000000" | bc 2>/dev/null || echo "N/A")
+      echo "  Power Draw:      ${pw_w}W"
+    fi
+  fi
+}
+
+collect_wifi() {
+  local wifi_iface=""
+  local wifi_power=""
+  local wifi_link=""
+  local wifi_ssid=""
+  local wifi_signal=""
+  local wifi_bitrate_rx=""
+  local wifi_bitrate_tx=""
+  local wifi_txpower=""
+
+  # Find wireless interface
+  for iface in /sys/class/net/*; do
+    local name=$(basename "$iface")
+    if [[ -d "/sys/class/net/$name/wireless" ]] || iw dev "$name" info &>/dev/null; then
+      wifi_iface="$name"
+      break
+    fi
+  done
+
+  if [[ -n "$wifi_iface" ]]; then
+    wifi_power=$(iw dev "$wifi_iface" get power_save 2>/dev/null | awk '{print $NF}')
+    wifi_link=$(iw dev "$wifi_iface" link 2>/dev/null)
+    wifi_ssid=$(echo "$wifi_link" | grep -oP 'SSID: \K.*' | head -1)
+    wifi_signal=$(echo "$wifi_link" | grep -oP 'signal: \K[-0-9]+' | head -1)
+    wifi_bitrate_rx=$(echo "$wifi_link" | grep 'rx bitrate' | awk '{print $3" "$4}' | head -1)
+    wifi_bitrate_tx=$(echo "$wifi_link" | grep 'tx bitrate' | awk '{print $3" "$4}' | head -1)
+    wifi_txpower=$(iw dev "$wifi_iface" info 2>/dev/null | grep txpower | awk '{print $2" "$3}')
+  fi
+
+  if $JSON_MODE; then
+    echo "{\"interface\":\"${wifi_iface:-none}\",\"power_save\":\"${wifi_power:-N/A}\",\"ssid\":\"${wifi_ssid:-N/A}\",\"signal_dbm\":\"${wifi_signal:-N/A}\",\"rx_bitrate\":\"${wifi_bitrate_rx:-N/A}\",\"tx_bitrate\":\"${wifi_bitrate_tx:-N/A}\",\"tx_power\":\"${wifi_txpower:-N/A}\"}"
+  else
+    echo -e "${BOLD}WiFi${RESET}"
+    if [[ -z "$wifi_iface" ]]; then
+      echo "  No wireless interface found"
+    else
+      echo "  Interface:       $wifi_iface"
+      echo "  Power Save:      $([[ "$wifi_power" == "on" ]] && echo -e "${GREEN}on${RESET}" || echo -e "${YELLOW}off${RESET}")"
+      [[ -n "$wifi_ssid" ]] && echo "  Connected:       $wifi_ssid"
+      [[ -n "$wifi_signal" ]] && echo "  Signal:          ${wifi_signal} dBm"
+      [[ -n "$wifi_bitrate_rx" ]] && echo "  RX Bitrate:      $wifi_bitrate_rx"
+      [[ -n "$wifi_bitrate_tx" ]] && echo "  TX Bitrate:      $wifi_bitrate_tx"
+      [[ -n "$wifi_txpower" ]] && echo "  TX Power:        $wifi_txpower"
+    fi
+  fi
+}
+
+collect_usb() {
+  local module_autosuspend=$(sysfs /sys/module/usbcore/parameters/autosuspend)
+
+  local usb_devices=""
+  local count=0
+  local auto_count=0
+  local on_count=0
+  local suspended_count=0
+
+  for d in /sys/bus/usb/devices/*/; do
+    local dev=$(basename "$d")
+    # Skip interfaces (contain ':')
+    [[ "$dev" == *:* ]] && continue
+    local product=$(sysfs "$d/product")
+    local vid=$(sysfs "$d/idVendor")
+    local pid=$(sysfs "$d/idProduct")
+    local speed=$(sysfs "$d/speed")
+    local autosuspend=$(sysfs "$d/power/autosuspend")
+    local control=$(sysfs "$d/power/control")
+    local status=$(sysfs "$d/power/runtime_status")
+
+    [[ "$control" == "auto" ]] && auto_count=$((auto_count + 1)) || on_count=$((on_count + 1))
+    [[ "$status" == "suspended" ]] && suspended_count=$((suspended_count + 1))
+    count=$((count + 1))
+  done
+
+  if $JSON_MODE; then
+    local mas_v=$([[ "$module_autosuspend" == "N/A" ]] && echo "null" || echo "$module_autosuspend")
+    echo "{\"module_autosuspend_seconds\":${mas_v},\"total_devices\":${count},\"control_auto\":${auto_count},\"control_on\":${on_count},\"suspended\":${suspended_count}}"
+  else
+    echo -e "${BOLD}USB${RESET}"
+    echo "  Module Autosuspend: ${module_autosuspend}s"
+    echo "  Devices:         $count total, $auto_count auto, $on_count always-on, $suspended_count suspended"
+    echo ""
+    echo "  Per-device:"
+    for d in /sys/bus/usb/devices/*/; do
+      local dev=$(basename "$d")
+      # Skip interfaces (contain ':')
+      [[ "$dev" == *:* ]] && continue
+      local product=$(sysfs "$d/product")
+      local vid=$(sysfs "$d/idVendor")
+      local pid=$(sysfs "$d/idProduct")
+      local speed=$(sysfs "$d/speed")
+      local autosuspend=$(sysfs "$d/power/autosuspend")
+      local control=$(sysfs "$d/power/control")
+      local status=$(sysfs "$d/power/runtime_status")
+      # Use VID:PID if product name is empty
+      [[ -z "$product" || "$product" == "N/A" ]] && product="${vid}:${pid}"
+      local ctrl_label="on"
+      local ctrl_color="${YELLOW}"
+      if [[ "$control" == "auto" ]]; then
+        ctrl_label="auto"
+        ctrl_color="${GREEN}"
+      fi
+      printf "    %-12s %-25s ctrl=%b%-4s%b  suspend=%-3s  status=%-10s\n" \
+        "$dev" "${product:0:25}" "$ctrl_color" "$ctrl_label" "$RESET" "${autosuspend}s" "$status"
+    done
+  fi
+}
+
+collect_pcie() {
+  local aspm_policy=$(sysfs /sys/module/pcie_aspm/parameters/policy)
+  # Parse active policy (in brackets)
+  local active=""
+  if [[ "$aspm_policy" != "N/A" ]]; then
+    active=$(echo "$aspm_policy" | grep -oP '\[\K[^\]]+' || echo "$aspm_policy")
+  fi
+
+  # Count PCIe runtime PM
+  local auto_count=0 on_count=0 total=0
+  for d in /sys/bus/pci/devices/*/power/control; do
+    total=$((total + 1))
+    local ctrl=$(cat "$d" 2>/dev/null)
+    [[ "$ctrl" == "auto" ]] && auto_count=$((auto_count + 1)) || on_count=$((on_count + 1))
+  done
+
+  if $JSON_MODE; then
+    echo "{\"aspm_policy\":\"${active:-N/A}\",\"aspm_available\":\"${aspm_policy// /,}\",\"pcie_runtime_pm_auto\":${auto_count},\"pcie_runtime_pm_on\":${on_count},\"pcie_total\":${total}}"
+  else
+    echo -e "${BOLD}PCIe${RESET}"
+    echo "  ASPM Policy:     $([[ "$active" == "powersave" || "$active" == "powersupersave" ]] && echo -e "${GREEN}${active}${RESET}" || echo -e "${YELLOW}${active:-N/A}${RESET}")"
+    echo "  Available:       $aspm_policy"
+    echo "  Runtime PM:      $auto_count auto / $on_count always-on / $total total"
+  fi
+}
+
+collect_memory() {
+  local mem_total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+  local mem_free=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+  local mem_used=$((mem_total - mem_free))
+  local swap_total=$(awk '/SwapTotal/ {print $2}' /proc/meminfo)
+  local swap_used=$(awk '/SwapUsed/ {print $2}' /proc/meminfo 2>/dev/null)
+  [[ -z "$swap_used" || "$swap_used" == "N/A" ]] && swap_used="0"
+  local swappiness=$(sysfs /proc/sys/vm/swappiness)
+  local laptop_mode=$(sysfs /proc/sys/vm/laptop_mode)
+  local dirty_ratio=$(sysfs /proc/sys/vm/dirty_ratio)
+  local dirty_bg_ratio=$(sysfs /proc/sys/vm/dirty_background_ratio)
+  local thp=$(sysfs /sys/kernel/mm/transparent_hugepage/enabled)
+
+  # Parse active THP mode
+  local thp_active=""
+  [[ -n "$thp" && "$thp" != "N/A" ]] && thp_active=$(echo "$thp" | grep -oP '\[\K[^\]]+' || echo "$thp")
+
+  if $JSON_MODE; then
+    local sw_val=$([[ "$swap_used" == "N/A" ]] && echo "0" || echo "$swap_used")
+    local sw_val2=$([[ "$swappiness" == "N/A" ]] && echo "null" || echo "$swappiness")
+    local lm_val=$([[ "$laptop_mode" == "N/A" ]] && echo "null" || echo "$laptop_mode")
+    local dr_val=$([[ "$dirty_ratio" == "N/A" ]] && echo "null" || echo "$dirty_ratio")
+    local dbr_val=$([[ "$dirty_bg_ratio" == "N/A" ]] && echo "null" || echo "$dirty_bg_ratio")
+    echo "{\"mem_total_kb\":${mem_total},\"mem_used_kb\":${mem_used},\"mem_available_kb\":${mem_free},\"swap_total_kb\":${swap_total},\"swap_used_kb\":${sw_val},\"swappiness\":${sw_val2},\"laptop_mode\":${lm_val},\"dirty_ratio\":${dr_val},\"dirty_background_ratio\":${dbr_val},\"transparent_hugepage\":\"${thp_active:-N/A}\"}"
+  else
+    local mem_total_mb=$((mem_total / 1024))
+    local mem_used_mb=$((mem_used / 1024))
+    local mem_free_mb=$((mem_free / 1024))
+    local swap_total_mb=$((swap_total / 1024))
+    echo -e "${BOLD}Memory${RESET}"
+    echo "  RAM:             ${mem_used_mb}MB / ${mem_total_mb}MB (${mem_free_mb}MB available)"
+    echo "  Swap:            ${swap_total_mb}MB"
+    echo "  Swappiness:      $swappiness"
+    echo "  Laptop Mode:     $laptop_mode"
+    echo "  Dirty Ratio:     $dirty_ratio% / bg $dirty_bg_ratio%"
+    echo "  THP:             ${thp_active:-N/A}"
+  fi
+}
+
+collect_disk() {
+  if $JSON_MODE; then
+    local json_items=""
+    for disk in /sys/block/*; do
+      local dev=$(basename "$disk")
+      [[ "$dev" == loop* ]] && continue
+      local scheduler=$(sysfs "$disk/queue/scheduler")
+      local rotational=$(sysfs "$disk/queue/rotational")
+      json_items="${json_items}\"${dev}\":{\"scheduler\":\"${scheduler}\",\"rotational\":${rotational}},"
+    done
+    json_items="${json_items%,}"
+    echo "{${json_items}}"
+  else
+    echo -e "${BOLD}Disk${RESET}"
+    for disk in /sys/block/*; do
+      local dev=$(basename "$disk")
+      [[ "$dev" == loop* ]] && continue
+      local scheduler=$(sysfs "$disk/queue/scheduler")
+      local rotational=$(sysfs "$disk/queue/rotational")
+      local disk_type=$([[ "$rotational" == "0" ]] && echo "SSD" || echo "HDD")
+      echo "  $dev: $disk_type, scheduler: $scheduler"
+    done
+  fi
+}
+
+collect_thermal() {
+  if $JSON_MODE; then
+    local json_items=""
+    for tz in /sys/class/thermal/thermal_zone*; do
+      local name=$(basename "$tz")
+      local type=$(sysfs "$tz/type")
+      local temp=$(sysfs "$tz/temp")
+      local temp_val=$([[ "$temp" == "N/A" ]] && echo "null" || echo "$temp")
+      json_items="${json_items}\"${name}\":{\"type\":\"${type}\",\"temp_mC\":${temp_val}},"
+    done
+    # Also add hwmon temps
+    for h in /sys/class/hwmon/hwmon*; do
+      local name=$(sysfs "$h/name")
+      local temp1=$(sysfs "$h/temp1_input")
+      [[ "$temp1" == "N/A" ]] && continue
+      json_items="${json_items}\"hwmon_${name}\":{\"temp_mC\":${temp1}},"
+    done
+    json_items="${json_items%,}"
+    echo "{${json_items}}"
+  else
+    echo -e "${BOLD}Thermal${RESET}"
+    for tz in /sys/class/thermal/thermal_zone*; do
+      local name=$(basename "$tz")
+      local type=$(sysfs "$tz/type")
+      local temp=$(sysfs "$tz/temp")
+      echo "  $type: $(fmt_temp "$temp")"
+    done
+
+    # Also show hwmon temps
+    echo ""
+    echo "  Hardware Monitors:"
+    for h in /sys/class/hwmon/hwmon*; do
+      local name=$(sysfs "$h/name")
+      local temp1=$(sysfs "$h/temp1_input")
+      [[ "$temp1" == "N/A" ]] && continue
+      echo "    $name: $(fmt_temp "$temp1")"
+    done
+  fi
+}
+
+collect_fan() {
+  local fan_rpm=""
+  local fan_input=""
+  for h in /sys/class/hwmon/hwmon*; do
+    local name=$(sysfs "$h/name")
+    if [[ -f "$h/fan1_input" ]]; then
+      fan_rpm=$(cat "$h/fan1_input" 2>/dev/null)
+      fan_input="$h/fan1_input"
+    fi
+  done
+
+  if $JSON_MODE; then
+    local fan_v=$([[ "$fan_rpm" == "N/A" || -z "$fan_rpm" ]] && echo "null" || echo "$fan_rpm")
+    echo "{\"fan_rpm\":${fan_v}}"
+  else
+    echo -e "${BOLD}Fan${RESET}"
+    if [[ -n "$fan_rpm" && "$fan_rpm" != "N/A" ]]; then
+      if [[ "$fan_rpm" == "0" ]]; then
+        echo "  Speed:           OFF"
+      else
+        echo "  Speed:           ${fan_rpm} RPM"
+      fi
+    else
+      echo "  No fan detected"
+    fi
+  fi
+}
+
+collect_misc() {
+  local brightness=""
+  local brightness_max=""
+  for bl in /sys/class/backlight/*; do
+    brightness=$(sysfs "$bl/brightness")
+    brightness_max=$(sysfs "$bl/max_brightness")
+    break
+  done
+
+  local audio_pm=$(sysfs /sys/module/snd_hda_intel/parameters/power_save)
+  local audio_pm_ctrl=$(sysfs /sys/module/snd_hda_intel/parameters/power_save_controller)
+
+  # Kernel command line relevant params
+  local cmdline=$(cat /proc/cmdline 2>/dev/null)
+  local aspm_boot=$(echo "$cmdline" | grep -oP 'pcie_aspm=\K[^ ]+' || echo "default")
+  local pstate_boot=$(echo "$cmdline" | grep -oP 'amd_pstate=\K[^ ]+' || echo "default")
+
+  if $JSON_MODE; then
+    local br_v=$([[ "$brightness" == "N/A" ]] && echo "null" || echo "$brightness")
+    local brm_v=$([[ "$brightness_max" == "N/A" ]] && echo "null" || echo "$brightness_max")
+    echo "{\"brightness\":${br_v},\"brightness_max\":${brm_v},\"audio_power_save\":\"${audio_pm}\",\"audio_power_save_controller\":\"${audio_pm_ctrl}\",\"boot_pcie_aspm\":\"${aspm_boot}\",\"boot_amd_pstate\":\"${pstate_boot}\"}"
+  else
+    echo -e "${BOLD}Miscellaneous${RESET}"
+    if [[ -n "$brightness" && "$brightness" != "N/A" ]]; then
+      local pct=$(( brightness * 100 / brightness_max ))
+      echo "  Brightness:      $brightness/$brightness_max ($pct%)"
+    fi
+    echo "  Audio PM:        ${audio_pm}s (controller: $audio_pm_ctrl)"
+    echo "  Boot ASPM:       $aspm_boot"
+    echo "  Boot P-State:    $pstate_boot"
+  fi
+}
+
+# Main output
+if $JSON_MODE; then
+  # Build JSON by collecting sections and assembling with jq
+  JSON_SECTIONS=""
+  
+  if [[ -z "$SECTION" || "$SECTION" == "cpu" ]]; then
+    JSON_SECTIONS="${JSON_SECTIONS},\"cpu\":$(collect_cpu | jq -c .)"
+  fi
+  if [[ -z "$SECTION" || "$SECTION" == "gpu" ]]; then
+    JSON_SECTIONS="${JSON_SECTIONS},\"gpu\":$(collect_gpu | jq -c .)"
+  fi
+  if [[ -z "$SECTION" || "$SECTION" == "tdp" ]]; then
+    JSON_SECTIONS="${JSON_SECTIONS},\"tdp\":$(collect_tdp | jq -c .)"
+  fi
+  if [[ -z "$SECTION" || "$SECTION" == "power" ]]; then
+    JSON_SECTIONS="${JSON_SECTIONS},\"power\":$(collect_power | jq -c .)"
+  fi
+  if [[ -z "$SECTION" || "$SECTION" == "wifi" ]]; then
+    JSON_SECTIONS="${JSON_SECTIONS},\"wifi\":$(collect_wifi | jq -c .)"
+  fi
+  if [[ -z "$SECTION" || "$SECTION" == "usb" ]]; then
+    JSON_SECTIONS="${JSON_SECTIONS},\"usb\":$(collect_usb | jq -c .)"
+  fi
+  if [[ -z "$SECTION" || "$SECTION" == "pcie" ]]; then
+    JSON_SECTIONS="${JSON_SECTIONS},\"pcie\":$(collect_pcie | jq -c .)"
+  fi
+  if [[ -z "$SECTION" || "$SECTION" == "memory" ]]; then
+    JSON_SECTIONS="${JSON_SECTIONS},\"memory\":$(collect_memory | jq -c .)"
+  fi
+  if [[ -z "$SECTION" || "$SECTION" == "disk" ]]; then
+    JSON_SECTIONS="${JSON_SECTIONS},\"disk\":$(collect_disk | jq -c .)"
+  fi
+  if [[ -z "$SECTION" || "$SECTION" == "thermal" ]]; then
+    JSON_SECTIONS="${JSON_SECTIONS},\"thermal\":$(collect_thermal | jq -c .)"
+  fi
+  if [[ -z "$SECTION" || "$SECTION" == "fan" ]]; then
+    JSON_SECTIONS="${JSON_SECTIONS},\"fan\":$(collect_fan | jq -c .)"
+  fi
+  if [[ -z "$SECTION" || "$SECTION" == "misc" ]]; then
+    JSON_SECTIONS="${JSON_SECTIONS},\"misc\":$(collect_misc | jq -c .)"
+  fi
+
+  # Strip leading comma and wrap in object
+  JSON_SECTIONS="${JSON_SECTIONS#,}"
+  echo "{\"timestamp\":\"$(date -Iseconds)\",${JSON_SECTIONS}}" | jq .
+else
+  if [[ -z "$SECTION" ]]; then
+    echo -e "${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD} PowerDeck Device State - $(date '+%Y-%m-%d %H:%M:%S')${RESET}"
+    echo -e "${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
+    echo ""
+  fi
+
+  case "$SECTION" in
+    cpu|"") collect_cpu; echo "" ;;
+  esac
+  case "$SECTION" in
+    gpu|"") collect_gpu; echo "" ;;
+  esac
+  case "$SECTION" in
+    tdp|"") collect_tdp; echo "" ;;
+  esac
+  case "$SECTION" in
+    power|"") collect_power; echo "" ;;
+  esac
+  case "$SECTION" in
+    wifi|"") collect_wifi; echo "" ;;
+  esac
+  case "$SECTION" in
+    usb|"") collect_usb; echo "" ;;
+  esac
+  case "$SECTION" in
+    pcie|"") collect_pcie; echo "" ;;
+  esac
+  case "$SECTION" in
+    memory|"") collect_memory; echo "" ;;
+  esac
+  case "$SECTION" in
+    disk|"") collect_disk; echo "" ;;
+  esac
+  case "$SECTION" in
+    thermal|"") collect_thermal; echo "" ;;
+  esac
+  case "$SECTION" in
+    fan|"") collect_fan; echo "" ;;
+  esac
+  case "$SECTION" in
+    misc|"") collect_misc; echo "" ;;
+  esac
+
+  if [[ -z "$SECTION" ]]; then
+    echo -e "${BOLD}═══════════════════════════════════════════════════════════════${RESET}"
+  fi
+fi
