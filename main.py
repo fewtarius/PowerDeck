@@ -3379,7 +3379,12 @@ class Plugin:
             # so we must re-apply ryzenadj TDP limits after the platform profile is set.
             # Use ryzenadj directly (not full set_tdp) to avoid re-triggering
             # the native controller which would change the platform profile again.
+            # Add a brief delay to allow amd_pmf to finish resetting limits before
+            # we override them with ryzenadj.
             if "tdp" in profile_data and "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally":
+                import asyncio
+                decky.logger.info(f"Waiting 1s for amd_pmf to settle before re-applying TDP")
+                await asyncio.sleep(1.0)
                 decky.logger.info(f"Re-applying TDP {profile_data['tdp']}W via ryzenadj after platform profile change (amd_pmf may have reset limits)")
                 try:
                     tdp_success = await self.set_amd_tdp(profile_data["tdp"])
