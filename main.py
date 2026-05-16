@@ -1508,6 +1508,10 @@ class Plugin:
                 battery_profile["governor"] = "powersave"
                 battery_profile["epp"] = "power"
                 battery_profile["platformProfile"] = "power-saver"
+                battery_profile["wifiPowerSave"] = True
+                battery_profile["pciRuntimePm"] = True
+                battery_profile["pcieAspm"] = True
+                battery_profile["usbAutosuspend"] = True
                 # Reduce TDP for battery (use 60% of default as starting point)
                 if "tdp" in battery_profile and battery_profile["tdp"] > 10:
                     battery_profile["tdp"] = max(5, int(battery_profile["tdp"] * 0.6))
@@ -3373,6 +3377,34 @@ class Plugin:
                 except Exception as e:
                     decky.logger.error(f"Error applying PCIe ASPM: {e}")
 
+            # Apply PCI runtime PM setting
+            if "pciRuntimePm" in profile_data:
+                total_operations += 1
+                try:
+                    pci_pm_enabled = profile_data.get("pciRuntimePm", False)
+                    pci_pm_success = await self.set_pci_runtime_pm(pci_pm_enabled)
+                    if pci_pm_success:
+                        success_count += 1
+                        decky.logger.info(f"Applied PCI runtime PM: {'enabled' if pci_pm_enabled else 'disabled'}")
+                    else:
+                        decky.logger.warning(f"Failed to apply PCI runtime PM: {'enabled' if pci_pm_enabled else 'disabled'}")
+                except Exception as e:
+                    decky.logger.error(f"Error applying PCI runtime PM: {e}")
+
+            # Apply WiFi power save setting
+            if "wifiPowerSave" in profile_data:
+                total_operations += 1
+                try:
+                    wifi_enabled = profile_data.get("wifiPowerSave", False)
+                    wifi_success = await self.set_wifi_power_save(wifi_enabled)
+                    if wifi_success:
+                        success_count += 1
+                        decky.logger.info(f"Applied WiFi power save: {'enabled' if wifi_enabled else 'disabled'}")
+                    else:
+                        decky.logger.warning(f"Failed to apply WiFi power save: {'enabled' if wifi_enabled else 'disabled'}")
+                except Exception as e:
+                    decky.logger.error(f"Error applying WiFi power save: {e}")
+
             # Apply ROG Ally thermal throttle policy FIRST
             # IMPORTANT: This must be applied BEFORE platform profile, because thermal policy 2
             # causes the ASUS firmware to revert platform profile to "low-power". Setting platform
@@ -3825,6 +3857,73 @@ class Plugin:
             return await self.set_pcie_aspm_policy(policy)
         except Exception as e:
             decky.logger.error(f"Failed to set PCIe power management: {e}")
+            return False
+
+    async def get_pci_runtime_pm_status(self) -> Dict[str, bool]:
+        """Get PCI runtime PM status for all devices"""
+        try:
+            pci_devices = {}
+            for control_file in glob.glob("/sys/bus/pci/devices/*/power/control"):
+                device_path = os.path.dirname(os.path.dirname(control_file))
+                device_name = os.path.basename(device_path)
+                try:
+                    with open(control_file, "r") as f:
+                        status = f.read().strip()
+                        pci_devices[device_name] = status == "auto"
+                except Exception:
+                    pass
+            return pci_devices
+        except Exception as e:
+            decky.logger.error(f"Failed to get PCI runtime PM status: {e}")
+            return {}
+
+    async def set_pci_runtime_pm(self, enable: bool) -> bool:
+        """Enable/disable PCI runtime PM for all devices that support it.
+        
+        When enabled, sets power/control=auto allowing unused PCI devices
+        to enter low-power states. When disabled, sets power/control=on
+        keeping devices always active.
+        
+        Excludes GPU and display controller to prevent display issues.
+        """
+        try:
+            # Devices that should always stay active
+            EXCLUDED_CLASSES = {
+                "0x030000",  # VGA compatible controller
+                "0x030200",  # 3D controller
+                "0x0300ff",  # VGA compatible controller (unknown)
+            }
+            
+            success_count = 0
+            total_count = 0
+            
+            for control_file in glob.glob("/sys/bus/pci/devices/*/power/control"):
+                device_path = os.path.dirname(os.path.dirname(control_file))
+                device_name = os.path.basename(device_path)
+                
+                # Check device class to exclude GPU
+                class_file = os.path.join(device_path, "class")
+                try:
+                    with open(class_file, "r") as f:
+                        device_class = f.read().strip()
+                    if device_class in EXCLUDED_CLASSES:
+                        continue
+                except Exception:
+                    pass
+                
+                total_count += 1
+                try:
+                    value = "auto" if enable else "on"
+                    with open(control_file, "w") as f:
+                        f.write(value)
+                    success_count += 1
+                except Exception:
+                    pass
+            
+            decky.logger.info(f"PCI runtime PM: {success_count}/{total_count} devices set to {'auto' if enable else 'on'}")
+            return success_count > 0
+        except Exception as e:
+            decky.logger.error(f"Failed to set PCI runtime PM: {e}")
             return False
 
     async def get_swappiness(self) -> int:
@@ -6964,3 +7063,11 @@ async def get_wifi_power_save() -> bool:
 async def set_wifi_power_save(enable: bool) -> bool:
     """Enable/disable WiFi power save - Global function called by frontend"""
     return await plugin.set_wifi_power_save(enable)
+
+async def get_pci_runtime_pm_status() -> Dict[str, bool]:
+    """Get PCI runtime PM status for all devices - Global function called by frontend"""
+    return await plugin.get_pci_runtime_pm_status()
+
+async def set_pci_runtime_pm(enable: bool) -> bool:
+    """Enable/disable PCI runtime PM - Global function called by frontend"""
+    return await plugin.set_pci_runtime_pm(enable)

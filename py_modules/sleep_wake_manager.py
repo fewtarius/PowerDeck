@@ -480,6 +480,18 @@ class EnhancedSleepWakeManager:
                 pcie_aspm = current_profile['pcieAspm']
                 if hasattr(self.plugin, 'set_pcie_power_management'):
                     await self.plugin.set_pcie_power_management(pcie_aspm)
+            
+            # PCI Runtime PM
+            if 'pciRuntimePm' in current_profile:
+                pci_runtime_pm = current_profile['pciRuntimePm']
+                if hasattr(self.plugin, 'set_pci_runtime_pm'):
+                    await self.plugin.set_pci_runtime_pm(pci_runtime_pm)
+            
+            # WiFi Power Save
+            if 'wifiPowerSave' in current_profile:
+                wifi_power_save = current_profile['wifiPowerSave']
+                if hasattr(self.plugin, 'set_wifi_power_save'):
+                    await self.plugin.set_wifi_power_save(wifi_power_save)
                     
         except Exception:
             # Silently handle power management restoration errors to prevent NVMe wake
