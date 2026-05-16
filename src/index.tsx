@@ -839,29 +839,21 @@ const Content: React.FC = () => {
     // Sync USB autosuspend setting - handle both true and false values
     const usbSetting = profile.usbAutosuspend ?? false; // Default to false if undefined
     setUsbAutosuspendEnabled(usbSetting);
-    if (usbSetting) {
-      try {
-        await setUsbAutosuspend(true);
-        debug.log('Applied USB autosuspend from profile (enabled)');
-      } catch (error) {
-        debug.error('Failed to apply USB autosuspend from profile:', error);
-      }
-    } else {
-      debug.log('Applied USB autosuspend from profile (disabled) - let OS manage');
+    try {
+      await setUsbAutosuspend(usbSetting);
+      debug.log(`Applied USB autosuspend from profile (${usbSetting ? 'enabled' : 'disabled'})`);
+    } catch (error) {
+      debug.error('Failed to apply USB autosuspend from profile:', error);
     }
     
     // Sync PCIe ASPM setting - handle both true and false values  
     const pcieSetting = profile.pcieAspm ?? false; // Default to false if undefined
     setPcieAspmEnabled(pcieSetting);
-    if (pcieSetting) {
-      try {
-        await setPcieAspmPolicy('powersave');
-        debug.log('Applied PCIe ASPM from profile (enabled)');
-      } catch (error) {
-        debug.error('Failed to apply PCIe ASPM from profile:', error);
-      }
-    } else {
-      debug.log('Applied PCIe ASPM from profile (disabled) - let OS manage');
+    try {
+      await setPcieAspmPolicy(pcieSetting ? 'powersave' : 'default');
+      debug.log(`Applied PCIe ASPM from profile (${pcieSetting ? 'enabled (powersave)' : 'disabled (default)'})`);
+    } catch (error) {
+      debug.error('Failed to apply PCIe ASPM from profile:', error);
     }
     
     // Sync WiFi power save setting - apply both true and false values
@@ -1670,7 +1662,7 @@ const Content: React.FC = () => {
     }
   }, [currentProfile, currentProfileId]);
 
-  const handlePcieAsmpChange = useCallback(async (enabled: boolean) => {
+  const handlePcieAspmChange = useCallback(async (enabled: boolean) => {
     setPcieAspmEnabled(enabled);
     
     // Update the current profile with the new PCIe ASPM setting
@@ -2525,7 +2517,7 @@ const Content: React.FC = () => {
                   label="PCIe ASPM"
                   description="Enable PCIe Active State Power Management"
                   checked={pcieAspmEnabled}
-                  onChange={handlePcieAsmpChange}
+                  onChange={handlePcieAspmChange}
                 />
               </PanelSectionRow>
             )}

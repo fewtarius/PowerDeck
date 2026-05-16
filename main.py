@@ -6932,3 +6932,35 @@ async def debug_get_state_comparison():
     except Exception as e:
         decky.logger.error(f"Debug get state comparison failed: {e}")
         return {"success": False, "error": str(e)}
+
+# ── Missing module-level wrappers for frontend callables ──────────────
+# These Plugin instance methods need module-level wrappers for Decky
+# to call them from the frontend via callable().
+
+async def apply_profile(profile_data: Dict[str, Any]) -> bool:
+    """Apply a power profile to hardware - Global function called by frontend"""
+    return await plugin.apply_profile(profile_data)
+
+async def get_pcie_aspm_policy() -> str:
+    """Get current PCIe ASPM power policy - Global function called by frontend"""
+    return await plugin.get_pcie_aspm_policy()
+
+async def set_pcie_aspm_policy(policy: str) -> bool:
+    """Set PCIe ASPM power policy - Global function called by frontend"""
+    return await plugin.set_pcie_aspm_policy(policy)
+
+async def get_usb_autosuspend_status() -> Dict[str, bool]:
+    """Get USB autosuspend status for all devices - Global function called by frontend"""
+    return await plugin.get_usb_autosuspend_status()
+
+async def set_usb_autosuspend(enable: bool) -> bool:
+    """Enable/disable USB autosuspend - Global function called by frontend"""
+    return await plugin.set_usb_autosuspend(enable)
+
+async def get_wifi_power_save() -> bool:
+    """Get WiFi power save status - Global function called by frontend"""
+    return await plugin.get_wifi_power_save()
+
+async def set_wifi_power_save(enable: bool) -> bool:
+    """Enable/disable WiFi power save - Global function called by frontend"""
+    return await plugin.set_wifi_power_save(enable)
