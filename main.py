@@ -1740,11 +1740,14 @@ class Plugin:
     async def set_tdp(self, tdp: int, save_to_profile: bool = False) -> bool:
         """Set TDP limit using the best available method.
         
-        Priority order:
-        1. SteamOS Manager DBus (SteamFork 3.8+) - coordinates with amd_pmf
-        2. Device-specific native controller (ROG Ally Armoury, Legion WMI, etc.)
-        3. ryzenadj for live application (always used as supplement to #1/#2)
-        4. Generic fallback (ryzenadj only)
+        IMPORTANT: ryzenadj and amd_pmf are mutually exclusive.
+        - When ROG Ally native TDP is enabled: use ONLY Armoury sysfs (amd_pmf
+          manages power). ryzenadj fights with amd_pmf's 1-second register
+          refresh loop and gets overridden, causing constant power limit resets.
+        - When ROG Ally native TDP is disabled: use ONLY ryzenadj (no amd_pmf
+          interference). This gives direct SMU control without register fights.
+        - SteamOS Manager coordinates with amd_pmf natively, so it's always
+          preferred when available.
         """
         try:
             # Validate TDP range
@@ -1757,23 +1760,15 @@ class Plugin:
                 tdp = max_tdp
             
             success = False
-            steamos_success = False
             
             # ── Priority 1: SteamOS Manager DBus ──────────────────────
             # On SteamFork 3.8+ and SteamOS 3.5+, steamos-manager provides
-            # the canonical power management interface. It uses the
-            # firmware-attributes (Armoury) sysfs for persistence and
-            # coordinates with amd_pmf to prevent register fights.
+            # the canonical power management interface. It coordinates with
+            # amd_pmf natively, so no ryzenadj supplement is needed.
             if self.steamos_manager_available:
                 steamos_success = await self.set_tdp_via_steamos_manager(tdp)
                 if steamos_success:
                     decky.logger.info(f"TDP set to {tdp}W via SteamOS Manager (primary)")
-                    # Also apply via ryzenadj for immediate live effect.
-                    # steamos-manager sets Armoury values which amd_pmf
-                    # picks up, but ryzenadj provides instant SMU writes.
-                    live_success = await self.set_amd_tdp(tdp)
-                    if live_success:
-                        decky.logger.info(f"TDP also applied live via ryzenadj: {tdp}W")
                     success = True
                 else:
                     decky.logger.warning("SteamOS Manager TDP failed, falling back to device controller")
@@ -1781,41 +1776,39 @@ class Plugin:
             # ── Priority 2: Device-specific native controller ─────────
             if not success and self.device_controller:
                 if self.device_type == "rog_ally":
-                    # Check if ROG Ally native TDP support is enabled
                     if self.rog_ally_native_tdp_enabled:
-                        # Use ROG Ally native TDP control (armoury sysfs - persistent but non-live)
-                        # Use tiered limits: fast > sustained > stapm for better burst performance.
-                        # The Armoury Crate firmware has max limits per attribute (e.g. STAPM max 25W
-                        # on Z1 Extreme), and set_power_limits() clamps values to those maximums.
-                        fast_limit = min(tdp + 15, 45)   # Z1 Extreme ceiling: 45W
-                        sustained_limit = min(int(tdp * 1.25), 43)  # Z1 Extreme ceiling: 43W
-                        native_success = self.device_controller.set_power_limits(fast_limit, sustained_limit, tdp)
+                        # ── ROG Ally Native TDP (amd_pmf) ────────────
+                        # Use ONLY Armoury sysfs for TDP control.
+                        # amd_pmf manages power limits via a 1-second register
+                        # refresh loop. ryzenadj writes get overridden by this
+                        # loop within 1 second, causing constant power limit
+                        # resets. Using both creates a register fight that
+                        # results in unstable power delivery.
+                        # Pin all limits to user's TDP value for consistent behavior.
+                        native_success = self.device_controller.set_power_limits(tdp, tdp, tdp)
                         if native_success:
-                            decky.logger.info(f"TDP set to {tdp}W via ROG Ally native controller (STAPM={tdp}W, sustained={sustained_limit}W, fast={fast_limit}W)")
+                            decky.logger.info(f"TDP set to {tdp}W (all limits pinned) via ROG Ally native controller (amd_pmf)")
                         else:
-                            decky.logger.error(f"ROG Ally native TDP control failed - Armoury Crate writes may be rejected. Check firmware max limits.")
-                        # ALWAYS also apply via ryzenadj for immediate/live effect.
-                        # Armoury writes are persistent but only take effect after amd_pmf
-                        # reload, while ryzenadj writes via /dev/mem are effective immediately.
-                        # Both paths are needed: armoury for persistence, ryzenadj for live.
-                        live_success = await self.set_amd_tdp(tdp)
-                        if live_success:
-                            decky.logger.info(f"TDP applied live via ryzenadj: {tdp}W")
-                        else:
-                            decky.logger.warning(f"ryzenadj live TDP apply failed for {tdp}W")
-                        # Native controller success is authoritative - ryzenadj alone is not
-                        # sufficient because amd_pmf overrides ryzenadj values within 1 second.
+                            decky.logger.error(f"ROG Ally native TDP control failed - Armoury Crate writes may be rejected")
                         success = native_success
+                    else:
+                        # ── ROG Ally with ryzenadj ────────────────────
+                        # Native TDP disabled: use ONLY ryzenadj for TDP control.
+                        # No amd_pmf interference since we're not using Armoury sysfs.
+                        decky.logger.info(f"Using ryzenadj for TDP control (ROG Ally native TDP disabled)")
+                        success = await self.set_amd_tdp(tdp)
+                        if success:
+                            decky.logger.info(f"TDP set to {tdp}W via ryzenadj")
+                        else:
+                            decky.logger.error(f"ryzenadj TDP control failed for {tdp}W")
                 elif self.device_type == "legion":
                     # Legion WMI control
-                    # Pin all limits to TDP - user's TDP is the hard cap
                     success = self.device_controller.set_power_limits_wmi(tdp, tdp, tdp)
                     if success:
                         decky.logger.info(f"TDP set to {tdp}W (all limits pinned) via {self.device_type} controller")
                     else:
                         decky.logger.warning(f"{self.device_type} TDP control failed, falling back to generic")
                 elif self.device_type == "steam_deck":
-                    # Steam Deck specific control
                     success = await self.device_controller.set_tdp(tdp)
                     if success:
                         decky.logger.info(f"TDP set to {tdp}W via {self.device_type} controller")
@@ -1884,14 +1877,16 @@ class Plugin:
             return False
 
     async def set_amd_tdp(self, tdp: int) -> bool:
-        """Set AMD TDP using ryzenadj with tiered burst limits.
-
-        The user's TDP value is the sustained/STAPM target. Fast and slow
-        limits are set higher to allow burst performance while keeping
-        sustained power at the user's setting:
+        """Set AMD TDP using ryzenadj with all limits pinned to user's TDP.
+        
+        When ryzenadj is the sole TDP controller (ROG Ally native TDP disabled),
+        all three AMD power limits are set to the same value to prevent burst
+        spikes above the user's setting:
           STAPM limit  = tdp  (sustained/long-term)
-          Fast limit   = min(tdp + 15, 45)  (short burst, Z1E ceiling 45W)
-          Slow limit   = min(tdp * 1.25, 43)  (medium burst, Z1E ceiling 43W)
+          Fast limit   = tdp  (short burst)
+          Slow limit   = tdp  (medium burst)
+        
+        This ensures the user's TDP slider is a hard cap, not a nominal target.
         """
         try:
             if not self.ryzenadj_path:
@@ -1900,10 +1895,9 @@ class Plugin:
 
             tdp_mw = tdp * 1000
 
-            # Tiered burst limits: fast > slow > stapm for better responsiveness
-            # Z1 Extreme ceiling: fast 45W, slow 43W (confirmed hardware values)
-            fast_limit_mw = min(tdp_mw + 15000, 45000)
-            slow_limit_mw = min(int(tdp_mw * 1.25), 43000)
+            # Pin all limits to user's TDP - the slider is the hard cap, not nominal
+            fast_limit_mw = tdp_mw
+            slow_limit_mw = tdp_mw
 
             cmd = [
                 self.ryzenadj_path,
@@ -3374,26 +3368,14 @@ class Plugin:
                 except Exception as e:
                     decky.logger.error(f"Error applying ROG Ally platform profile: {e}")
 
-            # Re-apply TDP AFTER platform profile on ROG Ally
-            # amd_pmf resets STAPM/PPT limits when platform profile changes,
-            # so we must re-apply ryzenadj TDP limits after the platform profile is set.
-            # Use ryzenadj directly (not full set_tdp) to avoid re-triggering
-            # the native controller which would change the platform profile again.
-            # Add a brief delay to allow amd_pmf to finish resetting limits before
-            # we override them with ryzenadj.
-            if "tdp" in profile_data and "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally":
-                import asyncio
-                decky.logger.info(f"Waiting 1s for amd_pmf to settle before re-applying TDP")
-                await asyncio.sleep(1.0)
-                decky.logger.info(f"Re-applying TDP {profile_data['tdp']}W via ryzenadj after platform profile change (amd_pmf may have reset limits)")
-                try:
-                    tdp_success = await self.set_amd_tdp(profile_data["tdp"])
-                    if tdp_success:
-                        decky.logger.info(f"Re-applied TDP: {profile_data['tdp']}W via ryzenadj after platform profile")
-                    else:
-                        decky.logger.warning(f"Failed to re-apply TDP after platform profile")
-                except Exception as e:
-                    decky.logger.error(f"Error re-applying TDP after platform profile: {e}")
+            # NOTE: No TDP re-apply needed after platform profile.
+            # When ROG Ally native TDP is enabled, amd_pmf manages TDP limits
+            # and will enforce them based on the platform profile we just set.
+            # When native TDP is disabled, ryzenadj manages TDP and platform
+            # profile changes don't conflict with ryzenadj writes.
+            # Using both ryzenadj and amd_pmf simultaneously causes register
+            # fights (amd_pmf overrides ryzenadj within 1 second), so they
+            # must be mutually exclusive.
 
             # Calculate success rate
             if total_operations > 0:
@@ -4254,17 +4236,33 @@ class Plugin:
         return self.rog_ally_native_tdp_enabled
 
     async def set_rog_ally_native_tdp_enabled(self, enabled: bool) -> bool:
-        """Set ROG Ally native TDP support setting"""
+        """Set ROG Ally native TDP support setting.
+        
+        When toggling modes, re-applies the current TDP using the new method
+        to ensure the active TDP controller matches the selected mode.
+        - Enabling native TDP: applies TDP via Armoury sysfs (amd_pmf)
+        - Disabling native TDP: applies TDP via ryzenadj (direct SMU)
+        """
         try:
             # Only allow this setting on ROG Ally devices
             if not await self.is_rog_ally_device():
                 decky.logger.warning("ROG Ally native TDP setting only available on ROG Ally devices")
                 return False
-                
+            
+            old_mode = self.rog_ally_native_tdp_enabled
             self.rog_ally_native_tdp_enabled = enabled
             self._rog_ally_native_tdp_explicitly_set = True  # Mark as explicitly set by user
             await self.save_settings()
             decky.logger.info(f"ROG Ally native TDP support changed to: {enabled} (explicitly set by user)")
+            
+            # Re-apply current TDP using the new control method
+            # This ensures the active TDP controller matches the selected mode
+            if old_mode != enabled:
+                current_tdp = self.current_profile.get("tdp")
+                if current_tdp:
+                    decky.logger.info(f"Re-applying TDP {current_tdp}W using new control mode (native={enabled})")
+                    await self.set_tdp(current_tdp)
+            
             return True
         except Exception as e:
             decky.logger.error(f"Failed to set ROG Ally native TDP setting: {e}")
