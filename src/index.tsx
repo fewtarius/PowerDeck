@@ -230,6 +230,7 @@ const setGpuFrequency = callable<[min: number, max: number], boolean>("set_gpu_f
 // Backend callable functions - Universal Power Management
 const getUsbAutosuspendStatus = callable<[], { [key: string]: boolean }>("get_usb_autosuspend_status");
 const setUsbAutosuspend = callable<[enabled: boolean], boolean>("set_usb_autosuspend");
+const getWifiPowerSave = callable<[], boolean>("get_wifi_power_save");
 const setWifiPowerSave = callable<[enabled: boolean], boolean>("set_wifi_power_save");
 const getPcieAspmPolicy = callable<[], string>("get_pcie_aspm_policy");
 const setPcieAspmPolicy = callable<[policy: string], boolean>("set_pcie_aspm_policy");
@@ -367,6 +368,9 @@ interface DeviceInfo {
   min_gpu_freq: number;
   max_gpu_freq: number;
   scalingDriver?: string;
+  supports_wifi_power_save?: boolean;
+  supports_usb_power_mgmt?: boolean;
+  supports_pcie_aspm?: boolean;
 }
 
 // Component for slider with React icon overlays
@@ -1056,20 +1060,41 @@ const Content: React.FC = () => {
           debug.log("Per-game profiles not supported");
         }
         
-        // Initialize advanced power management settings with defaults
+        // Initialize advanced power management settings from hardware state
         try {
-          // WiFi power save: enabled by default - apply immediately
-          setWifiPowerSaveEnabled(true);
-          await setWifiPowerSave(true);
-          debug.log("WiFi power save enabled by default");
+          // WiFi power save: query current state from hardware
+          try {
+            const wifiEnabled = await getWifiPowerSave();
+            setWifiPowerSaveEnabled(wifiEnabled);
+            debug.log(`WiFi power save initialized from hardware: ${wifiEnabled}`);
+          } catch (error) {
+            // WiFi not supported or not available - default to disabled
+            setWifiPowerSaveEnabled(false);
+            debug.log("WiFi power save not available, defaulting to disabled");
+          }
           
-          // USB autosuspend: disabled by default - don't apply
-          setUsbAutosuspendEnabled(false);
-          debug.log("USB autosuspend disabled by default (OS managed)");
+          // USB autosuspend: query current state from hardware
+          try {
+            const usbStatus = await getUsbAutosuspendStatus();
+            // Check if any device has autosuspend enabled
+            const anyEnabled = Object.values(usbStatus).some(v => v === true);
+            setUsbAutosuspendEnabled(anyEnabled);
+            debug.log(`USB autosuspend initialized from hardware: ${anyEnabled}`);
+          } catch (error) {
+            setUsbAutosuspendEnabled(false);
+            debug.log("USB autosuspend not available, defaulting to disabled");
+          }
           
-          // PCIe ASPM: disabled by default - don't apply  
-          setPcieAspmEnabled(false);
-          debug.log("PCIe ASPM disabled by default (OS managed)");
+          // PCIe ASPM: query current policy from hardware
+          try {
+            const aspmPolicy = await getPcieAspmPolicy();
+            const aspmEnabled = aspmPolicy === 'powersave' || aspmPolicy === 'powersupersave';
+            setPcieAspmEnabled(aspmEnabled);
+            debug.log(`PCIe ASPM initialized from hardware: ${aspmPolicy} (enabled: ${aspmEnabled})`);
+          } catch (error) {
+            setPcieAspmEnabled(false);
+            debug.log("PCIe ASPM not available, defaulting to disabled");
+          }
         } catch (error) {
           debug.log("Advanced power management initialization failed:", error);
         }
@@ -1588,16 +1613,12 @@ const Content: React.FC = () => {
   // Advanced Power Management Handlers
   const handleWifiPowerSaveChange = useCallback(async (enabled: boolean) => {
     setWifiPowerSaveEnabled(enabled);
-    if (enabled) {
-      // Only apply WiFi power save when enabled
-      try {
-        await setWifiPowerSave(true);
-        debug.log('WiFi power save enabled');
-      } catch (error) {
-        debug.error('Failed to enable WiFi power save:', error);
-      }
+    try {
+      await setWifiPowerSave(enabled);
+      debug.log(`WiFi power save ${enabled ? 'enabled' : 'disabled'}`);
+    } catch (error) {
+      debug.error(`Failed to ${enabled ? 'enable' : 'disable'} WiFi power save:`, error);
     }
-    // When disabled, don't change anything - let OS manage
   }, []);
 
   const handleUsbAutosuspendChange = useCallback(async (enabled: boolean) => {
@@ -1615,22 +1636,19 @@ const Content: React.FC = () => {
       debug.error('Failed to save USB autosuspend setting to profile:', error);
     }
     
-    if (enabled) {
-      // Only apply USB autosuspend when enabled
-      try {
-        await setUsbAutosuspend(true);
-        debug.log('USB autosuspend applied to hardware');
-      } catch (error) {
-        debug.error('Failed to apply USB autosuspend to hardware:', error);
-      }
+    // Apply to hardware regardless of enable/disable
+    try {
+      await setUsbAutosuspend(enabled);
+      debug.log(`USB autosuspend ${enabled ? 'enabled' : 'disabled'} on hardware`);
+    } catch (error) {
+      debug.error(`Failed to ${enabled ? 'enable' : 'disable'} USB autosuspend on hardware:`, error);
     }
-    // When disabled, don't change anything - let OS manage
   }, [currentProfile, currentProfileId]);
 
   const handlePcieAsmpChange = useCallback(async (enabled: boolean) => {
     setPcieAspmEnabled(enabled);
     
-    // Update the current profile with the new PCIe ASMP setting
+    // Update the current profile with the new PCIe ASPM setting
     const updatedProfile = { ...currentProfile, pcieAspm: enabled };
     setCurrentProfile(updatedProfile);
     
@@ -1642,16 +1660,13 @@ const Content: React.FC = () => {
       debug.error('Failed to save PCIe ASPM setting to profile:', error);
     }
     
-    if (enabled) {
-      // Only apply PCIe ASPM when enabled  
-      try {
-        await setPcieAspmPolicy('powersave');
-        debug.log('PCIe ASPM applied to hardware (powersave policy)');
-      } catch (error) {
-        debug.error('Failed to apply PCIe ASPM to hardware:', error);
-      }
+    // Apply to hardware: powersave when enabled, default when disabled
+    try {
+      await setPcieAspmPolicy(enabled ? 'powersave' : 'default');
+      debug.log(`PCIe ASPM ${enabled ? 'enabled (powersave)' : 'disabled (default)'} on hardware`);
+    } catch (error) {
+      debug.error(`Failed to ${enabled ? 'enable' : 'disable'} PCIe ASPM on hardware:`, error);
     }
-    // When disabled, don't change anything - let OS manage
   }, [currentProfile, currentProfileId]);
 
   if (loading) {
@@ -2457,36 +2472,42 @@ const Content: React.FC = () => {
               </PanelSectionRow>
             )}
             
-            <PanelSectionRow>
-              <ToggleField
-                label="WiFi Power Save"
-                description="Enable WiFi power saving features (recommended)"
-                checked={wifiPowerSaveEnabled}
-                onChange={handleWifiPowerSaveChange}
-              />
-            </PanelSectionRow>
+            {deviceInfo?.supports_wifi_power_save && (
+              <PanelSectionRow>
+                <ToggleField
+                  label="WiFi Power Save"
+                  description="Enable WiFi power saving features (recommended)"
+                  checked={wifiPowerSaveEnabled}
+                  onChange={handleWifiPowerSaveChange}
+                />
+              </PanelSectionRow>
+            )}
             
-            <PanelSectionRow>
-              <ToggleField
-                label="USB Auto-suspend"
-                description="Enable USB device auto-suspend (may affect some devices)"
-                checked={usbAutosuspendEnabled}
-                onChange={handleUsbAutosuspendChange}
-              />
-            </PanelSectionRow>
+            {deviceInfo?.supports_usb_power_mgmt && (
+              <PanelSectionRow>
+                <ToggleField
+                  label="USB Auto-suspend"
+                  description="Enable USB device auto-suspend (may affect some devices)"
+                  checked={usbAutosuspendEnabled}
+                  onChange={handleUsbAutosuspendChange}
+                />
+              </PanelSectionRow>
+            )}
             
-            <PanelSectionRow>
-              <ToggleField
-                label="PCIe ASPM"
-                description="Enable PCIe Active State Power Management"
-                checked={pcieAspmEnabled}
-                onChange={handlePcieAsmpChange}
-              />
-            </PanelSectionRow>
+            {deviceInfo?.supports_pcie_aspm && (
+              <PanelSectionRow>
+                <ToggleField
+                  label="PCIe ASPM"
+                  description="Enable PCIe Active State Power Management"
+                  checked={pcieAspmEnabled}
+                  onChange={handlePcieAsmpChange}
+                />
+              </PanelSectionRow>
+            )}
             
             <PanelSectionRow>
               <div style={{ fontSize: '0.8em', color: '#888', fontStyle: 'italic', marginTop: '10px' }}>
-                Note: Disabled options will not modify system settings and let the OS manage them completely.
+                Toggling off will revert settings to OS defaults.
               </div>
             </PanelSectionRow>
           </>

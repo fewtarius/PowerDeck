@@ -1114,8 +1114,12 @@ class Plugin:
             # Check for wireless interfaces
             with open("/proc/net/wireless", "r") as f:
                 lines = f.readlines()
-                return len(lines) > 2  # Header lines + at least one interface
+                has_interface = len(lines) > 2  # Header lines + at least one interface
+                if has_interface:
+                    self.device_info["supports_wifi_power_save"] = True
+                return has_interface
         except OSError:
+            self.device_info["supports_wifi_power_save"] = False
             return False
 
     async def get_intel_tdp_limits(self) -> Optional[tuple]:
@@ -3313,29 +3317,32 @@ class Plugin:
                 except Exception as e:
                     decky.logger.error(f"Error applying GPU frequency: {e}")
             
-            # Apply USB autosuspend setting (only if enabled in profile)
-            if profile_data.get("usbAutosuspend", False):
+            # Apply USB autosuspend setting
+            if "usbAutosuspend" in profile_data:
                 total_operations += 1
                 try:
-                    usb_success = await self.set_usb_autosuspend(True)
+                    usb_enabled = profile_data.get("usbAutosuspend", False)
+                    usb_success = await self.set_usb_autosuspend(usb_enabled)
                     if usb_success:
                         success_count += 1
-                        decky.logger.info("Applied USB autosuspend: enabled")
+                        decky.logger.info(f"Applied USB autosuspend: {'enabled' if usb_enabled else 'disabled'}")
                     else:
-                        decky.logger.warning("Failed to apply USB autosuspend")
+                        decky.logger.warning(f"Failed to apply USB autosuspend: {'enabled' if usb_enabled else 'disabled'}")
                 except Exception as e:
                     decky.logger.error(f"Error applying USB autosuspend: {e}")
             
-            # Apply PCIe ASPM setting (only if enabled in profile)  
-            if profile_data.get("pcieAspm", False):
+            # Apply PCIe ASPM setting
+            if "pcieAspm" in profile_data:
                 total_operations += 1
                 try:
-                    pcie_success = await self.set_pcie_aspm_policy("powersave")
+                    pcie_enabled = profile_data.get("pcieAspm", False)
+                    pcie_policy = "powersave" if pcie_enabled else "default"
+                    pcie_success = await self.set_pcie_aspm_policy(pcie_policy)
                     if pcie_success:
                         success_count += 1
-                        decky.logger.info("Applied PCIe ASPM: powersave policy")
+                        decky.logger.info(f"Applied PCIe ASPM: {pcie_policy} policy")
                     else:
-                        decky.logger.warning("Failed to apply PCIe ASPM")
+                        decky.logger.warning(f"Failed to apply PCIe ASPM: {pcie_policy}")
                 except Exception as e:
                     decky.logger.error(f"Error applying PCIe ASPM: {e}")
 
@@ -4098,6 +4105,10 @@ class Plugin:
     async def get_wifi_power_save(self) -> bool:
         """Get WiFi power save status"""
         try:
+            # Re-detect WiFi if previously unavailable (WiFi may come online after boot)
+            if not self.device_info.get("supports_wifi_power_save"):
+                await self.detect_wifi_interfaces()
+            
             if not self.device_info.get("supports_wifi_power_save"):
                 return False
                 
@@ -4113,6 +4124,10 @@ class Plugin:
     async def set_wifi_power_save(self, enable: bool) -> bool:
         """Enable/disable WiFi power saving"""
         try:
+            # Re-detect WiFi if previously unavailable (WiFi may come online after boot)
+            if not self.device_info.get("supports_wifi_power_save"):
+                await self.detect_wifi_interfaces()
+            
             if not self.device_info.get("supports_wifi_power_save"):
                 self.log_warning_once("WiFi power save not supported on this device")
                 return False
