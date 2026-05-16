@@ -1441,10 +1441,23 @@ class Plugin:
                     decky.logger.warning("No platformProfile in system_profile, will use default 'performance'")
                     system_profile["platformProfile"] = "performance"
                 
-                # Create identical AC and battery profiles from true system defaults
-                await self.save_profile({"gameId": "00000000_ac", **system_profile})
-                await self.save_profile({"gameId": "00000000_battery", **system_profile})
-                decky.logger.info(f"Created identical default profiles with original hardware defaults: {system_profile}")
+                # Create AC and battery profiles from true system defaults
+                # Battery profile gets power-saving defaults appropriate for battery use
+                ac_profile = system_profile.copy()
+                battery_profile = system_profile.copy()
+                
+                # Override battery profile with power-saving defaults
+                battery_profile["governor"] = "powersave"
+                battery_profile["epp"] = "power"
+                battery_profile["platformProfile"] = "power-saver"
+                # Reduce TDP for battery (use 60% of default as starting point)
+                if "tdp" in battery_profile and battery_profile["tdp"] > 10:
+                    battery_profile["tdp"] = max(5, int(battery_profile["tdp"] * 0.6))
+                
+                await self.save_profile({"gameId": "00000000_ac", **ac_profile})
+                await self.save_profile({"gameId": "00000000_battery", **battery_profile})
+                decky.logger.info(f"Created AC profile: {ac_profile}")
+                decky.logger.info(f"Created battery profile: {battery_profile}")
                 
                 # Apply the system-derived defaults to ensure settings are active
                 try:
@@ -3136,10 +3149,11 @@ class Plugin:
                 _default_epp = "balance_performance" if getattr(self, "ac_power", True) else "balance_power"
                 epp = profile_data.get("epp", _default_epp)
                 
+                pstate_mode = await self.get_pstate_mode()
+                
                 # In guided mode, map platform profile to appropriate governor
                 # amd_pmf handles hardware scheduling, so governor should complement
                 # the platform profile rather than conflict with it
-                pstate_mode = await self.get_pstate_mode()
                 if pstate_mode == "guided" and "platformProfile" in profile_data:
                     # Map platform profile to governor for guided mode
                     guided_governor_map = {
@@ -3153,6 +3167,35 @@ class Plugin:
                     if mapped_governor and mapped_governor != governor:
                         decky.logger.info(f"Guided mode: mapping platform profile '{platform_profile}' to governor '{mapped_governor}' (was '{governor}')")
                         governor = mapped_governor
+                
+                # In active mode (amd-pstate-epp), governor must follow EPP:
+                # - EPP power/balance_power → governor must be powersave (EPP controls behavior)
+                # - EPP performance/balance_performance → governor must be performance
+                # Also, EPP cannot be set while governor is performance, so we must
+                # set governor to powersave FIRST, then set EPP, then optionally
+                # switch governor to performance if EPP demands it.
+                if pstate_mode == "active" and "epp" in profile_data:
+                    # Determine the correct governor for this EPP
+                    active_governor_map = {
+                        "power": "powersave",
+                        "balance_power": "powersave",
+                        "balance_performance": "performance",
+                        "performance": "performance",
+                    }
+                    epp_governor = active_governor_map.get(epp, "powersave")
+                    if epp_governor != governor:
+                        decky.logger.info(f"Active mode: EPP '{epp}' requires governor '{epp_governor}' (profile has '{governor}'), adjusting governor to match EPP")
+                        governor = epp_governor
+                    
+                    # Set governor to powersave first to allow EPP changes
+                    # (EPP cannot be changed while governor is performance)
+                    current_governor = self.cpu_manager.get_current_governor()
+                    if current_governor == "performance" and epp_governor != "performance":
+                        decky.logger.info(f"Active mode: temporarily setting governor to powersave to allow EPP change")
+                        if self.steamos_manager_available:
+                            await self.set_governor_via_steamos_manager("powersave")
+                        else:
+                            await self.set_power_governor("powersave")
                 
                 # Set governor if present
                 if "governor" in profile_data or "powerGovernor" in profile_data:
@@ -3303,6 +3346,20 @@ class Plugin:
                         decky.logger.warning(f"Failed to apply ROG Ally platform profile: {profile_data['platformProfile']}")
                 except Exception as e:
                     decky.logger.error(f"Error applying ROG Ally platform profile: {e}")
+
+            # Re-apply TDP AFTER platform profile on ROG Ally
+            # amd_pmf resets STAPM/PPT limits when platform profile changes,
+            # so we must re-apply ryzenadj TDP limits after the platform profile is set
+            if "tdp" in profile_data and "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally":
+                decky.logger.info(f"Re-applying TDP {profile_data['tdp']}W after platform profile change (amd_pmf may have reset limits)")
+                try:
+                    tdp_success = await self.set_tdp(profile_data["tdp"])
+                    if tdp_success:
+                        decky.logger.info(f"Re-applied TDP: {profile_data['tdp']}W after platform profile")
+                    else:
+                        decky.logger.warning(f"Failed to re-apply TDP after platform profile")
+                except Exception as e:
+                    decky.logger.error(f"Error re-applying TDP after platform profile: {e}")
 
             # Calculate success rate
             if total_operations > 0:
