@@ -3376,13 +3376,15 @@ class Plugin:
 
             # Re-apply TDP AFTER platform profile on ROG Ally
             # amd_pmf resets STAPM/PPT limits when platform profile changes,
-            # so we must re-apply ryzenadj TDP limits after the platform profile is set
+            # so we must re-apply ryzenadj TDP limits after the platform profile is set.
+            # Use ryzenadj directly (not full set_tdp) to avoid re-triggering
+            # the native controller which would change the platform profile again.
             if "tdp" in profile_data and "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally":
-                decky.logger.info(f"Re-applying TDP {profile_data['tdp']}W after platform profile change (amd_pmf may have reset limits)")
+                decky.logger.info(f"Re-applying TDP {profile_data['tdp']}W via ryzenadj after platform profile change (amd_pmf may have reset limits)")
                 try:
-                    tdp_success = await self.set_tdp(profile_data["tdp"])
+                    tdp_success = await self.set_amd_tdp(profile_data["tdp"])
                     if tdp_success:
-                        decky.logger.info(f"Re-applied TDP: {profile_data['tdp']}W after platform profile")
+                        decky.logger.info(f"Re-applied TDP: {profile_data['tdp']}W via ryzenadj after platform profile")
                     else:
                         decky.logger.warning(f"Failed to re-apply TDP after platform profile")
                 except Exception as e:
