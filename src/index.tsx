@@ -234,6 +234,8 @@ const getWifiPowerSave = callable<[], boolean>("get_wifi_power_save");
 const setWifiPowerSave = callable<[enabled: boolean], boolean>("set_wifi_power_save");
 const getPcieAspmPolicy = callable<[], string>("get_pcie_aspm_policy");
 const setPcieAspmPolicy = callable<[policy: string], boolean>("set_pcie_aspm_policy");
+const getPciRuntimePmStatus = callable<[], { [key: string]: boolean }>("get_pci_runtime_pm_status");
+const setPciRuntimePm = callable<[enabled: boolean], boolean>("set_pci_runtime_pm");
 
 
 // Backend callable functions - Core functions
@@ -349,6 +351,7 @@ interface PowerProfile {
   pciePowerManagement?: boolean;
   usbAutosuspend?: boolean;
   pcieAspm?: boolean;
+  pciRuntimePm?: boolean;
   platformProfile?: string;
   thermalPolicy?: number;
 }
@@ -550,7 +553,8 @@ const Content: React.FC = () => {
     gpuFreqMax: 1100, // Safe default for Intel devices  
     gpuFreqFixed: 700,
     usbAutosuspend: false, // Default to disabled for stability
-    pcieAspm: false // Default to disabled for stability
+    pcieAspm: false, // Default to disabled for stability
+    pciRuntimePm: false // Default to disabled for stability
   });
 
   const [currentProfileId, setCurrentProfileId] = useState<string>("00000000_ac");
@@ -575,6 +579,7 @@ const Content: React.FC = () => {
   const [wifiPowerSaveEnabled, setWifiPowerSaveEnabled] = useState<boolean>(true);
   const [usbAutosuspendEnabled, setUsbAutosuspendEnabled] = useState<boolean>(false);
   const [pcieAspmEnabled, setPcieAspmEnabled] = useState<boolean>(false);
+  const [pciRuntimePmEnabled, setPciRuntimePmEnabled] = useState<boolean>(false);
 
   // Available options from device
   const [availableGovernors, setAvailableGovernors] = useState<string[]>(['performance', 'powersave', 'ondemand', 'conservative', 'schedutil']);
@@ -773,7 +778,7 @@ const Content: React.FC = () => {
       // Deep comparison of important settings that trigger hardware changes
       // BUT: Skip comparison if forceApply is true (AC/battery switch, game change, etc.)
       if (lastAppliedProfile && !forceApply) {
-        const importantSettings = ['tdp', 'cpuBoost', 'cpuCores', 'governor', 'smt', 'epp', 'gpuMode', 'gpuFreqMin', 'gpuFreqMax', 'gpuFreqFixed', 'usbAutosuspend', 'pcieAspm', 'wifiPowerSave'];
+        const importantSettings = ['tdp', 'cpuBoost', 'cpuCores', 'governor', 'smt', 'epp', 'gpuMode', 'gpuFreqMin', 'gpuFreqMax', 'gpuFreqFixed', 'usbAutosuspend', 'pcieAspm', 'wifiPowerSave', 'pciRuntimePm'];
         const hasChanges = importantSettings.some(key => 
           lastAppliedProfile[key as keyof PowerProfile] !== newProfile[key as keyof PowerProfile]
         );
@@ -806,7 +811,8 @@ const Content: React.FC = () => {
       ...profile,
       usbAutosuspend: profile.usbAutosuspend ?? false,
       pcieAspm: profile.pcieAspm ?? false,
-      wifiPowerSave: profile.wifiPowerSave ?? false
+      wifiPowerSave: profile.wifiPowerSave ?? false,
+      pciRuntimePm: profile.pciRuntimePm ?? false
     };
   }, []);
 
@@ -864,6 +870,16 @@ const Content: React.FC = () => {
       debug.log(`Applied WiFi power save from profile (${wifiSetting ? 'enabled' : 'disabled'})`);
     } catch (error) {
       debug.error('Failed to apply WiFi power save from profile:', error);
+    }
+    
+    // Sync PCI runtime PM setting
+    const pciPmSetting = profile.pciRuntimePm ?? false; // Default to false if undefined
+    setPciRuntimePmEnabled(pciPmSetting);
+    try {
+      await setPciRuntimePm(pciPmSetting);
+      debug.log(`Applied PCI runtime PM from profile (${pciPmSetting ? 'enabled' : 'disabled'})`);
+    } catch (error) {
+      debug.error('Failed to apply PCI runtime PM from profile:', error);
     }
   }, []);
 
@@ -1683,6 +1699,30 @@ const Content: React.FC = () => {
       debug.log(`PCIe ASPM ${enabled ? 'enabled (powersave)' : 'disabled (default)'} on hardware`);
     } catch (error) {
       debug.error(`Failed to ${enabled ? 'enable' : 'disable'} PCIe ASPM on hardware:`, error);
+    }
+  }, [currentProfile, currentProfileId]);
+
+  const handlePciRuntimePmChange = useCallback(async (enabled: boolean) => {
+    setPciRuntimePmEnabled(enabled);
+    
+    // Update the current profile with the new PCI runtime PM setting
+    const updatedProfile = { ...currentProfile, pciRuntimePm: enabled };
+    setCurrentProfile(updatedProfile);
+    
+    // Save the updated profile immediately
+    try {
+      await setGameProfile(currentProfileId, updatedProfile);
+      debug.log(`PCI runtime PM ${enabled ? 'enabled' : 'disabled'} and saved to profile ${currentProfileId}`);
+    } catch (error) {
+      debug.error('Failed to save PCI runtime PM setting to profile:', error);
+    }
+    
+    // Apply to hardware
+    try {
+      await setPciRuntimePm(enabled);
+      debug.log(`PCI runtime PM ${enabled ? 'enabled' : 'disabled'} on hardware`);
+    } catch (error) {
+      debug.error(`Failed to ${enabled ? 'enable' : 'disable'} PCI runtime PM on hardware:`, error);
     }
   }, [currentProfile, currentProfileId]);
 
@@ -2521,6 +2561,15 @@ const Content: React.FC = () => {
                 />
               </PanelSectionRow>
             )}
+            
+            <PanelSectionRow>
+              <ToggleField
+                label="PCI Runtime PM"
+                description="Allow unused PCI devices to enter low-power states"
+                checked={pciRuntimePmEnabled}
+                onChange={handlePciRuntimePmChange}
+              />
+            </PanelSectionRow>
             
             <PanelSectionRow>
               <div style={{ fontSize: '0.8em', color: '#888', fontStyle: 'italic', marginTop: '10px' }}>
