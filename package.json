@@ -1,6 +1,6 @@
 {
   "name": "powerdeck",
-  "version": "1.0.33",
+  "version": "1.0.34",
   "type": "module",
   "description": "Advanced power management for Steam Deck and handheld PCs",
   "scripts": {
