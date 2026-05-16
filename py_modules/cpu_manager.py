@@ -313,6 +313,10 @@ class CPUManager:
         In amd-pstate guided mode, EPP is NOT available (no energy_performance_preference sysfs).
         The main.py set_epp() method handles the guided-mode mapping to governor changes.
         This method only handles the direct sysfs write for active/passive modes.
+        
+        Note: In active mode, EPP cannot be set while governor is 'performance'.
+        The caller (main.py apply_profile) is responsible for setting governor to
+        'powersave' before calling this method when EPP needs to change.
         """
         available_options = self.get_available_epp_options()
         if not available_options:
@@ -324,10 +328,13 @@ class CPUManager:
             return False
         
         # Check if EPP can be changed (not blocked by performance governor)
+        # In active mode, governor must be 'powersave' to allow EPP changes.
+        # The caller should set governor to 'powersave' first if needed.
         current_governor = self.get_current_governor()
         if (current_governor == "performance" and 
             self._scaling_driver in [ScalingDriver.AMD_PSTATE_EPP, ScalingDriver.INTEL_PSTATE]):
-            decky_plugin.logger.warning("EPP cannot be changed while governor is set to performance")
+            decky_plugin.logger.warning("EPP cannot be changed while governor is 'performance'. "
+                                        "Set governor to 'powersave' first, then set EPP, then switch back.")
             return False
         
         try:
