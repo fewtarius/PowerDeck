@@ -3965,12 +3965,18 @@ class Plugin:
             # Get VID/PID pairs of all input devices from /proc/bus/input/devices
             input_device_vid_pids = self.get_input_device_vid_pids()
             
-            # Same exclusion logic as set_usb_autosuspend
+            # Exclusion logic matches set_usb_autosuspend
+            # Keyboards with wakeup capability are included - they auto-resume on keypress
             CRITICAL_DEVICE_EXCLUSIONS = [
+                # Gaming controllers - held open by driver, can't suspend
                 "gamepad", "controller", "joystick", "xbox", "playstation", "nintendo",
-                "game", "joy", "pad", "stick", "keyboard", "mouse", "touchpad", 
-                "trackpad", "touchscreen", "hid", "input", "builtin", "internal", 
-                "integrated", "ayaneo", "rog", "ally", "steam", "deck", "onexplayer", "gpd"
+                "game", "joy", "pad", "stick",
+                # Pointing devices - many don't auto-resume from suspend
+                "mouse", "touchpad", "trackpad", "touchscreen",
+                # Generic HID/input patterns - too broad, may match critical devices
+                "hid", "input", "builtin", "internal", "integrated",
+                # Handheld-specific controllers
+                "ayaneo", "rog", "ally", "steam", "deck", "onexplayer", "gpd"
             ]
             
             for control_file in glob.glob("/sys/bus/usb/devices/*/power/control"):
@@ -4028,6 +4034,15 @@ class Plugin:
                             if exclusion in device_check_string:
                                 should_exclude = True
                                 break
+                    
+                    # Override: keyboards with wakeup capability can be safely suspended
+                    if should_exclude and "keyboard" in f"{device_name} {device_info}".lower():
+                        wakeup_file = os.path.join(device_path, "power", "wakeup")
+                        if os.path.exists(wakeup_file):
+                            with open(wakeup_file, "r") as f:
+                                wakeup = f.read().strip()
+                            if wakeup == "enabled":
+                                should_exclude = False
                     
                 except Exception:
                     should_exclude = True  # Exclude if we can't read device info
@@ -4125,14 +4140,15 @@ class Plugin:
             # Get VID/PID pairs of all input devices from /proc/bus/input/devices
             input_device_vid_pids = self.get_input_device_vid_pids()
             
-            # Define additional device types that should NEVER be power managed
+            # Device types that should NOT be power managed
+            # Keyboards with wakeup capability are allowed - they auto-resume on keypress
             CRITICAL_DEVICE_EXCLUSIONS = [
-                # Built-in gaming controllers (common patterns)
+                # Gaming controllers - held open by driver, can't suspend
                 "gamepad", "controller", "joystick", "xbox", "playstation", "nintendo",
                 "game", "joy", "pad", "stick",
-                # Built-in keyboards and input devices
-                "keyboard", "mouse", "touchpad", "trackpad", "touchscreen",
-                # Critical system devices
+                # Pointing devices - many don't auto-resume from suspend
+                "mouse", "touchpad", "trackpad", "touchscreen",
+                # Generic HID/input patterns - too broad, may match critical devices
                 "hid", "input", "builtin", "internal", "integrated",
                 # Handheld-specific controllers
                 "ayaneo", "rog", "ally", "steam", "deck", "onexplayer", "gpd"
@@ -4199,6 +4215,18 @@ class Plugin:
                                 exclusion_reason = f"matches pattern '{exclusion}'"
                                 break
                     
+                    # Override: keyboards with wakeup capability can be safely suspended
+                    # They auto-resume on keypress, saving ~0.5W on handheld devices
+                    if should_exclude and "keyboard" in f"{device_name} {device_info}".lower():
+                        wakeup_file = os.path.join(device_path, "power", "wakeup")
+                        if os.path.exists(wakeup_file):
+                            with open(wakeup_file, "r") as f:
+                                wakeup = f.read().strip()
+                            if wakeup == "enabled":
+                                should_exclude = False
+                                exclusion_reason = ""
+                                decky.logger.info(f"USB Power Management: Allowing keyboard '{device_name}' with wakeup capability for autosuspend")
+                    
                     # Log exclusion details
                     if should_exclude:
                         decky.logger.info(f"USB Power Management: Excluding critical device '{device_name}' ({exclusion_reason}) - device info: {device_info}")
@@ -4226,6 +4254,157 @@ class Plugin:
             return count > 0
         except Exception as e:
             decky.logger.error(f"Failed to set USB autosuspend: {e}")
+            return False
+
+    async def get_keyboard_suspend_status(self) -> Dict[str, Any]:
+        """Get keyboard suspend status and capability info"""
+        try:
+            result = {
+                "supported": False,
+                "keyboards": [],
+                "suspend_enabled": False
+            }
+            
+            for control_file in glob.glob("/sys/bus/usb/devices/*/power/control"):
+                device_path = os.path.dirname(os.path.dirname(control_file))
+                device_name = os.path.basename(device_path)
+                
+                try:
+                    # Check if this is a keyboard device
+                    product_file = os.path.join(device_path, "product")
+                    if not os.path.exists(product_file):
+                        continue
+                    
+                    product_name = ""
+                    with open(product_file, "r") as f:
+                        product_name = f.read().strip()
+                    
+                    # Match keyboard devices by name
+                    if "keyboard" not in product_name.lower():
+                        continue
+                    
+                    # Check wakeup capability
+                    wakeup_file = os.path.join(device_path, "power", "wakeup")
+                    wakeup_capable = False
+                    if os.path.exists(wakeup_file):
+                        with open(wakeup_file, "r") as f:
+                            wakeup_capable = f.read().strip() == "enabled"
+                    
+                    # Check current control setting
+                    with open(control_file, "r") as f:
+                        current_control = f.read().strip()
+                    
+                    # Check runtime status
+                    runtime_file = os.path.join(device_path, "power", "runtime_status")
+                    runtime_status = "unknown"
+                    if os.path.exists(runtime_file):
+                        with open(runtime_file, "r") as f:
+                            runtime_status = f.read().strip()
+                    
+                    # Get VID/PID
+                    vendor = ""
+                    product_id = ""
+                    vendor_file = os.path.join(device_path, "idVendor")
+                    product_id_file = os.path.join(device_path, "idProduct")
+                    if os.path.exists(vendor_file):
+                        with open(vendor_file, "r") as f:
+                            vendor = f.read().strip()
+                    if os.path.exists(product_id_file):
+                        with open(product_id_file, "r") as f:
+                            product_id = f.read().strip()
+                    
+                    kbd_info = {
+                        "name": product_name,
+                        "device": device_name,
+                        "vendor_id": vendor,
+                        "product_id": product_id,
+                        "wakeup_capable": wakeup_capable,
+                        "control": current_control,
+                        "runtime_status": runtime_status,
+                        "can_suspend": wakeup_capable
+                    }
+                    result["keyboards"].append(kbd_info)
+                    
+                    if wakeup_capable:
+                        result["supported"] = True
+                        if current_control == "auto":
+                            result["suspend_enabled"] = True
+                            
+                except Exception as e:
+                    decky.logger.warning(f"Failed to check keyboard device {device_name}: {e}")
+                    continue
+            
+            return result
+        except Exception as e:
+            decky.logger.error(f"Failed to get keyboard suspend status: {e}")
+            return {"supported": False, "keyboards": [], "suspend_enabled": False}
+
+    async def set_keyboard_suspend(self, enable: bool) -> bool:
+        """Enable/disable USB autosuspend for keyboard devices that support wakeup.
+        
+        Keyboards with wakeup capability can be safely suspended - they auto-resume
+        on keypress. This saves ~0.5W on devices with built-in USB keyboards.
+        """
+        try:
+            setting = "auto" if enable else "on"
+            count = 0
+            
+            for control_file in glob.glob("/sys/bus/usb/devices/*/power/control"):
+                device_path = os.path.dirname(os.path.dirname(control_file))
+                device_name = os.path.basename(device_path)
+                
+                try:
+                    # Check if this is a keyboard device
+                    product_file = os.path.join(device_path, "product")
+                    if not os.path.exists(product_file):
+                        continue
+                    
+                    product_name = ""
+                    with open(product_file, "r") as f:
+                        product_name = f.read().strip()
+                    
+                    if "keyboard" not in product_name.lower():
+                        continue
+                    
+                    # Only suspend keyboards that support wakeup
+                    wakeup_file = os.path.join(device_path, "power", "wakeup")
+                    if not os.path.exists(wakeup_file):
+                        decky.logger.info(f"Keyboard suspend: {device_name} has no wakeup capability, skipping")
+                        continue
+                    
+                    with open(wakeup_file, "r") as f:
+                        wakeup = f.read().strip()
+                    
+                    if wakeup != "enabled":
+                        decky.logger.info(f"Keyboard suspend: {device_name} wakeup not enabled, skipping")
+                        continue
+                    
+                    # Set autosuspend delay (30 seconds)
+                    # Long delay avoids perceptible resume latency during active typing.
+                    # Keyboard only suspends after 30s of no input, saving power
+                    # during extended idle periods (watching video, reading, etc.)
+                    autosuspend_file = os.path.join(device_path, "power", "autosuspend_delay_ms")
+                    if os.path.exists(autosuspend_file) and enable:
+                        with open(autosuspend_file, "w") as f:
+                            f.write("30000")
+                    
+                    # Set control to auto (suspend) or on (always active)
+                    with open(control_file, "w") as f:
+                        f.write(setting)
+                    count += 1
+                    decky.logger.info(f"Keyboard suspend: Set {device_name} ({product_name}) to {setting}")
+                    
+                except Exception as e:
+                    decky.logger.warning(f"Failed to set keyboard suspend for {device_name}: {e}")
+                    continue
+            
+            if count > 0:
+                decky.logger.info(f"Keyboard suspend: Set {count} keyboard(s) to {setting}")
+            else:
+                decky.logger.info("Keyboard suspend: No wakeup-capable keyboards found")
+            return count > 0
+        except Exception as e:
+            decky.logger.error(f"Failed to set keyboard suspend: {e}")
             return False
 
     async def get_wifi_power_save(self) -> bool:
@@ -7055,6 +7234,14 @@ async def get_usb_autosuspend_status() -> Dict[str, bool]:
 async def set_usb_autosuspend(enable: bool) -> bool:
     """Enable/disable USB autosuspend - Global function called by frontend"""
     return await plugin.set_usb_autosuspend(enable)
+
+async def get_keyboard_suspend_status() -> Dict[str, Any]:
+    """Get keyboard suspend status and capability info - Global function called by frontend"""
+    return await plugin.get_keyboard_suspend_status()
+
+async def set_keyboard_suspend(enable: bool) -> bool:
+    """Enable/disable USB keyboard suspend for power saving - Global function called by frontend"""
+    return await plugin.set_keyboard_suspend(enable)
 
 async def get_wifi_power_save() -> bool:
     """Get WiFi power save status - Global function called by frontend"""
