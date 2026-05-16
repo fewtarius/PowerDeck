@@ -2403,10 +2403,13 @@ class Plugin:
     # - active:  Full hardware control via CPPC (Collaborative Processor Performance Control)
     #            Provides best power efficiency with EPP (Energy Performance Preference)
     #            Available governors: performance, powersave only
+    #            Scaling driver: amd-pstate-epp
     # - passive: Traditional software control via the Linux cpufreq subsystem
     #            Available governors: all standard governors (schedutil, ondemand, etc.)
+    #            Scaling driver: amd-pstate
     # - guided:  Hybrid mode where hardware suggests frequencies but kernel can adjust
-    #            Available governors: performance, powersave only
+    #            Available governors: all standard governors (same as passive)
+    #            Scaling driver: amd-pstate
     PSTATE_MODES = ["active", "passive", "guided"]
     PSTATE_STATUS_PATH = "/sys/devices/system/cpu/amd_pstate/status"
 
@@ -2419,26 +2422,28 @@ class Plugin:
                     # Cache the mode for quick access
                     self.pstate_mode = current_mode
                     return current_mode
-            # Fallback: try to infer from available governors
-            gov_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"
-            if os.path.exists(gov_path):
-                with open(gov_path, 'r') as f:
-                    available = f.read().strip().split()
-                # Active/guided modes only have performance and powersave
-                if set(available) == {"performance", "powersave"}:
-                    # Distinguish active from guided by checking EPP availability
-                    # EPP (energy_performance_preference) is only exposed in active mode
-                    epp_path = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
-                    if os.path.exists(epp_path):
-                        self.pstate_mode = "active"
-                        return "active"
-                    else:
-                        self.pstate_mode = "guided"
-                        return "guided"
+            # Fallback: try to infer from scaling driver
+            scaling_driver = await self.get_scaling_driver()
+            if scaling_driver == "amd-pstate-epp":
+                # Active mode uses amd-pstate-epp driver
+                self.pstate_mode = "active"
+                return "active"
+            elif scaling_driver == "amd-pstate":
+                # Both passive and guided use amd-pstate driver
+                # Check EPP availability to distinguish:
+                # - Active mode has EPP (energy_performance_preference)
+                # - Guided mode does NOT have EPP
+                # - Passive mode does NOT have EPP
+                # We can't distinguish guided from passive by EPP alone,
+                # but guided is the safer default
+                epp_path = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
+                if os.path.exists(epp_path):
+                    self.pstate_mode = "active"
+                    return "active"
                 else:
-                    self.pstate_mode = "passive"
-                    return "passive"
-            return "guided"  # Safe default
+                    self.pstate_mode = "guided"
+                    return "guided"
+            return self.pstate_mode
         except Exception as e:
             decky.logger.error(f"Failed to get pstate mode: {e}")
             return self.pstate_mode
@@ -3587,37 +3592,37 @@ class Plugin:
             return "balanced"
 
     async def get_available_governors(self) -> List[str]:
-        """Get list of available power governors"""
+        """Get list of available power governors based on current pstate mode
+        
+        Available governors depend on the CPU scaling driver:
+        - amd-pstate-epp (active mode): Only performance and powersave
+          (hardware manages frequencies via EPP, governor just sets policy)
+        - amd-pstate (passive/guided mode): All traditional governors available
+          (conservative, ondemand, schedutil, powersave, performance, userspace)
+        """
         try:
-            # Get current pstate mode to determine valid governors
-            current_pstate_mode = await self.get_pstate_mode()
-            
-            # In active/guided modes, ondemand is NOT available (only performance/powersave)
-            if current_pstate_mode in ("active", "guided"):
-                decky.logger.info(f"GET_AVAILABLE_GOVERNORS: {current_pstate_mode} mode - limiting to performance/powersave only")
-                return ["performance", "powersave"]
-            
-            # First check scaling driver to determine correct governors
-            scaling_driver = await self.get_scaling_driver()
-            decky.logger.info(f"GET_AVAILABLE_GOVERNORS: Scaling driver: {scaling_driver}")
-            
-            # For amd-pstate-epp, only performance and powersave are valid
-            if scaling_driver == "amd-pstate-epp":
-                governors = ["performance", "powersave"]
-                decky.logger.info(f"GET_AVAILABLE_GOVERNORS: Using amd-pstate-epp governors: {governors}")
-                return governors
-            
-            # For other drivers, read from system file
+            # Read available governors directly from sysfs - this is the
+            # authoritative source and reflects the current pstate mode
             gov_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"
             if os.path.exists(gov_path):
                 with open(gov_path, "r") as f:
                     governors = f.read().strip().split()
-                    decky.logger.info(f"GET_AVAILABLE_GOVERNORS: Read from file: {governors}")
+                    decky.logger.info(f"GET_AVAILABLE_GOVERNORS: Read from sysfs: {governors}")
                     return governors
             
-            # Fallback for unknown drivers
-            governors = ["performance", "powersave", "schedutil", "ondemand", "conservative"]
-            decky.logger.info(f"GET_AVAILABLE_GOVERNORS: Using fallback: {governors}")
+            # Fallback: determine from scaling driver
+            scaling_driver = await self.get_scaling_driver()
+            decky.logger.info(f"GET_AVAILABLE_GOVERNORS: Scaling driver: {scaling_driver}")
+            
+            if scaling_driver == "amd-pstate-epp":
+                # Active mode: only performance and powersave are valid
+                governors = ["performance", "powersave"]
+                decky.logger.info(f"GET_AVAILABLE_GOVERNORS: Using amd-pstate-epp governors: {governors}")
+                return governors
+            
+            # For amd-pstate (passive/guided) and other drivers, return full set
+            governors = ["conservative", "ondemand", "userspace", "powersave", "performance", "schedutil"]
+            decky.logger.info(f"GET_AVAILABLE_GOVERNORS: Using full governor set: {governors}")
             return governors
         except Exception as e:
             decky.logger.error(f"Failed to get available governors: {e}")
