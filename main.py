@@ -1233,24 +1233,27 @@ class Plugin:
     async def get_ac_power_status_with_retry(self, max_retries: int = 5, delay_seconds: float = 2.0) -> bool:
         """Get AC power status with retry logic for initialization during boot"""
         import asyncio
+        import glob
         
         for attempt in range(max_retries):
             try:
                 decky.logger.info(f"AC power detection attempt {attempt + 1}/{max_retries}")
                 
-                # Check multiple common AC power supply paths for broader device compatibility
-                ac_paths = [
-                    "/sys/class/power_supply/ACAD/online",  # Generic/ROG Ally
-                    "/sys/class/power_supply/ADP1/online",  # Ayaneo Air and many laptops
-                    "/sys/class/power_supply/AC/online",    # Some other devices
-                    "/sys/class/power_supply/ADP0/online"   # Alternative naming
-                ]
-                
+                # Use glob patterns for broader device compatibility
+                # This handles AC0, AC1, ADP0, ADP1, ACAD, etc.
                 ac_connected = False
                 detected_path = None
                 
-                for ac_path in ac_paths:
-                    if os.path.exists(ac_path):
+                # Method 1: Check AC adapter online status via glob patterns
+                ac_glob_patterns = [
+                    '/sys/class/power_supply/AC*/online',   # AC0, AC1, etc.
+                    '/sys/class/power_supply/ADP*/online',   # ADP0, ADP1, etc.
+                    '/sys/class/power_supply/ACAD/online',   # Generic
+                ]
+                
+                for pattern in ac_glob_patterns:
+                    matches = glob.glob(pattern)
+                    for ac_path in matches:
                         try:
                             with open(ac_path, 'r') as f:
                                 ac_value = f.read().strip()
@@ -1261,6 +1264,30 @@ class Plugin:
                         except Exception as e:
                             decky.logger.warning(f"Failed to read AC power from {ac_path}: {e}")
                             continue
+                    if detected_path:
+                        break
+                
+                # Method 2: Check battery status if no AC adapter found
+                if not detected_path:
+                    battery_glob_patterns = [
+                        '/sys/class/power_supply/BAT*/status',
+                        '/sys/class/power_supply/battery/status',
+                    ]
+                    for pattern in battery_glob_patterns:
+                        for bat_path in glob.glob(pattern):
+                            try:
+                                with open(bat_path, 'r') as f:
+                                    battery_status = f.read().strip().lower()
+                                    decky.logger.info(f"Battery status via {bat_path}: {battery_status}")
+                                    if battery_status in ['charging', 'full']:
+                                        decky.logger.info(f"AC power confirmed: battery status is '{battery_status}'")
+                                        return True
+                                    elif battery_status in ['discharging', 'not charging']:
+                                        decky.logger.info(f"AC power not connected: battery status is '{battery_status}'")
+                                        return False
+                            except Exception as e:
+                                decky.logger.warning(f"Failed to read battery status from {bat_path}: {e}")
+                                continue
                 
                 if detected_path:
                     # If we detect AC power, return immediately (no need to retry)
