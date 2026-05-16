@@ -308,8 +308,17 @@ class CPUManager:
         return None
     
     def set_epp(self, epp: str) -> bool:
-        """Set Energy Performance Preference for all cores"""
+        """Set Energy Performance Preference for all cores
+        
+        In amd-pstate guided mode, EPP is NOT available (no energy_performance_preference sysfs).
+        The main.py set_epp() method handles the guided-mode mapping to governor changes.
+        This method only handles the direct sysfs write for active/passive modes.
+        """
         available_options = self.get_available_epp_options()
+        if not available_options:
+            decky_plugin.logger.info("EPP not available on this system (likely guided/passive mode)")
+            return False
+        
         if epp not in available_options:
             decky_plugin.logger.error(f"EPP {epp} not available. Available: {available_options}")
             return False
