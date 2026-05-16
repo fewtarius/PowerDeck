@@ -158,8 +158,7 @@ class Plugin:
             "cpuBoost": True,  # Enabled by default to match typical system behavior
             "smt": True,
             "cpuCores": None,  # Will be detected from hardware during initialization
-            "governor": "powersave",  # Always use powersave for efficiency
-            "governor": "performance",  # Performance governor for gaming
+            "governor": "performance",  # Performance governor for gaming (AC default)
             "epp": "balance_performance"  # Balanced performance as safe default
         }
         # TDP limits will be set from processor database or sysfs during initialization
@@ -2477,12 +2476,18 @@ class Plugin:
     async def _ensure_valid_governor_for_mode(self, mode: str) -> bool:
         """Ensure current governor is valid for the given pstate mode
         
-        In active/guided modes, only 'performance' and 'powersave' governors are valid.
-        If the current governor is invalid (e.g., schedutil, ondemand), switch to
-        'performance' using the standard set_power_governor method which handles
-        per-CPU writes and error reporting.
+        In active mode, only 'performance' and 'powersave' governors are valid.
+        In guided mode, ALL governors are available (conservative, ondemand, schedutil, etc.)
+        because the kernel exposes the full cpufreq governor list while amd_pmf handles
+        the hardware-guided scheduling. Only in active mode do we need to restrict governors.
         """
         try:
+            # In guided and passive modes, all governors are valid - no restriction needed
+            if mode in ("guided", "passive"):
+                decky.logger.info(f"Governor restriction not needed for {mode} mode - all governors available")
+                return True
+            
+            # In active mode, only performance and powersave are valid
             gov_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
             if not os.path.exists(gov_path):
                 return False
@@ -2490,13 +2495,12 @@ class Plugin:
             with open(gov_path, 'r') as f:
                 current = f.read().strip()
             
-            # In active/guided mode, only performance and powersave are valid
             valid_governors = ["performance", "powersave"]
             
             if current not in valid_governors:
                 decky.logger.warning(f"Governor '{current}' invalid for {mode} mode, switching to 'performance'")
                 return await self.set_power_governor("performance")
-            return False  # Governor was already valid
+            return True  # Governor was already valid
             
         except Exception as e:
             decky.logger.error(f"Failed to ensure valid governor: {e}")
@@ -2542,7 +2546,7 @@ class Plugin:
                 "guided": {
                     "description": "Hardware-guided with kernel hints - Balanced approach",
                     "supports_epp": False,
-                    "available_governors": ["performance", "powersave"],
+                    "available_governors": ["conservative", "ondemand", "userspace", "powersave", "performance", "schedutil"],
                     "epp_options": [],
                     "recommended_for": ["Balanced performance", "Quick transitions", "General use"]
                 }
@@ -2566,8 +2570,11 @@ class Plugin:
     async def set_power_governor(self, governor: str) -> bool:
         """Set CPU power governor with fallback for unavailable governors
         
-        In amd-pstate active/guided modes, only 'performance' and 'powersave' are available.
-        In passive mode, all standard governors (schedutil, ondemand, etc.) are available.
+        In amd-pstate active mode, only 'performance' and 'powersave' are available.
+        In guided mode, ALL governors are available (conservative, ondemand, schedutil, etc.)
+        because the kernel exposes the full cpufreq governor list while amd_pmf handles
+        hardware-guided scheduling.
+        In passive mode, all standard governors are available.
         This method automatically maps unavailable governors to valid alternatives.
         """
         try:
@@ -2585,7 +2592,7 @@ class Plugin:
                 except Exception:
                     pass  # Fall through to normal governor setting
 
-            # Get available governors
+            # Get available governors from sysfs (the authoritative source)
             available_governors_path = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors"
             if os.path.exists(available_governors_path):
                 with open(available_governors_path, 'r') as f:
@@ -2593,7 +2600,25 @@ class Plugin:
             else:
                 available_governors = ["performance", "powersave"]  # Safe fallback
             
+            # In guided mode, prefer schedutil for battery/balanced profiles
+            # schedutil provides good dynamic scaling while amd_pmf handles hardware hints
+            if pstate_mode == "guided":
+                # Map governor choices to guided-mode-appropriate alternatives
+                guided_governor_map = {
+                    "powersave": "powersave",    # Keep powersave for max battery
+                    "schedutil": "schedutil",    # Keep schedutil for balanced
+                    "performance": "performance", # Keep performance for gaming
+                    "ondemand": "schedutil",      # ondemand -> schedutil (better for guided)
+                    "conservative": "powersave",  # conservative -> powersave (similar behavior)
+                }
+                if governor in guided_governor_map:
+                    mapped = guided_governor_map[governor]
+                    if mapped != governor:
+                        decky.logger.info(f"Guided mode: mapping governor '{governor}' to '{mapped}'")
+                    governor = mapped
+            
             # Map requested governor to available governor if needed
+            # This handles cases where a governor is requested but not available on this system
             governor_mapping = {
                 "balanced": "powersave",       # AMD systems often don't have balanced
                 "ondemand": "powersave",       # Fallback if ondemand not available
@@ -2637,8 +2662,41 @@ class Plugin:
             return False
 
     async def set_epp(self, epp: str) -> bool:
-        """Set Energy Performance Preference - with validation for available options"""
+        """Set Energy Performance Preference - with validation for available options
+        
+        In amd-pstate guided mode, EPP is NOT available (no energy_performance_preference sysfs).
+        In this mode, the governor choice controls power behavior instead:
+        - powersave governor = maximum power savings (equivalent to EPP=power)
+        - schedutil governor = balanced (equivalent to EPP=balance_power)
+        - performance governor = maximum performance (equivalent to EPP=performance)
+        
+        This method skips EPP entirely in guided mode and returns True to avoid
+        silent failures that mask the real issue from users.
+        """
         try:
+            # Check if EPP is available on this system
+            epp_path = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
+            if not os.path.exists(epp_path):
+                # EPP not available - likely in guided or passive mode
+                pstate_mode = await self.get_pstate_mode()
+                if pstate_mode == "guided":
+                    decky.logger.info(f"EPP not available in guided mode - governor controls power behavior instead. "
+                                     f"Use governor mapping: powersave≈EPP power, schedutil≈EPP balance_power, performance≈EPP performance")
+                    # Map the EPP intent to a governor change for guided mode
+                    governor_map = {
+                        "power": "powersave",
+                        "balance_power": "schedutil",
+                        "balance_performance": "schedutil",
+                        "performance": "performance",
+                        "default": "schedutil"
+                    }
+                    target_governor = governor_map.get(epp, "schedutil")
+                    decky.logger.info(f"Guided mode: mapping EPP '{epp}' to governor '{target_governor}'")
+                    return await self.set_power_governor(target_governor)
+                else:
+                    decky.logger.warning(f"EPP not available (pstate mode: {pstate_mode}), skipping EPP setting")
+                    return True  # Don't fail the profile application
+            
             # First check if the requested EPP is available
             available_epp = await self.get_available_epp_options()
             if epp not in available_epp:
@@ -3078,6 +3136,24 @@ class Plugin:
                 _default_epp = "balance_performance" if getattr(self, "ac_power", True) else "balance_power"
                 epp = profile_data.get("epp", _default_epp)
                 
+                # In guided mode, map platform profile to appropriate governor
+                # amd_pmf handles hardware scheduling, so governor should complement
+                # the platform profile rather than conflict with it
+                pstate_mode = await self.get_pstate_mode()
+                if pstate_mode == "guided" and "platformProfile" in profile_data:
+                    # Map platform profile to governor for guided mode
+                    guided_governor_map = {
+                        "performance": "performance",      # Full performance for gaming
+                        "balanced": "schedutil",           # Balanced with dynamic scaling
+                        "low-power": "powersave",          # Maximum power savings
+                        "power-saver": "powersave",         # Frontend sends "power-saver"
+                    }
+                    platform_profile = profile_data.get("platformProfile", "balanced")
+                    mapped_governor = guided_governor_map.get(platform_profile)
+                    if mapped_governor and mapped_governor != governor:
+                        decky.logger.info(f"Guided mode: mapping platform profile '{platform_profile}' to governor '{mapped_governor}' (was '{governor}')")
+                        governor = mapped_governor
+                
                 # Set governor if present
                 if "governor" in profile_data or "powerGovernor" in profile_data:
                     total_operations += 1
@@ -3095,7 +3171,7 @@ class Plugin:
                     except Exception as e:
                         decky.logger.error(f"Error applying CPU governor: {e}")
                 
-                # Set EPP if present
+                # Set EPP if present (skipped in guided mode - set_epp handles the mapping)
                 if "epp" in profile_data:
                     total_operations += 1
                     try:

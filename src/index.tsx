@@ -1164,8 +1164,8 @@ const Content: React.FC = () => {
               gpuFreqMin: gpuMin, gpuFreqMax: gpuMax, gpuFreqFixed: gpuFixed,
               usbAutosuspend: false, pcieAspm: false // Default to disabled for stability
             } : {
-              tdp: dbDefaultTdp, cpuBoost: false, cpuCores: 4, governor: "powersave",
-              fanProfile: "quiet", smt: true, epp: "power", gpuMode: "battery",
+              tdp: dbDefaultTdp, cpuBoost: true, cpuCores: 8, governor: "schedutil",
+              fanProfile: "quiet", smt: true, epp: "balance_power", gpuMode: "battery",
               gpuFreqMin: gpuMin, gpuFreqMax: Math.floor(gpuMax * 0.8), gpuFreqFixed: Math.floor(gpuFixed * 0.8),
               usbAutosuspend: false, pcieAspm: false // Default to disabled for stability
             };
@@ -1373,7 +1373,7 @@ const Content: React.FC = () => {
                 ...currentProfile, tdp: defaultTdp, cpuBoost: true, governor: "performance",
                 usbAutosuspend: false, pcieAspm: false // Default to disabled for stability
               } : {
-                ...currentProfile, tdp: defaultTdp, cpuBoost: false, governor: "powersave",
+                ...currentProfile, tdp: defaultTdp, cpuBoost: true, governor: "schedutil",
                 usbAutosuspend: false, pcieAspm: false // Default to disabled for stability
               };
               
@@ -1898,7 +1898,7 @@ const Content: React.FC = () => {
               )}
               {pstateCapabilities?.current_mode === "guided" && (
                 <span style={{ fontSize: '0.7em', color: '#2196F3' }}>
-                  Hardware-guided scheduling with kernel hints
+                  All governors available; governor complements platform profile
                 </span>
               )}
             </div>
@@ -2052,8 +2052,8 @@ const Content: React.FC = () => {
             />
           </PanelSectionRow>
         )}
-        {/* CPU Governor - hide when using amd-pstate (guided) where governor is not meaningful */}
-        {deviceInfo?.scalingDriver !== "amd-pstate" && (
+        {/* CPU Governor - show in all modes except amd-pstate active (where only performance/powersave are available) */}
+        {deviceInfo?.scalingDriver !== "amd-pstate-epp" && (
           <PanelSectionRow>
             <SliderWithIcons
               label="CPU Governor"
@@ -2101,7 +2101,7 @@ const Content: React.FC = () => {
           </PanelSectionRow>
         )}
         {/* Governor description - show when governor is visible */}
-        {deviceInfo?.scalingDriver !== "amd-pstate" && (
+        {deviceInfo?.scalingDriver !== "amd-pstate-epp" && (
           <PanelSectionRow>
             <div style={{ display: 'flex', alignItems: 'center', fontSize: "14px", opacity: 0.7, marginTop: "-6px", marginBottom: "8px", gap: '8px' }}>
               <span style={{ color: '#00d4ff', fontSize: '1.2em', display: 'flex', alignItems: 'center' }}>
@@ -2124,8 +2124,8 @@ const Content: React.FC = () => {
           </PanelSectionRow>
         )}
         
-        {/* EPP Section - show when using amd-pstate (guided) where EPP controls scheduler behavior */}
-        {deviceInfo?.scalingDriver === "amd-pstate" && (
+        {/* EPP Section - only show in amd-pstate active mode where EPP is available */}
+        {deviceInfo?.scalingDriver === "amd-pstate-epp" && (
           <>
             <PanelSectionRow>
               <SliderWithIcons
