@@ -773,7 +773,7 @@ const Content: React.FC = () => {
       // Deep comparison of important settings that trigger hardware changes
       // BUT: Skip comparison if forceApply is true (AC/battery switch, game change, etc.)
       if (lastAppliedProfile && !forceApply) {
-        const importantSettings = ['tdp', 'cpuBoost', 'cpuCores', 'governor', 'smt', 'epp', 'gpuMode', 'gpuFreqMin', 'gpuFreqMax', 'gpuFreqFixed', 'usbAutosuspend', 'pcieAspm'];
+        const importantSettings = ['tdp', 'cpuBoost', 'cpuCores', 'governor', 'smt', 'epp', 'gpuMode', 'gpuFreqMin', 'gpuFreqMax', 'gpuFreqFixed', 'usbAutosuspend', 'pcieAspm', 'wifiPowerSave'];
         const hasChanges = importantSettings.some(key => 
           lastAppliedProfile[key as keyof PowerProfile] !== newProfile[key as keyof PowerProfile]
         );
@@ -805,7 +805,8 @@ const Content: React.FC = () => {
     return {
       ...profile,
       usbAutosuspend: profile.usbAutosuspend ?? false,
-      pcieAspm: profile.pcieAspm ?? false
+      pcieAspm: profile.pcieAspm ?? false,
+      wifiPowerSave: profile.wifiPowerSave ?? false
     };
   }, []);
 
@@ -861,6 +862,16 @@ const Content: React.FC = () => {
       }
     } else {
       debug.log('Applied PCIe ASPM from profile (disabled) - let OS manage');
+    }
+    
+    // Sync WiFi power save setting - apply both true and false values
+    const wifiSetting = profile.wifiPowerSave ?? false; // Default to false if undefined
+    setWifiPowerSaveEnabled(wifiSetting);
+    try {
+      await setWifiPowerSave(wifiSetting);
+      debug.log(`Applied WiFi power save from profile (${wifiSetting ? 'enabled' : 'disabled'})`);
+    } catch (error) {
+      debug.error('Failed to apply WiFi power save from profile:', error);
     }
   }, []);
 
@@ -1613,13 +1624,27 @@ const Content: React.FC = () => {
   // Advanced Power Management Handlers
   const handleWifiPowerSaveChange = useCallback(async (enabled: boolean) => {
     setWifiPowerSaveEnabled(enabled);
+    
+    // Update the current profile with the new WiFi power save setting
+    const updatedProfile = { ...currentProfile, wifiPowerSave: enabled };
+    setCurrentProfile(updatedProfile);
+    
+    // Save the updated profile immediately
+    try {
+      await setGameProfile(currentProfileId, updatedProfile);
+      debug.log(`WiFi power save ${enabled ? 'enabled' : 'disabled'} and saved to profile ${currentProfileId}`);
+    } catch (error) {
+      debug.error('Failed to save WiFi power save setting to profile:', error);
+    }
+    
+    // Apply to hardware
     try {
       await setWifiPowerSave(enabled);
       debug.log(`WiFi power save ${enabled ? 'enabled' : 'disabled'}`);
     } catch (error) {
       debug.error(`Failed to ${enabled ? 'enable' : 'disable'} WiFi power save:`, error);
     }
-  }, []);
+  }, [currentProfile, currentProfileId]);
 
   const handleUsbAutosuspendChange = useCallback(async (enabled: boolean) => {
     setUsbAutosuspendEnabled(enabled);

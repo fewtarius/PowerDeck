@@ -1111,14 +1111,41 @@ class Plugin:
     async def detect_wifi_interfaces(self) -> bool:
         """Detect if WiFi interfaces are available for power management"""
         try:
-            # Check for wireless interfaces
-            with open("/proc/net/wireless", "r") as f:
-                lines = f.readlines()
-                has_interface = len(lines) > 2  # Header lines + at least one interface
-                if has_interface:
+            # Check for wireless interfaces via /proc/net/wireless
+            try:
+                with open("/proc/net/wireless", "r") as f:
+                    lines = f.readlines()
+                    has_interface = len(lines) > 2  # Header lines + at least one interface
+                    if has_interface:
+                        self.device_info["supports_wifi_power_save"] = True
+                        decky.logger.info(f"WiFi power save supported (detected via /proc/net/wireless: {len(lines)} lines)")
+                        return True
+            except OSError:
+                pass
+            
+            # Fallback: check via iw command (WiFi may not be connected yet but interface exists)
+            try:
+                result = subprocess.run(["iw", "dev"], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0 and "Interface" in result.stdout:
                     self.device_info["supports_wifi_power_save"] = True
-                return has_interface
-        except OSError:
+                    decky.logger.info("WiFi power save supported (detected via iw dev)")
+                    return True
+            except Exception:
+                pass
+            
+            # Fallback: check for wireless interfaces in /sys/class/net
+            import glob
+            wireless_interfaces = glob.glob("/sys/class/net/*/wireless")
+            if wireless_interfaces:
+                self.device_info["supports_wifi_power_save"] = True
+                decky.logger.info(f"WiFi power save supported (detected via /sys/class/net: {wireless_interfaces})")
+                return True
+            
+            self.device_info["supports_wifi_power_save"] = False
+            decky.logger.warning("No WiFi interfaces detected for power management")
+            return False
+        except Exception as e:
+            decky.logger.error(f"Error detecting WiFi interfaces: {e}")
             self.device_info["supports_wifi_power_save"] = False
             return False
 
@@ -4169,9 +4196,9 @@ class Plugin:
             # Set power save mode - try both iw and iwconfig methods
             power_mode = "on" if enable else "off"
             
-            # Method 1: Try iw command (newer systems)
+            # Method 1: Try iw command (newer systems) - requires root
             try:
-                result = subprocess.run(["iw", interface, "set", "power_save", power_mode], 
+                result = subprocess.run(["sudo", "iw", interface, "set", "power_save", power_mode], 
                                       capture_output=True, text=True, timeout=5)
                 if result.returncode == 0:
                     decky.logger.info(f"Set WiFi power save to: {power_mode} using iw")
@@ -4181,10 +4208,10 @@ class Plugin:
             except Exception as e:
                 self.log_warning_once(f"iw power save command failed: {e}")
             
-            # Method 2: Try iwconfig command (older systems/fallback)
+            # Method 2: Try iwconfig command (older systems/fallback) - requires root
             try:
                 iwconfig_mode = "on" if enable else "off"
-                result = subprocess.run(["iwconfig", interface, "power", iwconfig_mode], 
+                result = subprocess.run(["sudo", "iwconfig", interface, "power", iwconfig_mode], 
                                       capture_output=True, text=True, timeout=5)
                 if result.returncode == 0:
                     decky.logger.info(f"Set WiFi power save to: {power_mode} using iwconfig")
