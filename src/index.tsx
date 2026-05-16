@@ -230,6 +230,8 @@ const setGpuFrequency = callable<[min: number, max: number], boolean>("set_gpu_f
 // Backend callable functions - Universal Power Management
 const getUsbAutosuspendStatus = callable<[], { [key: string]: boolean }>("get_usb_autosuspend_status");
 const setUsbAutosuspend = callable<[enabled: boolean], boolean>("set_usb_autosuspend");
+const getKeyboardSuspendStatus = callable<[], { supported: boolean; keyboards: any[]; suspend_enabled: boolean }>("get_keyboard_suspend_status");
+const setKeyboardSuspend = callable<[enabled: boolean], boolean>("set_keyboard_suspend");
 const getWifiPowerSave = callable<[], boolean>("get_wifi_power_save");
 const setWifiPowerSave = callable<[enabled: boolean], boolean>("set_wifi_power_save");
 const getPcieAspmPolicy = callable<[], string>("get_pcie_aspm_policy");
@@ -350,6 +352,7 @@ interface PowerProfile {
   wifiPowerSave?: boolean;
   pciePowerManagement?: boolean;
   usbAutosuspend?: boolean;
+  keyboardSuspend?: boolean;
   pcieAspm?: boolean;
   pciRuntimePm?: boolean;
   platformProfile?: string;
@@ -553,6 +556,7 @@ const Content: React.FC = () => {
     gpuFreqMax: 1100, // Safe default for Intel devices  
     gpuFreqFixed: 700,
     usbAutosuspend: false, // Default to disabled for stability
+    keyboardSuspend: false, // Default to disabled - only shown when supported
     pcieAspm: false, // Default to disabled for stability
     pciRuntimePm: false // Default to disabled for stability
   });
@@ -578,6 +582,8 @@ const Content: React.FC = () => {
   const [showAdvancedMenu, setShowAdvancedMenu] = useState<boolean>(false);
   const [wifiPowerSaveEnabled, setWifiPowerSaveEnabled] = useState<boolean>(true);
   const [usbAutosuspendEnabled, setUsbAutosuspendEnabled] = useState<boolean>(false);
+  const [keyboardSuspendEnabled, setKeyboardSuspendEnabled] = useState<boolean>(false);
+  const [keyboardSuspendSupported, setKeyboardSuspendSupported] = useState<boolean>(false);
   const [pcieAspmEnabled, setPcieAspmEnabled] = useState<boolean>(false);
   const [pciRuntimePmEnabled, setPciRuntimePmEnabled] = useState<boolean>(false);
 
@@ -778,7 +784,7 @@ const Content: React.FC = () => {
       // Deep comparison of important settings that trigger hardware changes
       // BUT: Skip comparison if forceApply is true (AC/battery switch, game change, etc.)
       if (lastAppliedProfile && !forceApply) {
-        const importantSettings = ['tdp', 'cpuBoost', 'cpuCores', 'governor', 'smt', 'epp', 'gpuMode', 'gpuFreqMin', 'gpuFreqMax', 'gpuFreqFixed', 'usbAutosuspend', 'pcieAspm', 'wifiPowerSave', 'pciRuntimePm'];
+        const importantSettings = ['tdp', 'cpuBoost', 'cpuCores', 'governor', 'smt', 'epp', 'gpuMode', 'gpuFreqMin', 'gpuFreqMax', 'gpuFreqFixed', 'usbAutosuspend', 'keyboardSuspend', 'pcieAspm', 'wifiPowerSave', 'pciRuntimePm'];
         const hasChanges = importantSettings.some(key => 
           lastAppliedProfile[key as keyof PowerProfile] !== newProfile[key as keyof PowerProfile]
         );
@@ -810,6 +816,7 @@ const Content: React.FC = () => {
     return {
       ...profile,
       usbAutosuspend: profile.usbAutosuspend ?? false,
+      keyboardSuspend: profile.keyboardSuspend ?? false,
       pcieAspm: profile.pcieAspm ?? false,
       wifiPowerSave: profile.wifiPowerSave ?? false,
       pciRuntimePm: profile.pciRuntimePm ?? false
@@ -870,6 +877,16 @@ const Content: React.FC = () => {
       debug.log(`Applied WiFi power save from profile (${wifiSetting ? 'enabled' : 'disabled'})`);
     } catch (error) {
       debug.error('Failed to apply WiFi power save from profile:', error);
+    }
+    
+    // Sync keyboard suspend setting - suspend built-in keyboard when idle
+    const kbdSetting = profile.keyboardSuspend ?? false;
+    setKeyboardSuspendEnabled(kbdSetting);
+    try {
+      await setKeyboardSuspend(kbdSetting);
+      debug.log(`Applied keyboard suspend from profile (${kbdSetting ? 'enabled' : 'disabled'})`);
+    } catch (error) {
+      debug.error('Failed to apply keyboard suspend from profile:', error);
     }
     
     // Sync PCI runtime PM setting
@@ -1104,6 +1121,18 @@ const Content: React.FC = () => {
             debug.log("USB autosuspend not available, defaulting to disabled");
           }
           
+          // Keyboard suspend: query current state from hardware
+          try {
+            const kbdStatus = await getKeyboardSuspendStatus();
+            setKeyboardSuspendSupported(kbdStatus.supported);
+            setKeyboardSuspendEnabled(kbdStatus.suspend_enabled);
+            debug.log(`Keyboard suspend initialized: supported=${kbdStatus.supported}, enabled=${kbdStatus.suspend_enabled}`);
+          } catch (error) {
+            setKeyboardSuspendSupported(false);
+            setKeyboardSuspendEnabled(false);
+            debug.log("Keyboard suspend not available, defaulting to disabled");
+          }
+          
           // PCIe ASPM: query current policy from hardware
           try {
             const aspmPolicy = await getPcieAspmPolicy();
@@ -1206,12 +1235,12 @@ const Content: React.FC = () => {
               tdp: dbDefaultTdp, cpuBoost: true, cpuCores: 8, governor: "performance",
               fanProfile: "moderate", smt: true, epp: "performance", gpuMode: "auto",
               gpuFreqMin: gpuMin, gpuFreqMax: gpuMax, gpuFreqFixed: gpuFixed,
-              usbAutosuspend: false, pcieAspm: false // Default to disabled for stability
+              usbAutosuspend: false, keyboardSuspend: false, pcieAspm: false
             } : {
               tdp: dbDefaultTdp, cpuBoost: true, cpuCores: 8, governor: "schedutil",
               fanProfile: "quiet", smt: true, epp: "balance_power", gpuMode: "battery",
               gpuFreqMin: gpuMin, gpuFreqMax: Math.floor(gpuMax * 0.8), gpuFreqFixed: Math.floor(gpuFixed * 0.8),
-              usbAutosuspend: false, pcieAspm: false // Default to disabled for stability
+              usbAutosuspend: false, keyboardSuspend: false, pcieAspm: false
             };
           }
           
@@ -1402,6 +1431,7 @@ const Content: React.FC = () => {
               
               // Save normalized profile if it was missing fields
               if (normalizedProfile.usbAutosuspend !== newProfile.usbAutosuspend || 
+                  normalizedProfile.keyboardSuspend !== newProfile.keyboardSuspend ||
                   normalizedProfile.pcieAspm !== newProfile.pcieAspm) {
                 try {
                   await setGameProfile(newProfileId, normalizedProfile);
@@ -1415,10 +1445,10 @@ const Content: React.FC = () => {
               // Create appropriate default based on power state
               const defaultProfile = newAcState ? {
                 ...currentProfile, tdp: defaultTdp, cpuBoost: true, governor: "performance",
-                usbAutosuspend: false, pcieAspm: false // Default to disabled for stability
+                usbAutosuspend: false, keyboardSuspend: false, pcieAspm: false
               } : {
                 ...currentProfile, tdp: defaultTdp, cpuBoost: true, governor: "schedutil",
-                usbAutosuspend: false, pcieAspm: false // Default to disabled for stability
+                usbAutosuspend: false, keyboardSuspend: false, pcieAspm: false
               };
               
               // Add metadata to default profile
@@ -1675,6 +1705,30 @@ const Content: React.FC = () => {
       debug.log(`USB autosuspend ${enabled ? 'enabled' : 'disabled'} on hardware`);
     } catch (error) {
       debug.error(`Failed to ${enabled ? 'enable' : 'disable'} USB autosuspend on hardware:`, error);
+    }
+  }, [currentProfile, currentProfileId]);
+
+  const handleKeyboardSuspendChange = useCallback(async (enabled: boolean) => {
+    setKeyboardSuspendEnabled(enabled);
+    
+    // Update the current profile with the new keyboard suspend setting
+    const updatedProfile = { ...currentProfile, keyboardSuspend: enabled };
+    setCurrentProfile(updatedProfile);
+    
+    // Save the updated profile immediately
+    try {
+      await setGameProfile(currentProfileId, updatedProfile);
+      debug.log(`Keyboard suspend ${enabled ? 'enabled' : 'disabled'} and saved to profile ${currentProfileId}`);
+    } catch (error) {
+      debug.error('Failed to save keyboard suspend setting to profile:', error);
+    }
+    
+    // Apply to hardware
+    try {
+      await setKeyboardSuspend(enabled);
+      debug.log(`Keyboard suspend ${enabled ? 'enabled' : 'disabled'} on hardware`);
+    } catch (error) {
+      debug.error(`Failed to ${enabled ? 'enable' : 'disable'} keyboard suspend on hardware:`, error);
     }
   }, [currentProfile, currentProfileId]);
 
@@ -2547,6 +2601,17 @@ const Content: React.FC = () => {
                   description="Enable USB device auto-suspend (may affect some devices)"
                   checked={usbAutosuspendEnabled}
                   onChange={handleUsbAutosuspendChange}
+                />
+              </PanelSectionRow>
+            )}
+            
+            {keyboardSuspendSupported && (
+              <PanelSectionRow>
+                <ToggleField
+                  label="Suspend Keyboard"
+                  description="Suspend keyboard after 30s idle (saves ~0.5W, auto-resumes on keypress)"
+                  checked={keyboardSuspendEnabled}
+                  onChange={handleKeyboardSuspendChange}
                 />
               </PanelSectionRow>
             )}
