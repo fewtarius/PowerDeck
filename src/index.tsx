@@ -1759,12 +1759,12 @@ const Content: React.FC = () => {
                 {(() => {
                   const profile = currentProfile.fanProfile || "auto";
                   const descriptions = {
-                    "auto": "System Managed",
-                    "quiet": "Quiet Operation", 
-                    "moderate": "Balanced Cooling",
-                    "aggressive": "Aggressive Cooling"
+                    "auto": "System managed",
+                    "quiet": "Quiet operation", 
+                    "moderate": "Balanced cooling",
+                    "aggressive": "Aggressive cooling"
                   };
-                  return descriptions[profile as keyof typeof descriptions] || "System Managed";
+                  return descriptions[profile as keyof typeof descriptions] || "System managed";
                 })()}
               </span>
             </div>
@@ -1830,77 +1830,69 @@ const Content: React.FC = () => {
       {pstateAvailable && (
         <PanelSection title="CPU Driver Mode">
           <PanelSectionRow>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '4px', width: '100%' }}>
-              <span style={{ fontSize: '0.75em', color: '#888888' }}>
-                amd-pstate mode: {pstateCapabilities?.current_mode || pstateMode}
+            <SliderWithIcons
+              label=""
+              value={(() => {
+                const modes = ["active", "passive", "guided"];
+                const current = pstateCapabilities?.current_mode || pstateMode;
+                return modes.indexOf(current) >= 0 ? modes.indexOf(current) : 2;
+              })()}
+              min={0}
+              max={2}
+              step={1}
+              icons={[<FaBolt />, <FaCogs />, <FaSlidersH />]}
+              onChange={async (value) => {
+                const modes = ["active", "passive", "guided"];
+                const selectedMode = modes[value] || "guided";
+                const previousMode = pstateMode;
+                setLocalPStateMode(selectedMode);
+                try {
+                  const success = await setPStateMode(selectedMode);
+                  if (success) {
+                    // Refresh capabilities after mode change
+                    const caps = await getPStateModeCapabilities();
+                    setLocalPStateCapabilities(caps);
+                    // Also refresh available governors since they change with pstate mode
+                    const governors = await getAvailableGovernors();
+                    setAvailableGovernors(governors);
+                    debug.log(`PState mode changed to: ${selectedMode}`);
+                  } else {
+                    // Backend rejected the change, rollback UI
+                    setLocalPStateMode(previousMode);
+                    debug.error(`Failed to set pstate mode to ${selectedMode}: backend returned false`);
+                  }
+                } catch (error) {
+                  // Rollback UI on error
+                  setLocalPStateMode(previousMode);
+                  debug.error("Failed to set pstate mode:", error);
+                }
+              }}
+            />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
+              <span style={{ color: '#00d4ff', fontSize: '1em' }}>
+                {(() => {
+                  const mode = pstateCapabilities?.current_mode || pstateMode;
+                  switch (mode) {
+                    case 'active': return <FaBolt />;
+                    case 'passive': return <FaCogs />;
+                    case 'guided': return <FaSlidersH />;
+                    default: return <FaSlidersH />;
+                  }
+                })()}
               </span>
-              <div style={{ display: 'flex', gap: '8px', justifyContent: 'space-between' }}>
-                {[
-                  { id: "active", label: "Active", icon: <FaBolt /> },
-                  { id: "passive", label: "Passive", icon: <FaCogs /> },
-                  { id: "guided", label: "Guided", icon: <FaSlidersH /> }
-                ].map((mode) => (
-                  <button
-                    key={mode.id}
-                    onClick={async () => {
-                      const previousMode = pstateMode;
-                      setLocalPStateMode(mode.id);
-                      try {
-                        const success = await setPStateMode(mode.id);
-                        if (success) {
-                          // Refresh capabilities after mode change
-                          const caps = await getPStateModeCapabilities();
-                          setLocalPStateCapabilities(caps);
-                          // Also refresh available governors since they change with pstate mode
-                          const governors = await getAvailableGovernors();
-                          setAvailableGovernors(governors);
-                          debug.log(`PState mode changed to: ${mode.id}`);
-                        } else {
-                          // Backend rejected the change, rollback UI
-                          setLocalPStateMode(previousMode);
-                          debug.error(`Failed to set pstate mode to ${mode.id}: backend returned false`);
-                        }
-                      } catch (error) {
-                        // Rollback UI on error
-                        setLocalPStateMode(previousMode);
-                        debug.error("Failed to set pstate mode:", error);
-                      }
-                    }}
-                    style={{
-                      flex: 1,
-                      padding: '8px 4px',
-                      background: pstateMode === mode.id ? '#4a9eff' : '#2a2a2a',
-                      border: 'none',
-                      borderRadius: '6px',
-                      color: pstateMode === mode.id ? '#fff' : '#888',
-                      cursor: 'pointer',
-                      fontSize: '0.75em',
-                      display: 'flex',
-                      flexDirection: 'column',
-                      alignItems: 'center',
-                      gap: '4px'
-                    }}
-                  >
-                    <span style={{ fontSize: '1.2em' }}>{mode.icon}</span>
-                    <span>{mode.label}</span>
-                  </button>
-                ))}
-              </div>
-              {pstateCapabilities?.current_mode === "active" && (
-                <span style={{ fontSize: '0.7em', color: '#4CAF50' }}>
-                  EPP control available in this mode
-                </span>
-              )}
-              {pstateCapabilities?.current_mode === "passive" && (
-                <span style={{ fontSize: '0.7em', color: '#FF9800' }}>
-                  All governors available in this mode
-                </span>
-              )}
-              {pstateCapabilities?.current_mode === "guided" && (
-                <span style={{ fontSize: '0.7em', color: '#2196F3' }}>
-                  All governors available; governor complements platform profile
-                </span>
-              )}
+              <span>
+                {(() => {
+                  const mode = pstateCapabilities?.current_mode || pstateMode;
+                  const descriptions: { [key: string]: string } = {
+                    "active": "EPP control - hardware follows energy preference",
+                    "passive": "Traditional scaling - all governors available",
+                    "guided": "Hardware-guided - governor complements platform profile"
+                  };
+                  return descriptions[mode] || mode;
+                })()}
+              </span>
             </div>
           </PanelSectionRow>
         </PanelSection>
@@ -1993,6 +1985,32 @@ const Content: React.FC = () => {
               }}
             />
           </PanelSectionRow>
+          <PanelSectionRow>
+            <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
+              <span style={{ color: '#00d4ff', fontSize: '1em' }}>
+                {(() => {
+                  const profile = currentProfile.platformProfile ?? rogAllyPlatformProfile;
+                  switch (profile) {
+                    case 'power-saver': return <FaBatteryFull />;
+                    case 'balanced': return <FaBalanceScale />;
+                    case 'performance': return <FaRocket />;
+                    default: return <FaBalanceScale />;
+                  }
+                })()}
+              </span>
+              <span>
+                {(() => {
+                  const profile = currentProfile.platformProfile ?? rogAllyPlatformProfile;
+                  const descriptions: { [key: string]: string } = {
+                    "power-saver": "Maximum battery life, reduced performance",
+                    "balanced": "Balanced performance and efficiency",
+                    "performance": "Maximum performance, higher power draw"
+                  };
+                  return descriptions[profile] || "Balanced performance and efficiency";
+                })()}
+              </span>
+            </div>
+          </PanelSectionRow>
         </PanelSection>
       )}
 
@@ -2018,6 +2036,34 @@ const Content: React.FC = () => {
                 }
               }}
             />
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
+              <span style={{ color: '#00d4ff', fontSize: '1em' }}>
+                {(() => {
+                  const policy = currentProfile.thermalPolicy ?? rogAllyThermalPolicy;
+                  switch (policy) {
+                    case 0: return <FaThermometerHalf />;
+                    case 1: return <FaBalanceScale />;
+                    case 2: return <FaFire />;
+                    case 3: return <FaRocket />;
+                    default: return <FaThermometerHalf />;
+                  }
+                })()}
+              </span>
+              <span>
+                {(() => {
+                  const policy = currentProfile.thermalPolicy ?? rogAllyThermalPolicy;
+                  const descriptions: { [key: number]: string } = {
+                    0: "Quiet - minimal fan noise",
+                    1: "Balanced - moderate cooling",
+                    2: "Aggressive - active cooling",
+                    3: "Performance - maximum cooling"
+                  };
+                  return descriptions[policy] || "Balanced - moderate cooling";
+                })()}
+              </span>
+            </div>
           </PanelSectionRow>
         </PanelSection>
       )}
@@ -2103,19 +2149,19 @@ const Content: React.FC = () => {
         {/* Governor description - show when governor is visible */}
         {deviceInfo?.scalingDriver !== "amd-pstate-epp" && (
           <PanelSectionRow>
-            <div style={{ display: 'flex', alignItems: 'center', fontSize: "14px", opacity: 0.7, marginTop: "-6px", marginBottom: "8px", gap: '8px' }}>
-              <span style={{ color: '#00d4ff', fontSize: '1.2em', display: 'flex', alignItems: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
+              <span style={{ color: '#00d4ff', fontSize: '1em' }}>
                 {getGovernorIcon(currentProfile.governor || "powersave")}
               </span>
               <span>
                 {(() => {
                   const gov = currentProfile.governor || "powersave";
                   const govMap: { [key: string]: string } = {
-                    "powersave": "Power Saving Mode",
-                    "conservative": "Conservative Mode", 
-                    "ondemand": "On Demand Mode",
-                    "schedutil": "Scheduler Utility",
-                    "performance": "Performance Mode"
+                    "powersave": "Maximum power savings",
+                    "conservative": "Conservative scaling",
+                    "ondemand": "On-demand frequency scaling",
+                    "schedutil": "Scheduler-driven scaling",
+                    "performance": "Maximum performance"
                   };
                   return govMap[gov] || gov;
                 })()}
@@ -2148,17 +2194,17 @@ const Content: React.FC = () => {
             </PanelSectionRow>
             <PanelSectionRow>
               <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
-                <span style={{ color: '#00d4ff', fontSize: '1.2em', display: 'flex', alignItems: 'center' }}>
+                <span style={{ color: '#00d4ff', fontSize: '1em' }}>
                   {getEppIcon(currentProfile.epp || "balance_performance")}
                 </span>
                 <span>
                   {(() => {
                     const epp = currentProfile.epp || "balance_performance";
                     const eppMap: { [key: string]: string } = {
-                      "power": "Maximum Power Savings",
-                      "balance_power": "Balanced Power Savings",
-                      "balance_performance": "Balanced Performance",
-                      "performance": "Maximum Performance"
+                      "power": "Maximum power savings",
+                      "balance_power": "Balanced power savings",
+                      "balance_performance": "Balanced performance",
+                      "performance": "Maximum performance"
                     };
                     return eppMap[epp] || epp;
                   })()}
@@ -2198,38 +2244,24 @@ const Content: React.FC = () => {
         </PanelSectionRow>
         
         <PanelSectionRow>
-          {currentProfile.gpuMode === "battery" && (
-            <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
-              <span style={{ color: '#00d4ff', fontSize: '1.2em', display: 'flex', alignItems: 'center' }}>
-                <FaBatteryHalf />
-              </span>
-              <span>Lowest power consumption, reduced performance</span>
-            </div>
-          )}
-          {currentProfile.gpuMode === "auto" && (
-            <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
-              <span style={{ color: '#00d4ff', fontSize: '1.2em', display: 'flex', alignItems: 'center' }}>
-                <FaSyncAlt />
-              </span>
-              <span>System automatically manages GPU frequency</span>
-            </div>
-          )}
-          {currentProfile.gpuMode === "range" && (
-            <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
-              <span style={{ color: '#00d4ff', fontSize: '1.2em', display: 'flex', alignItems: 'center' }}>
-                <FaSlidersH />
-              </span>
-              <span>Set minimum and maximum frequency range</span>
-            </div>
-          )}
-          {currentProfile.gpuMode === "fixed" && (
-            <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
-              <span style={{ color: '#00d4ff', fontSize: '1.2em', display: 'flex', alignItems: 'center' }}>
-                <FaBullseye />
-              </span>
-              <span>GPU runs at fixed frequency for consistent performance</span>
-            </div>
-          )}
+          {(() => {
+            const mode = currentProfile.gpuMode || "auto";
+            const descriptions: { [key: string]: { icon: React.ReactNode; text: string } } = {
+              "battery": { icon: <FaBatteryHalf />, text: "Lowest power consumption, reduced performance" },
+              "auto": { icon: <FaSyncAlt />, text: "System automatically manages GPU frequency" },
+              "range": { icon: <FaSlidersH />, text: "Set minimum and maximum frequency range" },
+              "fixed": { icon: <FaBullseye />, text: "GPU runs at fixed frequency for consistent performance" }
+            };
+            const desc = descriptions[mode] || descriptions["auto"];
+            return (
+              <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
+                <span style={{ color: '#00d4ff', fontSize: '1em' }}>
+                  {desc.icon}
+                </span>
+                <span>{desc.text}</span>
+              </div>
+            );
+          })()}
         </PanelSectionRow>
 
         {currentProfile.gpuMode === "range" && (
@@ -2299,6 +2331,18 @@ const Content: React.FC = () => {
               }}
             />
           </PanelSectionRow>
+          <PanelSectionRow>
+            <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
+              <span style={{ color: '#00d4ff', fontSize: '1em' }}>
+                {rogAllyBatteryChargeLimit <= 40 ? <FaBatteryEmpty /> : rogAllyBatteryChargeLimit <= 80 ? <FaBatteryHalf /> : <FaBatteryFull />}
+              </span>
+              <span>
+                {rogAllyBatteryChargeLimit <= 40 ? "Extended battery lifespan" : 
+                 rogAllyBatteryChargeLimit <= 80 ? "Balanced battery lifespan" : 
+                 "Full charge capacity"}
+              </span>
+            </div>
+          </PanelSectionRow>
         </PanelSection>
       )}
 
@@ -2348,13 +2392,13 @@ const Content: React.FC = () => {
           </PanelSectionRow>
           <PanelSectionRow>
             <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
-              <span style={{ color: '#1a9fff', fontSize: '1.2em' }}>
+              <span style={{ color: '#00d4ff', fontSize: '1em' }}>
                 {getControllerIcon(currentInputPlumberMode)}
               </span>
               <span>
                 {(() => {
                   const modeInfo = CONTROLLER_MODE_LABELS[currentInputPlumberMode];
-                  return modeInfo ? modeInfo.name : currentInputPlumberMode;
+                  return modeInfo ? modeInfo.description || modeInfo.name : currentInputPlumberMode;
                 })()}
               </span>
             </div>
