@@ -3352,7 +3352,12 @@ class Plugin:
             
             # Apply ROG Ally platform profile LAST
             # Setting platform profile AFTER thermal policy overrides any reverts caused by thermal policy
-            if "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally":
+            # IMPORTANT: Only set platform profile when native TDP is enabled.
+            # When native TDP is disabled, ryzenadj manages TDP directly and
+            # amd_pmf's platform profile would conflict with ryzenadj's power limits.
+            # amd_pmf enforces its own STAPM/PPT limits based on platform profile,
+            # which would override ryzenadj values within 1 second.
+            if "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally" and self.rog_ally_native_tdp_enabled:
                 total_operations += 1
                 try:
                     # Prefer SteamOS Manager for platform profile on supported systems
@@ -3367,12 +3372,14 @@ class Plugin:
                         decky.logger.warning(f"Failed to apply ROG Ally platform profile: {profile_data['platformProfile']}")
                 except Exception as e:
                     decky.logger.error(f"Error applying ROG Ally platform profile: {e}")
+            elif "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally" and not self.rog_ally_native_tdp_enabled:
+                decky.logger.info(f"Skipping platform profile '{profile_data['platformProfile']}' - native TDP disabled, ryzenadj manages power limits directly")
 
             # NOTE: No TDP re-apply needed after platform profile.
             # When ROG Ally native TDP is enabled, amd_pmf manages TDP limits
             # and will enforce them based on the platform profile we just set.
-            # When native TDP is disabled, ryzenadj manages TDP and platform
-            # profile changes don't conflict with ryzenadj writes.
+            # When native TDP is disabled, ryzenadj manages TDP directly and
+            # platform profile is skipped to avoid amd_pmf conflicts.
             # Using both ryzenadj and amd_pmf simultaneously causes register
             # fights (amd_pmf overrides ryzenadj within 1 second), so they
             # must be mutually exclusive.

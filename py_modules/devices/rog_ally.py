@@ -194,35 +194,38 @@ class ROGAllyController:
     def set_power_limits(self, fast_limit: int, sustained_limit: int, stapm_limit: int) -> bool:
         """Set ROG Ally power limits via preferred interface
         
-        Values are automatically clamped to the Armoury Crate firmware maximums
-        to avoid "Invalid argument" errors. The Z1 Extreme firmware caps STAPM at
-        25W, sustained at 30W, and fast at 30W (or 35W on some variants).
+        Values are automatically clamped to the Armoury Crate firmware min/max
+        ranges to avoid "Invalid argument" errors. The Z1 Extreme firmware has
+        minimum limits (e.g., sustained/fast min=15W) that must be respected.
         """
         success = True
         
-        # Clamp values to Armoury Crate firmware maximums to avoid write failures.
-        # The firmware rejects any value above its max with "Invalid argument".
-        # We read the max_value from each attribute and clamp accordingly.
+        # Clamp values to Armoury Crate firmware min/max ranges to avoid write failures.
+        # The firmware rejects any value above its max or below its min with "Invalid argument".
         if self.armoury_available:
             try:
                 stapm_max = int(self._read_sysfs_value(f"{ARMOURY_STAPM_LIMIT.replace('/current_value', '/max_value')}") or 25)
+                stapm_min = int(self._read_sysfs_value(f"{ARMOURY_STAPM_LIMIT.replace('/current_value', '/min_value')}") or 5)
                 sustained_max = int(self._read_sysfs_value(f"{ARMOURY_SUSTAINED_LIMIT.replace('/current_value', '/max_value')}") or 30)
-                fast_max = int(self._read_sysfs_value(f"{ARMOURY_FAST_LIMIT.replace('/current_value', '/max_value')}") or 30)
+                sustained_min = int(self._read_sysfs_value(f"{ARMOURY_SUSTAINED_LIMIT.replace('/current_value', '/min_value')}") or 15)
+                fast_max = int(self._read_sysfs_value(f"{ARMOURY_FAST_LIMIT.replace('/current_value', '/max_value')}") or 35)
+                fast_min = int(self._read_sysfs_value(f"{ARMOURY_FAST_LIMIT.replace('/current_value', '/min_value')}") or 15)
                 
                 original_stapm = stapm_limit
                 original_sustained = sustained_limit
                 original_fast = fast_limit
                 
-                stapm_limit = min(stapm_limit, stapm_max)
-                sustained_limit = min(sustained_limit, sustained_max)
-                fast_limit = min(fast_limit, fast_max)
+                # Clamp to firmware min/max ranges
+                stapm_limit = max(stapm_min, min(stapm_limit, stapm_max))
+                sustained_limit = max(sustained_min, min(sustained_limit, sustained_max))
+                fast_limit = max(fast_min, min(fast_limit, fast_max))
                 
                 if stapm_limit != original_stapm or sustained_limit != original_sustained or fast_limit != original_fast:
                     decky_plugin.logger.info(
-                        f"ROG Ally: Clamped power limits to firmware maximums - "
-                        f"STAPM: {original_stapm}W->{stapm_limit}W (max {stapm_max}W), "
-                        f"Sustained: {original_sustained}W->{sustained_limit}W (max {sustained_max}W), "
-                        f"Fast: {original_fast}W->{fast_limit}W (max {fast_max}W)"
+                        f"ROG Ally: Clamped power limits to firmware ranges - "
+                        f"STAPM: {original_stapm}W->{stapm_limit}W (range {stapm_min}-{stapm_max}W), "
+                        f"Sustained: {original_sustained}W->{sustained_limit}W (range {sustained_min}-{sustained_max}W), "
+                        f"Fast: {original_fast}W->{fast_limit}W (range {fast_min}-{fast_max}W)"
                     )
             except Exception as e:
                 decky_plugin.logger.warning(f"Failed to read Armoury Crate max values, using defaults: {e}")
