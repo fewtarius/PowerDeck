@@ -374,6 +374,9 @@ interface DeviceInfo {
   supports_wifi_power_save?: boolean;
   supports_usb_power_mgmt?: boolean;
   supports_pcie_aspm?: boolean;
+  steamosManagerAvailable?: boolean;
+  isJELOS?: boolean;
+  tdpControlMode?: string;
 }
 
 // Component for slider with React icon overlays
@@ -2300,27 +2303,37 @@ const Content: React.FC = () => {
             label="GPU Power Mode"
             value={(() => {
               const mode = currentProfile.gpuMode || "auto";
-              const modes = ["battery", "auto", "range", "fixed"];
+              // "performance" (DPM "high") is only safe on JELOS, which ships a
+              // custom kernel patch that fixes the AMD power_dpm_force_performance_level
+              // hang.  SteamFork/SteamOS still hang on DPM "high" with stock kernels.
+              const modes = deviceInfo?.isJELOS
+                ? ["battery", "auto", "performance", "range", "fixed"]
+                : ["battery", "auto", "range", "fixed"];
               return Math.max(0, modes.indexOf(mode));
             })()}
             min={0}
-            max={3}
+            max={deviceInfo?.isJELOS ? 4 : 3}
             step={1}
-            icons={[<FaBatteryHalf />, <FaSyncAlt />, <FaChartBar />, <FaBullseye />]}
+            icons={deviceInfo?.isJELOS
+              ? [<FaBatteryHalf />, <FaSyncAlt />, <FaRocket />, <FaChartBar />, <FaBullseye />]
+              : [<FaBatteryHalf />, <FaSyncAlt />, <FaChartBar />, <FaBullseye />]}
             onChange={(value) => {
-              const modes = ["battery", "auto", "range", "fixed"];
+              const modes = deviceInfo?.isJELOS
+                ? ["battery", "auto", "performance", "range", "fixed"]
+                : ["battery", "auto", "range", "fixed"];
               const selectedMode = modes[value] || "auto";
               handleGpuModeChange(selectedMode);
             }}
           />
         </PanelSectionRow>
-        
+
         <PanelSectionRow>
           {(() => {
             const mode = currentProfile.gpuMode || "auto";
             const descriptions: { [key: string]: { icon: React.ReactNode; text: string } } = {
               "battery": { icon: <FaBatteryHalf />, text: "Lowest power consumption, reduced performance" },
               "auto": { icon: <FaSyncAlt />, text: "System automatically manages GPU frequency" },
+              "performance": { icon: <FaRocket />, text: "Maximum GPU performance (AMD DPM high - JELOS only)" },
               "range": { icon: <FaSlidersH />, text: "Set minimum and maximum frequency range" },
               "fixed": { icon: <FaBullseye />, text: "GPU runs at fixed frequency for consistent performance" }
             };

@@ -185,7 +185,11 @@ class Plugin:
         
         # SteamOS Manager integration (SteamFork 3.8+ / SteamOS 3.5+)
         self.steamos_manager_available = False  # Will be detected during init
-        
+
+        # JELOS distribution detection (JELOS exposes the same SteamOS Manager DBus
+        # interface but with a custom kernel that supports power_dpm_force_performance_level=high)
+        self.is_jelos = False
+
         # Enhanced sleep/wake management
         self.sleep_wake_manager = None
         
@@ -261,6 +265,32 @@ class Plugin:
             return False
         except Exception as e:
             decky.logger.info(f"SteamOS Manager detection failed: {e}")
+            return False
+
+    def _detect_jelos(self) -> bool:
+        """Check if running on JELOS distribution.
+
+        JELOS rebrands SteamOS / SteamFork tooling (jelos-fancontrol, jelos-manager,
+        jelos-device-id, etc.) but exposes the same com.steampowered.SteamOSManager1
+        DBus interface. JELOS also includes a custom kernel patch that fixes the AMD
+        power_dpm_force_performance_level=high hang, allowing the "performance" GPU
+        mode to be exposed safely.
+        """
+        try:
+            if not os.path.exists("/etc/os-release"):
+                return False
+            with open("/etc/os-release", 'r') as f:
+                for line in f:
+                    # DISTRO_NAME is JELOS-specific (SteamFork/SteamOS don't set it).
+                    # HOME_URL is set to https://www.jelos.org on JELOS as a fallback.
+                    line = line.strip()
+                    if line.startswith("DISTRO_NAME=") and "JELOS" in line.upper():
+                        return True
+                    if line.startswith("HOME_URL=") and "jelos.org" in line.lower():
+                        return True
+            return False
+        except Exception as e:
+            decky.logger.info(f"JELOS detection failed: {e}")
             return False
 
     def _steamos_manager_call(self, method: str, *args) -> bool:
@@ -492,11 +522,14 @@ class Plugin:
         
     async def _main(self):
         decky.logger.info("PowerDeck initializing...")
-        
+
         # Detect SteamOS Manager availability (SteamFork 3.8+ / SteamOS 3.5+)
         self.steamos_manager_available = self._detect_steamos_manager()
         decky.logger.info(f"SteamOS Manager available: {self.steamos_manager_available}")
-        
+        # Detect JELOS distribution (custom kernel fixes AMD DPM "high" hang)
+        self.is_jelos = self._detect_jelos()
+        decky.logger.info(f"JELOS distribution detected: {self.is_jelos}")
+
         # Log device support status
         decky.logger.info(f"Device support available: {device_support_available}")
         
@@ -1620,8 +1653,10 @@ class Plugin:
             
             # Include SteamOS Manager availability for frontend
             self.device_info["steamosManagerAvailable"] = self.steamos_manager_available
+            # JELOS exposes additional GPU mode options (DPM "high" is safe on JELOS)
+            self.device_info["isJELOS"] = self.is_jelos
             self.device_info["tdpControlMode"] = await self.get_tdp_control_mode()
-            
+
             return self.device_info
         except Exception as e:
             decky.logger.error(f"Failed to get device info: {e}")
@@ -3310,10 +3345,14 @@ class Plugin:
                     # Prefer SteamOS Manager for GPU performance level on supported systems
                     if self.steamos_manager_available:
                         # Map PowerDeck GPU modes to steamos-manager performance levels
+                        # "performance" maps to "high" for SteamOS Manager (DPM "high").
+                        # Only safe on JELOS due to the AMD power_dpm_force_performance_level
+                        # kernel hang fixed by JELOS's custom kernel.
                         gpu_level_map = {
                             "auto": "auto",
                             "balanced": "auto",
                             "low": "low",
+                            "performance": "high",
                             "high": "high",
                             "manual": "high",
                             "range": "high"
@@ -3324,7 +3363,16 @@ class Plugin:
                             # Fall back to direct GPU mode setting
                             gpu_success = await self.set_gpu_mode(gpu_mode)
                     else:
-                        gpu_success = await self.set_gpu_mode(gpu_mode)
+                        # Refuse "performance" on non-JELOS systems - it would write DPM "high"
+                        # and trigger the AMD GPU hang on SteamFork/SteamOS stock kernels.
+                        if gpu_mode == "performance" and not self.is_jelos:
+                            decky.logger.warning(
+                                f"Refusing to apply GPU mode 'performance' (DPM 'high') on non-JELOS "
+                                f"system - AMD power_dpm_force_performance_level=high is known to hang."
+                            )
+                            gpu_success = False
+                        else:
+                            gpu_success = await self.set_gpu_mode(gpu_mode)
                     if gpu_success:
                         success_count += 1
                         decky.logger.info(f"Applied GPU mode: {gpu_mode}")
