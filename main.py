@@ -153,13 +153,17 @@ class Plugin:
         self.power_mode = "hybrid"  # Power management mode: sysfs, database, or hybrid
         self.original_hardware_defaults = None  # Store unmodified hardware state for default profile creation
         # Initialize with minimal defaults - real values will be set from processor database during initialization
+        # Defaults are biased toward power efficiency. governor=performance only
+        # exposes EPP=performance in the kernel, so pairing it with a low EPP
+        # silently pins the CPU to the top of the boost range. schedutil
+        # unlocks the full EPP set and is responsive enough for handheld use.
         self.current_profile = {
             "tdp": None,  # Will be set from processor database default_tdp during initialization
             "cpuBoost": True,  # Enabled by default to match typical system behavior
             "smt": True,
             "cpuCores": None,  # Will be detected from hardware during initialization
-            "governor": "performance",  # Performance governor for gaming (AC default)
-            "epp": "balance_performance"  # Balanced performance as safe default
+            "governor": "schedutil",  # Balanced default - see profile_manager presets
+            "epp": "balance_power"  # Power-biased default for handheld use
         }
         # TDP limits will be set from processor database or sysfs during initialization
         self.tdp_limits = {"min": 4, "max": None}  # Min is hard-coded 4W, max from database
@@ -2810,10 +2814,48 @@ class Plugin:
             available_epp = await self.get_available_epp_options()
             if epp not in available_epp:
                 decky.logger.warning(f"Requested EPP '{epp}' not available. Available options: {available_epp}")
-                # Try to find a close alternative
-                if epp in ["balance_power", "power"] and "performance" in available_epp:
-                    decky.logger.info(f"Using 'performance' as fallback for requested '{epp}' on amd-pstate-epp system")
-                    epp = "performance"
+                # The full EPP hint set (default/performance/balance_performance/
+                # balance_power/power) is only exposed by the kernel when the
+                # governor is powersave / schedutil / ondemand / conservative.
+                # When the kernel reports only ['performance'] in the available
+                # list while we asked for a low EPP, the current governor is
+                # performance and we need to switch it to powersave first
+                # before the EPP write will be accepted. We bypass the
+                # SteamOS Manager dbus call here because the upstream path
+                # (apply_profile -> set_governor_via_steamos_manager) does
+                # not exist on some SteamOS Holo builds.
+                if epp in ["balance_power", "power", "balance_performance", "default"] and "performance" in available_epp:
+                    current_governor = self.cpu_manager.get_current_governor() if hasattr(self, 'cpu_manager') else None
+                    if current_governor == "performance":
+                        decky.logger.info(
+                            f"EPP '{epp}' unavailable because governor=performance. "
+                            f"Switching governor to powersave via sysfs and retrying EPP write."
+                        )
+                        switch_ok = await self.set_power_governor("powersave")
+                        if switch_ok:
+                            available_epp = await self.get_available_epp_options()
+                            if epp in available_epp:
+                                # Fall through to the per-CPU write below with
+                                # the recovered EPP available.
+                                pass
+                            else:
+                                decky.logger.error(
+                                    f"EPP '{epp}' still unavailable after governor switch. "
+                                    f"Available: {available_epp}"
+                                )
+                                return False
+                        else:
+                            decky.logger.error(
+                                f"Failed to switch governor to powersave for EPP recovery; "
+                                f"not falling back to EPP=performance (would waste ~3W at idle)."
+                            )
+                            return False
+                    else:
+                        decky.logger.error(
+                            f"EPP '{epp}' unavailable with governor '{current_governor}'. "
+                            f"Available: {available_epp}"
+                        )
+                        return False
                 else:
                     decky.logger.error(f"No suitable EPP alternative found for '{epp}'")
                     return False
@@ -3143,9 +3185,20 @@ class Plugin:
                 if "cpuCores" not in profile_data or profile_data["cpuCores"] is None:
                     profile_data["cpuCores"] = self.device_info.get("max_cpu_cores", 8)
                 if "governor" not in profile_data or profile_data["governor"] is None:
-                    profile_data["governor"] = "performance" if is_ac_power else "schedutil"
+                    # schedutil is the balanced default: it unlocks the full
+                    # EPP set on amd-pstate-epp (governor=performance only
+                    # exposes EPP=performance) and is responsive enough for
+                    # handheld use. AC and battery defaults are kept similar
+                    # because the per-power-mode tdp/epp split is what
+                    # actually shifts behavior; the governor is a fallback.
+                    profile_data["governor"] = "schedutil"
                 if "epp" not in profile_data or profile_data["epp"] is None:
-                    profile_data["epp"] = "performance" if is_ac_power else "balance_performance"
+                    # Power-biased by default. balance_power on battery, a
+                    # notch warmer on AC. Previously this used
+                    # performance/balance_performance which silently pinned
+                    # EPP to performance on amd-pstate-epp (see v1.0.42
+                    # changelog - AYANEO Air Pro / Cezanne writeup).
+                    profile_data["epp"] = "balance_performance" if is_ac_power else "balance_power"
                 if "gpuMode" not in profile_data or profile_data["gpuMode"] is None:
                     profile_data["gpuMode"] = "auto"
                 # Save it so it exists next time
@@ -3289,7 +3342,18 @@ class Plugin:
                     if current_governor == "performance" and epp_governor != "performance":
                         decky.logger.info(f"Active mode: temporarily setting governor to powersave to allow EPP change")
                         if self.steamos_manager_available:
-                            await self.set_governor_via_steamos_manager("powersave")
+                            # Try SteamOS Manager first, but fall back to
+                            # direct sysfs if the dbus call fails (e.g.
+                            # SteamOS Holo builds where
+                            # SetCpuScalingGovernor is not registered on
+                            # com.steampowered.SteamOSManager1.RootManager).
+                            sm_ok = await self.set_governor_via_steamos_manager("powersave")
+                            if not sm_ok:
+                                decky.logger.warning(
+                                    "SteamOS Manager SetCpuScalingGovernor failed; "
+                                    "falling back to direct sysfs write"
+                                )
+                                await self.set_power_governor("powersave")
                         else:
                             await self.set_power_governor("powersave")
                 
@@ -3300,6 +3364,15 @@ class Plugin:
                         # Prefer SteamOS Manager for governor on supported systems
                         if self.steamos_manager_available:
                             governor_success = await self.set_governor_via_steamos_manager(governor)
+                            # Fall back to direct sysfs if dbus call fails
+                            # (e.g. SteamOS Holo builds where the
+                            # SetCpuScalingGovernor method is not registered).
+                            if not governor_success:
+                                decky.logger.warning(
+                                    "SteamOS Manager SetCpuScalingGovernor failed; "
+                                    "falling back to direct sysfs write"
+                                )
+                                governor_success = await self.set_power_governor(governor)
                         else:
                             governor_success = await self.set_power_governor(governor)
                         if governor_success:

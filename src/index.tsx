@@ -543,17 +543,23 @@ const Content: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
 
   // Unified Profile state - SINGLE PROFILE MANAGEMENT SYSTEM
+  // Defaults are biased toward power efficiency. governor=performance
+  // only exposes EPP=performance on amd-pstate-epp, so pairing it with
+  // a low EPP silently pins the CPU to the top of the boost range and
+  // wastes ~3W at idle (v1.0.42 changelog, AYANEO Air Pro / Cezanne
+  // writeup). schedutil unlocks the full EPP set and is responsive
+  // enough for handheld use.
   const [currentProfile, setCurrentProfile] = useState<PowerProfile>({
     tdp: 15,  // Will be updated to database default during initialization
     cpuBoost: true,
     cpuCores: 8,
-    governor: "performance",
+    governor: "schedutil",
     fanProfile: "moderate",
     smt: true,
-    epp: "performance",
+    epp: "balance_performance",
     gpuMode: "auto",
     gpuFreqMin: 300, // Safe default for Intel devices
-    gpuFreqMax: 1100, // Safe default for Intel devices  
+    gpuFreqMax: 1100, // Safe default for Intel devices
     gpuFreqFixed: 700,
     usbAutosuspend: false, // Default to disabled for stability
     pcieAspm: false, // Default to disabled for stability
@@ -1205,9 +1211,16 @@ const Content: React.FC = () => {
             const gpuMax = deviceData?.max_gpu_freq || 1600;
             const gpuFixed = Math.floor((gpuMin + gpuMax) / 2);
             
+            // schedutil+balance_performance on AC, schedutil+balance_power
+            // on battery. The previous AC default was performance+performance
+            // which silently pinned EPP to performance on amd-pstate-epp
+            // (governor=performance only exposes EPP=performance) and wasted
+            // ~3W at idle. Both states share the same governor so the only
+            // behavioural difference between AC and battery is the EPP hint
+            // and the GPU mode - per the v1.0.42 changelog writeup.
             profileToLoad = acStatus ? {
-              tdp: dbDefaultTdp, cpuBoost: true, cpuCores: 8, governor: "performance",
-              fanProfile: "moderate", smt: true, epp: "performance", gpuMode: "auto",
+              tdp: dbDefaultTdp, cpuBoost: true, cpuCores: 8, governor: "schedutil",
+              fanProfile: "moderate", smt: true, epp: "balance_performance", gpuMode: "auto",
               gpuFreqMin: gpuMin, gpuFreqMax: gpuMax, gpuFreqFixed: gpuFixed,
               usbAutosuspend: false, pcieAspm: false
             } : {
@@ -1415,9 +1428,12 @@ const Content: React.FC = () => {
               }
             } else {
               debug.log(`No profile found for ${newProfileId}, creating default`);
-              // Create appropriate default based on power state
+              // Create appropriate default based on power state.
+              // schedutil is the balanced default for both AC and battery
+              // (see v1.0.42 changelog writeup - governor=performance
+              // pins EPP to performance on amd-pstate-epp).
               const defaultProfile = newAcState ? {
-                ...currentProfile, tdp: defaultTdp, cpuBoost: true, governor: "performance",
+                ...currentProfile, tdp: defaultTdp, cpuBoost: true, governor: "schedutil",
                 usbAutosuspend: false, pcieAspm: false
               } : {
                 ...currentProfile, tdp: defaultTdp, cpuBoost: true, governor: "schedutil",
