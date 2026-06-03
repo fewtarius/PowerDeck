@@ -131,25 +131,52 @@ class ProfileManager:
             decky_plugin.logger.error(f"Failed to save profile data: {e}")
     
     def _ensure_default_profiles(self):
-        """Ensure default profiles exist"""
+        """Ensure default profiles exist.
+
+        Defaults are biased toward power efficiency. The full EPP hint
+        set (default, performance, balance_performance, balance_power,
+        power) is only exposed by the kernel when the governor is one
+        of powersave / schedutil / ondemand / conservative. With
+        governor=performance the kernel only accepts EPP=performance,
+        so any saved profile that pairs governor=performance with
+        EPP=power / balance_power silently pins the CPU to the top of
+        the boost range and wastes ~3W at idle (see v1.0.42 changelog
+        for the AYANEO Air Pro / Cezanne writeup).
+
+        The four presets cover the full spectrum:
+          - battery_saver : powersave + power (most efficient)
+          - balanced      : schedutil + balance_power (default for
+                            handheld use - responsive, low idle power)
+          - performance   : schedutil + balance_performance (the
+                            previous default used performance+balance_perf
+                            which always pinned EPP to performance on
+                            amd-pstate-epp active)
+          - gaming        : performance + performance (explicit max
+                            perf, opt in only)
+        """
         capabilities = get_device_capabilities()
-        
-        # Battery Saver profile - conservative but not crippled
-        # Users can further reduce settings if they want more battery life
+
+        # Battery Saver profile - conservative but not crippled.
+        # powersave governor + EPP=power is the most efficient choice
+        # for a handheld on battery; both are always available because
+        # powersave is the canonical pstate powersave governor.
         if 'battery_saver' not in self._profiles:
             self._profiles['battery_saver'] = PowerProfileData(
                 name="Battery Saver",
                 tdp=max(3, capabilities.min_tdp),
                 cpu=CPUProfile(
-                    governor="schedutil",
-                    epp="balance_power",
+                    governor="powersave",
+                    epp="power",
                     boost_enabled=True,
                     smt_enabled=True
                 ),
                 gpu=GPUProfile(mode="auto")
             )
         
-        # Balanced profile
+        # Balanced profile - default for handheld use.
+        # schedutil + balance_power gives responsive scaling with low
+        # idle power; on amd-pstate-epp the schedutil governor unlocks
+        # the full EPP set so balance_power actually applies.
         if 'balanced' not in self._profiles:
             balanced_tdp = min(15, capabilities.max_tdp)
             self._profiles['balanced'] = PowerProfileData(
@@ -163,23 +190,33 @@ class ProfileManager:
                 ),
                 gpu=GPUProfile(mode="balance")
             )
-        
-        # Performance profile
+
+        # Performance profile - tuned for sustained work on AC power.
+        # schedutil + balance_performance gives near-peak performance
+        # with the same idle power as balanced. The previous default of
+        # performance+balance_performance silently pinned EPP to
+        # performance on amd-pstate-epp (kernel only exposes the full
+        # EPP set under non-performance governors), wasting ~3W at idle.
         if 'performance' not in self._profiles:
             perf_tdp = min(25, capabilities.max_tdp)
             self._profiles['performance'] = PowerProfileData(
                 name="Performance",
                 tdp=perf_tdp,
                 cpu=CPUProfile(
-                    governor="performance",
+                    governor="schedutil",
                     epp="balance_performance",
                     boost_enabled=True,
                     smt_enabled=True
                 ),
                 gpu=GPUProfile(mode="range")
             )
-        
-        # Gaming profile
+
+        # Gaming profile - explicit no-compromise max performance.
+        # governor=performance + EPP=performance is intentional: it
+        # pins the CPU to the top of the boost range and disables
+        # scheduler-driven scaling. Only opt in when you actually need
+        # it; on amd-pstate-epp this combination idles ~3W higher than
+        # schedutil+balance_performance.
         if 'gaming' not in self._profiles:
             gaming_tdp = min(30, capabilities.max_tdp)
             self._profiles['gaming'] = PowerProfileData(
