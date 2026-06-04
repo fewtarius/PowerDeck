@@ -1977,9 +1977,9 @@ const Content: React.FC = () => {
                 {(() => {
                   const mode = pstateCapabilities?.current_mode || pstateMode;
                   const descriptions: { [key: string]: string } = {
-                    "active": "EPP control - hardware follows energy preference",
-                    "passive": "Traditional scaling - all governors available",
-                    "guided": "Hardware-guided - governor complements platform profile"
+                    "active": "CPU scales via EPP",
+                    "passive": "OS scales the CPU",
+                    "guided": "Hardware + OS scaling"
                   };
                   return descriptions[mode] || mode;
                 })()}
@@ -2093,9 +2093,9 @@ const Content: React.FC = () => {
                 {(() => {
                   const profile = currentProfile.platformProfile ?? rogAllyPlatformProfile;
                   const descriptions: { [key: string]: string } = {
-                    "power-saver": "Maximum battery life, reduced performance",
-                    "balanced": "Balanced performance and efficiency",
-                    "performance": "Maximum performance, higher power draw"
+                    "power-saver": "Maximum Power Saving",
+                    "balanced": "Balanced",
+                    "performance": "Max Performance"
                   };
                   return descriptions[profile] || "Balanced performance and efficiency";
                 })()}
@@ -2179,11 +2179,11 @@ const Content: React.FC = () => {
           onChange={() => {}} // Handle immediate visual updates
          onChangeEnd={handleCpuCoresChange} // Handle actual setting application
        />
-       {deviceInfo?.supports_smt && (
+        {deviceInfo?.supports_smt && (
           <PanelSectionRow>
             <ToggleField
               label="SMT (Hyperthreading)"
-              description="Enables/disables simultaneous multithreading for power efficiency."
+              description="Disable hyperthreading"
               checked={currentProfile.smt}
               onChange={handleSmtChange}
             />
@@ -2248,11 +2248,11 @@ const Content: React.FC = () => {
                 {(() => {
                   const gov = currentProfile.governor || "powersave";
                   const govMap: { [key: string]: string } = {
-                    "powersave": "Maximum power savings",
-                    "conservative": "Conservative scaling",
-                    "ondemand": "On-demand frequency scaling",
-                    "schedutil": "Scheduler-driven scaling",
-                    "performance": "Maximum performance"
+                    "powersave": "Maximum Power Saving",
+                    "conservative": "Power Saving",
+                    "ondemand": "Balanced",
+                    "schedutil": "Performance",
+                    "performance": "Max Performance"
                   };
                   return govMap[gov] || gov;
                 })()}
@@ -2292,10 +2292,10 @@ const Content: React.FC = () => {
                   {(() => {
                     const epp = currentProfile.epp || "balance_performance";
                     const eppMap: { [key: string]: string } = {
-                      "power": "Maximum power savings",
-                      "balance_power": "Balanced power savings",
-                      "balance_performance": "Balanced performance",
-                      "performance": "Maximum performance"
+                      "power": "Maximum Power Saving",
+                      "balance_power": "Balanced Power Saving",
+                      "balance_performance": "Balanced Performance",
+                      "performance": "Max Performance"
                     };
                     return eppMap[epp] || epp;
                   })()}
@@ -2347,11 +2347,11 @@ const Content: React.FC = () => {
           {(() => {
             const mode = currentProfile.gpuMode || "auto";
             const descriptions: { [key: string]: { icon: React.ReactNode; text: string } } = {
-              "battery": { icon: <FaBatteryHalf />, text: "Lowest power consumption, reduced performance" },
-              "auto": { icon: <FaSyncAlt />, text: "System automatically manages GPU frequency" },
-              "performance": { icon: <FaRocket />, text: "Maximum GPU performance (AMD DPM high - JELOS only)" },
-              "range": { icon: <FaSlidersH />, text: "Set minimum and maximum frequency range" },
-              "fixed": { icon: <FaBullseye />, text: "GPU runs at fixed frequency for consistent performance" }
+              "battery": { icon: <FaBatteryHalf />, text: "Maximum Power Saving" },
+              "auto": { icon: <FaSyncAlt />, text: "Balanced" },
+              "performance": { icon: <FaRocket />, text: "Max Performance" },
+              "range": { icon: <FaSlidersH />, text: "" },
+              "fixed": { icon: <FaBullseye />, text: "Fixed Frequency" }
             };
             const desc = descriptions[mode] || descriptions["auto"];
             return (
@@ -2543,7 +2543,7 @@ const Content: React.FC = () => {
               <PanelSectionRow>
                 <ToggleField
                   label="Enable MCU Power Save"
-                  description="Reduce power consumption when device is idle"
+                  description="Powers down the MCU when idle"
                   checked={rogAllyMcuPowersave}
                   onChange={async (value) => {
                     setRogAllyMcuPowersave(value);
@@ -2562,7 +2562,6 @@ const Content: React.FC = () => {
               <PanelSectionRow>
                 <ToggleField
                   label="WiFi Power Save"
-                  description="Enable WiFi power saving features (recommended)"
                   checked={wifiPowerSaveEnabled}
                   onChange={handleWifiPowerSaveChange}
                 />
@@ -2573,7 +2572,7 @@ const Content: React.FC = () => {
               <PanelSectionRow>
                 <ToggleField
                   label="USB Auto-suspend"
-                  description="Enable USB device auto-suspend (may affect some devices)"
+                  description="May disrupt some peripherals"
                   checked={usbAutosuspendEnabled}
                   onChange={handleUsbAutosuspendChange}
                 />
@@ -2584,7 +2583,6 @@ const Content: React.FC = () => {
               <PanelSectionRow>
                 <ToggleField
                   label="PCIe ASPM"
-                  description="Enable PCIe Active State Power Management"
                   checked={pcieAspmEnabled}
                   onChange={handlePcieAspmChange}
                 />
@@ -2594,7 +2592,6 @@ const Content: React.FC = () => {
             <PanelSectionRow>
               <ToggleField
                 label="PCI Runtime PM"
-                description="Allow unused PCI devices to enter low-power states"
                 checked={pciRuntimePmEnabled}
                 onChange={handlePciRuntimePmChange}
               />
