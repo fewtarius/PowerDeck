@@ -393,13 +393,13 @@ class Plugin:
                         str_args.append(str(arg))
                     elif isinstance(arg, str):
                         sig_parts.append("s")
-                        str_args.append(f'"{arg}"')
+                        str_args.append(arg)
                     elif isinstance(arg, bool):
                         sig_parts.append("b")
                         str_args.append("true" if arg else "false")
                     else:
                         sig_parts.append("s")
-                        str_args.append(f'"{arg}"')
+                        str_args.append(arg)
                 
                 cmd.append("".join(sig_parts))
                 cmd.extend(str_args)
@@ -410,11 +410,11 @@ class Plugin:
                 decky.logger.info(f"ExternalManager: {method}({', '.join(str(a) for a in args)}) succeeded")
                 # Parse busctl output - it returns the DBus return value
                 output = result.stdout.strip()
-                # busctl output format: "string \"token\"" or "boolean true" etc.
-                if output.startswith("string "):
-                    return output[8:].strip('"')
-                elif output.startswith("boolean "):
-                    return output[8:].strip() == "true"
+                # busctl output format: "s \"token\"" or "b true" etc.
+                if output.startswith("s "):
+                    return output[3:].strip().strip('"')
+                elif output.startswith("b "):
+                    return output[2:].strip() == "true"
                 elif output.startswith("uint32 "):
                     return int(output[7:].strip())
                 return output
