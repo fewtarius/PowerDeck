@@ -118,7 +118,7 @@ class PowerDeckErrorBoundary extends Component<{ children: ReactNode }, ErrorBou
 // Debug logging (set to false for production)
 const DEBUG_ENABLED = true;
 
-// Version management - Read from backend, no hardcoded versions
+// version: read from backend, no hardcoded fallback
 // // Version managed by backend - no hardcoding // REMOVED - Use backend version instead
 
 // Standardized debug logging
@@ -156,11 +156,10 @@ function getCurrentGameInfo() {
     debug.log("Available properties:", Object.keys(Router.MainRunningApp || {}));
   }
   
-  // For non-Steam games, try to create a more stable identifier
+  // non-Steam games: stable id from display name
   let gameId = appid;
   let gameName = display_name;
   
-  // Enhanced non-Steam game detection: Use display name to create stable ID
   if (display_name && display_name !== "Default" && display_name !== "Steam") {
     // For non-Steam games, create a stable ID based on the display name
     // Remove spaces, convert to lowercase, and create hash-like identifier
@@ -215,27 +214,29 @@ async function updateBackendGameDetection() {
 }
 
 // Backend callable functions - Core System
-const setTdp = callable<[tdp: number], boolean>("set_tdp");
-const setCpuCores = callable<[cores: number], boolean>("set_cpu_cores");
-const setGovernor = callable<[governor: string], boolean>("set_governor");
-const setFanProfile = callable<[profile: string], boolean>("set_fan_profile");
+
+// Power regression self-check: after every profile change, ask the backend
+// whether the active profile's EPP/governor is actually being honored by
+// the kernel. Returns ok=false with a reason string when something is
+// out of sync (e.g. EPP file missing in passive mode, governor write
+// silently rejected). Surfaced in the UI so a 14W-style regression
+// doesn't go unnoticed.
+// Single settings provider: the UI's only way to change a setting.
+// Backend merges the partial into the active profile, saves to disk,
+// and re-applies the full profile to hardware in one call. Replaces the
+// old pattern of calling an individual setter + applyProfile() per
+// control, which could leave dependent fields (governor<->EPP, SMT<->cores)
+// out of sync if a single setter failed.
+const updateAndApplySettings = callable<[partial: any], boolean>("update_and_apply_settings");
 const getAcPowerStatus = callable<[], boolean>("get_ac_power_status");
 
 // Backend callable functions - Advanced System Control
-const setSmt = callable<[enabled: boolean], boolean>("set_smt");
-const setEpp = callable<[epp: string], boolean>("set_epp");
-const setGpuMode = callable<[mode: string], boolean>("set_gpu_mode");
-const setGpuFrequency = callable<[min: number, max: number], boolean>("set_gpu_frequency");
 
 // Backend callable functions - Universal Power Management
 const getUsbAutosuspendStatus = callable<[], { [key: string]: boolean }>("get_usb_autosuspend_status");
-const setUsbAutosuspend = callable<[enabled: boolean], boolean>("set_usb_autosuspend");
 const getWifiPowerSave = callable<[], boolean>("get_wifi_power_save");
-const setWifiPowerSave = callable<[enabled: boolean], boolean>("set_wifi_power_save");
 const getPcieAspmPolicy = callable<[], string>("get_pcie_aspm_policy");
-const setPcieAspmPolicy = callable<[policy: string], boolean>("set_pcie_aspm_policy");
 const getPciRuntimePmStatus = callable<[], { [key: string]: boolean }>("get_pci_runtime_pm_status");
-const setPciRuntimePm = callable<[enabled: boolean], boolean>("set_pci_runtime_pm");
 
 
 // Backend callable functions - Core functions
@@ -433,7 +434,7 @@ const SliderWithIcons: React.FC<{
         zIndex: 10
       }}>
         {icons.map((icon, index) => {
-          // Map icon index to slider value: for step=1, value=index*step+min
+          // value this icon represents: min + index*step
           // For step>1 or non-zero min, compute the value this icon represents
           const iconValue = min + index * step;
           return (
@@ -532,25 +533,20 @@ const Content: React.FC = () => {
     };
   }, []);
 
-  // Plugin version state - Read from backend (no hardcoding)
+  // Plugin version (read from backend)
   const [pluginVersion, setPluginVersion] = useState<string>("Loading...");
   
-  // Core state
   const [acPower, setAcPower] = useState<boolean>(false);
   const [activeProfile, setActiveProfile] = useState<'ac' | 'battery'>('battery');
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Unified Profile state - SINGLE PROFILE MANAGEMENT SYSTEM
-  // Defaults are biased toward power efficiency. governor=performance
-  // only exposes EPP=performance on amd-pstate-epp, so pairing it with
-  // a low EPP silently pins the CPU to the top of the boost range and
-  // wastes ~3W at idle (v1.0.42 changelog, AYANEO Air Pro / Cezanne
-  // writeup). schedutil unlocks the full EPP set and is responsive
-  // enough for handheld use.
+  // schedutil unlocks the full amd-pstate-epp EPP set. governor=performance
+  // only exposes EPP=performance, which silently pins the CPU to the top of
+  // the boost range and wastes ~3W at idle on Cezanne/Renoir/Barcelo APUs.
   const [currentProfile, setCurrentProfile] = useState<PowerProfile>({
-    tdp: 15,  // Will be updated to database default during initialization
+    tdp: 15,  // overwritten with processor_db default during init
     cpuBoost: true,
     cpuCores: 8,
     governor: "schedutil",
@@ -558,17 +554,16 @@ const Content: React.FC = () => {
     smt: true,
     epp: "balance_performance",
     gpuMode: "auto",
-    gpuFreqMin: 300, // Safe default for Intel devices
-    gpuFreqMax: 1100, // Safe default for Intel devices
+    gpuFreqMin: 300, // Intel GPU floor
+    gpuFreqMax: 1100, // Intel GPU ceiling
     gpuFreqFixed: 700,
-    usbAutosuspend: false, // Default to disabled for stability
-    pcieAspm: false, // Default to disabled for stability
-    pciRuntimePm: false // Default to disabled for stability
+    usbAutosuspend: false, // user opts in
+    pcieAspm: false, // user opts in
+    pciRuntimePm: false // user opts in
   });
 
   const [currentProfileId, setCurrentProfileId] = useState<string>("00000000_ac");
 
-  // UI state
   const [showAdvancedTdp, setShowAdvancedTdp] = useState<boolean>(false);
   const [customTdpMin, setCustomTdpMin] = useState<number>(3);
   const [customTdpMax, setCustomTdpMax] = useState<number>(30);
@@ -576,14 +571,14 @@ const Content: React.FC = () => {
   // Additional Power Management States
   const [perGameProfilesEnabled, setPerGameProfilesEnabledState] = useState<boolean>(true);
 
-  // Game detection state 
+  // Game detection
   const [currentGame, setCurrentGame] = useState<{ id: string; name: string }>({ id: "handheld", name: "Handheld" });
   const [deviceClassification, setDeviceClassification] = useState<string>("Device");
 
-  // Quiet mode optimization - track last applied profile to avoid redundant system calls
+  // Last applied profile (skip reapply when unchanged)
   const [lastAppliedProfile, setLastAppliedProfile] = useState<PowerProfile | null>(null);
 
-  // Advanced Power Management State - WiFi enabled by default, others disabled
+  // Advanced power management
   const [showAdvancedMenu, setShowAdvancedMenu] = useState<boolean>(false);
   const [wifiPowerSaveEnabled, setWifiPowerSaveEnabled] = useState<boolean>(true);
   const [usbAutosuspendEnabled, setUsbAutosuspendEnabled] = useState<boolean>(false);
@@ -616,7 +611,7 @@ const Content: React.FC = () => {
   const [pstateCapabilities, setLocalPStateCapabilities] = useState<PStateModeCapabilities | null>(null);
   const [pstateAvailable, setLocalPStateAvailable] = useState<boolean>(false);
 
-  // InputPlumber Integration State
+  // InputPlumber
   const [inputPlumberAvailable, setInputPlumberAvailable] = useState<boolean>(false);
   const [inputPlumberModes, setInputPlumberModes] = useState<string[]>([]);
   const [currentInputPlumberMode, setCurrentInputPlumberMode] = useState<string>("default");
@@ -849,47 +844,13 @@ const Content: React.FC = () => {
     }
   }, [isRogAlly]);
 
-  // Helper function to sync USB and PCIe settings from profile to state variables and hardware
-  const syncUsbPcieSettings = useCallback(async (profile: PowerProfile) => {
-    // Sync USB autosuspend setting - handle both true and false values
-    const usbSetting = profile.usbAutosuspend ?? false; // Default to false if undefined
-    setUsbAutosuspendEnabled(usbSetting);
-    try {
-      await setUsbAutosuspend(usbSetting);
-      debug.log(`Applied USB autosuspend from profile (${usbSetting ? 'enabled' : 'disabled'})`);
-    } catch (error) {
-      debug.error('Failed to apply USB autosuspend from profile:', error);
-    }
-    
-    // Sync PCIe ASPM setting - handle both true and false values  
-    const pcieSetting = profile.pcieAspm ?? false; // Default to false if undefined
-    setPcieAspmEnabled(pcieSetting);
-    try {
-      await setPcieAspmPolicy(pcieSetting ? 'powersave' : 'default');
-      debug.log(`Applied PCIe ASPM from profile (${pcieSetting ? 'enabled (powersave)' : 'disabled (default)'})`);
-    } catch (error) {
-      debug.error('Failed to apply PCIe ASPM from profile:', error);
-    }
-    
-    // Sync WiFi power save setting - apply both true and false values
-    const wifiSetting = profile.wifiPowerSave ?? false; // Default to false if undefined
-    setWifiPowerSaveEnabled(wifiSetting);
-    try {
-      await setWifiPowerSave(wifiSetting);
-      debug.log(`Applied WiFi power save from profile (${wifiSetting ? 'enabled' : 'disabled'})`);
-    } catch (error) {
-      debug.error('Failed to apply WiFi power save from profile:', error);
-    }
-    
-    // Sync PCI runtime PM setting
-    const pciPmSetting = profile.pciRuntimePm ?? false; // Default to false if undefined
-    setPciRuntimePmEnabled(pciPmSetting);
-    try {
-      await setPciRuntimePm(pciPmSetting);
-      debug.log(`Applied PCI runtime PM from profile (${pciPmSetting ? 'enabled' : 'disabled'})`);
-    } catch (error) {
-      debug.error('Failed to apply PCI runtime PM from profile:', error);
-    }
+  // Update React state for the four toggles. Hardware state is pushed
+  // by the applyProfile that callers chain after this.
+  const syncUsbPcieSettings = useCallback((profile: PowerProfile) => {
+    setUsbAutosuspendEnabled(profile.usbAutosuspend ?? false);
+    setPcieAspmEnabled(profile.pcieAspm ?? false);
+    setWifiPowerSaveEnabled(profile.wifiPowerSave ?? false);
+    setPciRuntimePmEnabled(profile.pciRuntimePm ?? false);
   }, []);
 
   // Load device info and initial settings
@@ -1304,12 +1265,9 @@ const Content: React.FC = () => {
         if (perGameProfilesEnabled) {
           gameInfo = getCurrentGameInfo();
           
-          // IMPROVED GAME DETECTION LOGIC:
-          // Only consider it a "game change" if:
-          // 1. We detect a new specific game that's different from current
-          // 2. We consistently detect "default" for multiple checks (real game exit)
-          // Don't immediately switch to default on first "default" detection
-          
+          // Only treat as a real game change when a specific game id replaces
+          // the current one, or "default" persists for multiple checks.
+          // A single "default" reading is usually a Router hiccup, not an exit.
           if (gameInfo && gameInfo.id !== "default" && gameInfo.id !== "00000000") {
             // Real game detected - check if it's different from current
             if (gameInfo.id !== currentGame.id || gameInfo.name !== currentGame.name) {
@@ -1320,10 +1278,9 @@ const Content: React.FC = () => {
             // Frontend-backend coordination: Update backend with real game when detected
             await updateBackendGameDetection();
           } else {
-            // Router reports "default" - this could be:
-            // 1. Game actually exited (should switch to handheld profile)
-            // 2. Temporary Router inconsistency (should NOT switch profiles)
-            
+            // Router returns "default" either on a real game exit or a
+            // transient inconsistency. The first case is a profile switch,
+            // the second is not - the multi-sample check above handles it.
             // Only treat as "game exited" if current game was not already a base game
             const currentIsBaseGame = currentGame.id === "handheld" || currentGame.id === "laptop" || currentGame.id === "desktop";
             if (!currentIsBaseGame) {
@@ -1493,41 +1450,41 @@ const Content: React.FC = () => {
     };
   }, [perGameProfilesEnabled, currentGame.id, currentGame.name, currentProfile, acPower]);
 
-  // Helper function to apply hardware setting and update profile
-  const applySettingAndUpdateProfile = useCallback(async (
-    settingFunction: () => Promise<boolean>,
+  // Single point of change: backend re-runs the full set_* sequence so
+  // dependent fields (governor<->EPP, SMT<->cores) stay in sync.
+  const applySetting = useCallback(async (
     profileUpdate: Partial<PowerProfile>,
     settingName: string
   ) => {
     try {
-      const success = await settingFunction();
+      const newProfile = { ...currentProfile, ...profileUpdate };
+      setCurrentProfile(newProfile);
+      const success = await updateAndApplySettings(newProfile);
       if (success) {
-        updateCurrentProfile(profileUpdate);
+        setLastAppliedProfile(newProfile);
       } else {
         setError(`Failed to apply ${settingName}`);
       }
     } catch (err) {
       setError(`Error applying ${settingName}: ${err}`);
     }
-  }, [updateCurrentProfile]);
+  }, [currentProfile]);
 
   // Hardware control functions
   const handleTdpChange = useCallback(async (value: number) => {
-    await applySettingAndUpdateProfile(
-      () => setTdp(value),
+    await applySetting(
       { tdp: value },
       'TDP setting'
     );
-  }, [applySettingAndUpdateProfile]);
+  }, [applySetting]);
 
 
   const handleCpuCoresChange = useCallback(async (cores: number) => {
-    await applySettingAndUpdateProfile(
-      () => setCpuCores(cores),
+    await applySetting(
       { cpuCores: cores },
       'CPU cores setting'
     );
-  }, [applySettingAndUpdateProfile]);
+  }, [applySetting]);
 
   const handleSmtChange = useCallback(async (enabled: boolean) => {
     const maxCores = deviceInfo?.max_cpu_cores || 16;
@@ -1540,44 +1497,39 @@ const Content: React.FC = () => {
       adjustedCores = Math.floor(maxCores / 2);
     }
     
-    await applySettingAndUpdateProfile(
-      () => setSmt(enabled),
+    await applySetting(
       { smt: enabled, cpuCores: adjustedCores },
       'SMT (Simultaneous Multithreading) setting'
     );
-  }, [applySettingAndUpdateProfile, deviceInfo?.max_cpu_cores, currentProfile.cpuCores]);
+  }, [applySetting]);
 
   const handleGovernorChange = useCallback(async (value: string) => {
-    await applySettingAndUpdateProfile(
-      () => setGovernor(value),
+    await applySetting(
       { governor: value },
       'CPU governor'
     );
-  }, [applySettingAndUpdateProfile]);
+  }, [applySetting]);
 
   const handleFanProfileChange = useCallback(async (value: string) => {
-    await applySettingAndUpdateProfile(
-      () => setFanProfile(value),
+    await applySetting(
       { fanProfile: value },
       'fan profile'
     );
-  }, [applySettingAndUpdateProfile]);
+  }, [applySetting]);
 
   const handleEppChange = useCallback(async (value: string) => {
-    await applySettingAndUpdateProfile(
-      () => setEpp(value),
+    await applySetting(
       { epp: value },
       'EPP setting'
     );
-  }, [applySettingAndUpdateProfile]);
+  }, [applySetting]);
 
   const handleGpuModeChange = useCallback(async (value: string) => {
-    await applySettingAndUpdateProfile(
-      () => setGpuMode(value),
+    await applySetting(
       { gpuMode: value },
       'GPU mode'
     );
-  }, [applySettingAndUpdateProfile]);
+  }, [applySetting]);
 
   const handleGpuFrequencyChange = useCallback(async (min: number, max: number) => {
     // Guard against min=max for Intel GPUs (they don't support identical min/max)
@@ -1605,12 +1557,11 @@ const Content: React.FC = () => {
       }
     }
     
-    await applySettingAndUpdateProfile(
-      () => setGpuFrequency(adjustedMin, adjustedMax),
+    await applySetting(
       { gpuFreqMin: adjustedMin, gpuFreqMax: adjustedMax },
       'GPU frequency'
     );
-  }, [applySettingAndUpdateProfile, deviceInfo]);
+  }, [applySetting]);
 
   const handleGpuFixedFrequencyChange = useCallback(async (fixed: number) => {
     // For Intel GPUs, set min and max close to the fixed value but not identical
@@ -1641,109 +1592,32 @@ const Content: React.FC = () => {
       }
     }
     
-    await applySettingAndUpdateProfile(
-      () => setGpuFrequency(minFreq, maxFreq),
+    await applySetting(
       { gpuFreqFixed: clampedFixed },
       'GPU fixed frequency'
     );
-  }, [applySettingAndUpdateProfile, deviceInfo]);
+  }, [applySetting]);
 
   // Advanced Power Management Handlers
   const handleWifiPowerSaveChange = useCallback(async (enabled: boolean) => {
     setWifiPowerSaveEnabled(enabled);
-    
-    // Update the current profile with the new WiFi power save setting
-    const updatedProfile = { ...currentProfile, wifiPowerSave: enabled };
-    setCurrentProfile(updatedProfile);
-    
-    // Save the updated profile immediately
-    try {
-      await setGameProfile(currentProfileId, updatedProfile);
-      debug.log(`WiFi power save ${enabled ? 'enabled' : 'disabled'} and saved to profile ${currentProfileId}`);
-    } catch (error) {
-      debug.error('Failed to save WiFi power save setting to profile:', error);
-    }
-    
-    // Apply to hardware
-    try {
-      await setWifiPowerSave(enabled);
-      debug.log(`WiFi power save ${enabled ? 'enabled' : 'disabled'}`);
-    } catch (error) {
-      debug.error(`Failed to ${enabled ? 'enable' : 'disable'} WiFi power save:`, error);
-    }
-  }, [currentProfile, currentProfileId]);
+    await applySetting({ wifiPowerSave: enabled }, 'WiFi power save');
+  }, [applySetting]);
 
   const handleUsbAutosuspendChange = useCallback(async (enabled: boolean) => {
     setUsbAutosuspendEnabled(enabled);
-    
-    // Update the current profile with the new USB autosuspend setting
-    const updatedProfile = { ...currentProfile, usbAutosuspend: enabled };
-    setCurrentProfile(updatedProfile);
-    
-    // Save the updated profile immediately
-    try {
-      await setGameProfile(currentProfileId, updatedProfile);
-      debug.log(`USB autosuspend ${enabled ? 'enabled' : 'disabled'} and saved to profile ${currentProfileId}`);
-    } catch (error) {
-      debug.error('Failed to save USB autosuspend setting to profile:', error);
-    }
-    
-    // Apply to hardware regardless of enable/disable
-    try {
-      await setUsbAutosuspend(enabled);
-      debug.log(`USB autosuspend ${enabled ? 'enabled' : 'disabled'} on hardware`);
-    } catch (error) {
-      debug.error(`Failed to ${enabled ? 'enable' : 'disable'} USB autosuspend on hardware:`, error);
-    }
-  }, [currentProfile, currentProfileId]);
+    await applySetting({ usbAutosuspend: enabled }, 'USB autosuspend');
+  }, [applySetting]);
 
   const handlePcieAspmChange = useCallback(async (enabled: boolean) => {
     setPcieAspmEnabled(enabled);
-    
-    // Update the current profile with the new PCIe ASPM setting
-    const updatedProfile = { ...currentProfile, pcieAspm: enabled };
-    setCurrentProfile(updatedProfile);
-    
-    // Save the updated profile immediately
-    try {
-      await setGameProfile(currentProfileId, updatedProfile);
-      debug.log(`PCIe ASPM ${enabled ? 'enabled' : 'disabled'} and saved to profile ${currentProfileId}`);
-    } catch (error) {
-      debug.error('Failed to save PCIe ASPM setting to profile:', error);
-    }
-    
-    // Apply to hardware: powersave when enabled, default when disabled
-    try {
-      await setPcieAspmPolicy(enabled ? 'powersave' : 'default');
-      debug.log(`PCIe ASPM ${enabled ? 'enabled (powersave)' : 'disabled (default)'} on hardware`);
-    } catch (error) {
-      debug.error(`Failed to ${enabled ? 'enable' : 'disable'} PCIe ASPM on hardware:`, error);
-    }
-  }, [currentProfile, currentProfileId]);
+    await applySetting({ pcieAspm: enabled }, 'PCIe ASPM');
+  }, [applySetting]);
 
   const handlePciRuntimePmChange = useCallback(async (enabled: boolean) => {
     setPciRuntimePmEnabled(enabled);
-    
-    // Update the current profile with the new PCI runtime PM setting
-    const updatedProfile = { ...currentProfile, pciRuntimePm: enabled };
-    setCurrentProfile(updatedProfile);
-    
-    // Save the updated profile immediately
-    try {
-      await setGameProfile(currentProfileId, updatedProfile);
-      debug.log(`PCI runtime PM ${enabled ? 'enabled' : 'disabled'} and saved to profile ${currentProfileId}`);
-    } catch (error) {
-      debug.error('Failed to save PCI runtime PM setting to profile:', error);
-    }
-    
-    // Apply to hardware
-    try {
-      await setPciRuntimePm(enabled);
-      debug.log(`PCI runtime PM ${enabled ? 'enabled' : 'disabled'} on hardware`);
-    } catch (error) {
-      debug.error(`Failed to ${enabled ? 'enable' : 'disable'} PCI runtime PM on hardware:`, error);
-    }
-  }, [currentProfile, currentProfileId]);
+    await applySetting({ pciRuntimePm: enabled }, 'PCI runtime PM');
+  }, [applySetting]);
 
   if (loading) {
     return (

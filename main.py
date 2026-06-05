@@ -272,13 +272,9 @@ class Plugin:
             return False
 
     def _detect_jelos(self) -> bool:
-        """Check if running on JELOS distribution.
-
-        JELOS rebrands SteamOS / SteamFork tooling (jelos-fancontrol, jelos-manager,
-        jelos-device-id, etc.) but exposes the same com.steampowered.SteamOSManager1
-        DBus interface. JELOS also includes a custom kernel patch that fixes the AMD
-        power_dpm_force_performance_level=high hang, allowing the "performance" GPU
-        mode to be exposed safely.
+        """JELOS ships a custom kernel patch that fixes the AMD
+        power_dpm_force_performance_level=high hang, so "performance" GPU
+        mode is safe there.
         """
         try:
             if not os.path.exists("/etc/os-release"):
@@ -360,22 +356,8 @@ class Plugin:
             return False
 
     async def set_tdp_via_steamos_manager(self, tdp: int) -> bool:
-        """Set TDP via steamos-manager DBus interface.
-        
-        This is the preferred method on SteamFork 3.8+ because it:
-        - Uses the firmware-attributes (Armoury) interface for persistence
-        - Coordinates with amd_pmf to prevent register fights
-        - Sets the platform profile appropriately
-        
-        IMPORTANT: The "performance" profile must be active FIRST to enable
-        TDP limiting. If the current profile is "custom", steamos-manager's
-        SetPerformanceProfile will fail. We write directly to sysfs to ensure
-        the transition happens, then call steamos-manager to coordinate.
-        
-        Valid profile names: "low-power", "balanced", "performance"
-        
-        Returns True if the call succeeded.
-        """
+
+        """SteamOS Manager SetTdpLimit wrapper. Returns True on success."""
         try:
             ACPI_PLATFORM_PROFILE = '/sys/firmware/acpi/platform_profile'
             ACPI_PLATFORM_CHOICES = '/sys/firmware/acpi/platform_profile_choices'
@@ -454,16 +436,8 @@ class Plugin:
             return False
 
     async def set_performance_profile_via_steamos_manager(self, profile: str) -> bool:
-        """Set performance profile via steamos-manager DBus interface.
-        
-        Valid steamos-manager profiles: "low-power", "balanced", "performance"
-        "game" and "custom" are NOT valid and will fail.
-        Map common PowerDeck profile names to working ones.
-        
-        IMPORTANT: When transitioning from "custom" profile, we must write
-        directly to sysfs first because steamos-manager's SetPerformanceProfile
-        fails on "custom" state.
-        """
+
+        """steamos-manager profile: low-power | balanced | performance."""
         try:
             ACPI_PLATFORM_PROFILE = '/sys/firmware/acpi/platform_profile'
             ASUS_PLATFORM_PROFILE = '/sys/devices/platform/asus-nb-wmi/platform-profile/platform-profile-1/profile'
@@ -1812,17 +1786,8 @@ class Plugin:
             return None
 
     async def set_tdp(self, tdp: int, save_to_profile: bool = False) -> bool:
-        """Set TDP limit using the best available method.
-        
-        IMPORTANT: ryzenadj and amd_pmf are mutually exclusive.
-        - When ROG Ally native TDP is enabled: use ONLY Armoury sysfs (amd_pmf
-          manages power). ryzenadj fights with amd_pmf's 1-second register
-          refresh loop and gets overridden, causing constant power limit resets.
-        - When ROG Ally native TDP is disabled: use ONLY ryzenadj (no amd_pmf
-          interference). This gives direct SMU control without register fights.
-        - SteamOS Manager coordinates with amd_pmf natively, so it's always
-          preferred when available.
-        """
+
+        """ryzenadj and amd_pmf are mutually exclusive. Picks the best path per device."""
         try:
             # Validate TDP range
             min_tdp = self.tdp_limits["min"]
@@ -1951,17 +1916,8 @@ class Plugin:
             return False
 
     async def set_amd_tdp(self, tdp: int) -> bool:
-        """Set AMD TDP using ryzenadj with all limits pinned to user's TDP.
-        
-        When ryzenadj is the sole TDP controller (ROG Ally native TDP disabled),
-        all three AMD power limits are set to the same value to prevent burst
-        spikes above the user's setting:
-          STAPM limit  = tdp  (sustained/long-term)
-          Fast limit   = tdp  (short burst)
-          Slow limit   = tdp  (medium burst)
-        
-        This ensures the user's TDP slider is a hard cap, not a nominal target.
-        """
+
+        """Pins all ryzenadj limits to user TDP when it's the sole TDP controller."""
         try:
             if not self.ryzenadj_path:
                 decky.logger.error("ryzenadj not available")
@@ -2523,16 +2479,8 @@ class Plugin:
             return self.pstate_mode
     
     async def set_pstate_mode(self, mode: str) -> bool:
-        """Set amd-pstate operation mode (active, passive, guided)
-        
-        Requires root privileges. Changes take effect immediately.
-        
-        Args:
-            mode: One of "active", "passive", or "guided"
-            
-        Returns:
-            True if successful, False otherwise
-        """
+
+        """amd-pstate mode: active | passive | guided. Requires root."""
         if mode not in self.PSTATE_MODES:
             decky.logger.error(f"Invalid pstate mode: {mode}. Valid modes: {self.PSTATE_MODES}")
             return False
@@ -2587,13 +2535,9 @@ class Plugin:
             return False
     
     async def _ensure_valid_governor_for_mode(self, mode: str) -> bool:
-        """Ensure current governor is valid for the given pstate mode
-        
-        In active mode, only 'performance' and 'powersave' governors are valid.
-        In guided mode, ALL governors are available (conservative, ondemand, schedutil, etc.)
-        because the kernel exposes the full cpufreq governor list while amd_pmf handles
-        the hardware-guided scheduling. Only in active mode do we need to restrict governors.
-        """
+
+        """active mode restricts to performance | powersave.
+                guided and passive expose the full cpufreq governor list."""
         try:
             # In guided and passive modes, all governors are valid - no restriction needed
             if mode in ("guided", "passive"):
@@ -2681,15 +2625,9 @@ class Plugin:
             return {"error": str(e)}
 
     async def set_power_governor(self, governor: str) -> bool:
-        """Set CPU power governor with fallback for unavailable governors
-        
-        In amd-pstate active mode, only 'performance' and 'powersave' are available.
-        In guided mode, ALL governors are available (conservative, ondemand, schedutil, etc.)
-        because the kernel exposes the full cpufreq governor list while amd_pmf handles
-        hardware-guided scheduling.
-        In passive mode, all standard governors are available.
-        This method automatically maps unavailable governors to valid alternatives.
-        """
+
+        """amd-pstate active: performance | powersave only.
+                guided and passive: full cpufreq governor list. Maps unavailable governors."""
         try:
             # Check current pstate mode to understand governor constraints
             pstate_mode = await self.get_pstate_mode()
@@ -2775,17 +2713,8 @@ class Plugin:
             return False
 
     async def set_epp(self, epp: str) -> bool:
-        """Set Energy Performance Preference - with validation for available options
-        
-        In amd-pstate guided mode, EPP is NOT available (no energy_performance_preference sysfs).
-        In this mode, the governor choice controls power behavior instead:
-        - powersave governor = maximum power savings (equivalent to EPP=power)
-        - schedutil governor = balanced (equivalent to EPP=balance_power)
-        - performance governor = maximum performance (equivalent to EPP=performance)
-        
-        This method skips EPP entirely in guided mode and returns True to avoid
-        silent failures that mask the real issue from users.
-        """
+
+        """guided mode has no EPP sysfs; reject the write there."""
         try:
             # Check if EPP is available on this system
             epp_path = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
@@ -3141,13 +3070,8 @@ class Plugin:
             return False
 
     async def auto_switch_power_profile(self) -> bool:
-        """Automatically switch between AC and battery profiles based on power state.
-        
-        Uses the user's saved profiles as the source of truth. Never forces
-        conservative defaults - the user's settings always take priority.
-        Only creates a new profile from current hardware state if no saved
-        profile exists for the power mode.
-        """
+
+        """Switch active profile on AC/battery transitions using user's saved profiles."""
         try:
             decky.logger.info("=== AUTO POWER PROFILE SWITCHING ===")
             
@@ -3779,14 +3703,8 @@ class Plugin:
             return "balanced"
 
     async def get_available_governors(self) -> List[str]:
-        """Get list of available power governors based on current pstate mode
-        
-        Available governors depend on the CPU scaling driver:
-        - amd-pstate-epp (active mode): Only performance and powersave
-          (hardware manages frequencies via EPP, governor just sets policy)
-        - amd-pstate (passive/guided mode): All traditional governors available
-          (conservative, ondemand, schedutil, powersave, performance, userspace)
-        """
+
+        """Returns the subset of governors valid for the current pstate mode."""
         try:
             # Read available governors directly from sysfs - this is the
             # authoritative source and reflects the current pstate mode
@@ -3999,14 +3917,8 @@ class Plugin:
             return {}
 
     async def set_pci_runtime_pm(self, enable: bool) -> bool:
-        """Enable/disable PCI runtime PM for all devices that support it.
-        
-        When enabled, sets power/control=auto allowing unused PCI devices
-        to enter low-power states. When disabled, sets power/control=on
-        keeping devices always active.
-        
-        Excludes GPU and display controller to prevent display issues.
-        """
+
+        """Sets power/control=auto on all PCI devices that support runtime PM."""
         try:
             # Devices that should always stay active
             EXCLUDED_CLASSES = {
@@ -4519,13 +4431,8 @@ class Plugin:
         return self.rog_ally_native_tdp_enabled
 
     async def set_rog_ally_native_tdp_enabled(self, enabled: bool) -> bool:
-        """Set ROG Ally native TDP support setting.
-        
-        When toggling modes, re-applies the current TDP using the new method
-        to ensure the active TDP controller matches the selected mode.
-        - Enabling native TDP: applies TDP via Armoury sysfs (amd_pmf)
-        - Disabling native TDP: applies TDP via ryzenadj (direct SMU)
-        """
+
+        """Toggling modes re-applies the current TDP using the new controller."""
         try:
             # Only allow this setting on ROG Ally devices
             if not await self.is_rog_ally_device():
@@ -5618,19 +5525,8 @@ class Plugin:
         """Background task to periodically check for updates"""
 
     async def game_monitor(self):
-        """Backend game detection loop.
 
-        Polls for the currently running Steam game every 5 seconds and
-        auto-applies the matching power profile — without requiring the
-        PowerDeck quick-access menu to be open.
-
-        Also monitors AC power state changes and switches between _ac/_battery
-        profiles when the power source changes, even while the same game is running.
-
-        Detection method: look for the Steam Reaper process whose cmdline
-        contains 'SteamLaunch AppId=<id>' (same approach as SimpleDeckyTDP).
-        Returns '00000000' when no game is running (desktop/handheld mode).
-        """
+        """Poll Router for the running Steam game every 5s and apply its profile."""
         import re as _re
         import subprocess as _sp
         POLL_INTERVAL = 5  # seconds
@@ -5936,7 +5832,8 @@ class Plugin:
             return False
 
     async def set_governor(self, governor: str) -> bool:
-        """Set CPU governor - Plugin class method"""
+
+        """active mode restricts to performance | powersave; fall back to schedutil if needed."""
         try:
             return await self.set_power_governor(governor)
         except Exception as e:
@@ -6209,11 +6106,7 @@ class Plugin:
             decky.logger.error(f"Plugin.set_rog_ally_mcu_powersave failed: {e}")
             return False
 
-    # =========================================================================
-    # ROG Ally Setter Methods (Plugin class - callable by frontend)
-    # NOTE: Decky ONLY dispatches callable() calls to Plugin class methods.
-    # Global functions at the bottom of this file are dead code and never called.
-    # =========================================================================
+    # ROG Ally setters (callable from frontend)
 
     async def set_rog_ally_platform_profile(self, profile: str) -> bool:
         """Set ROG Ally platform profile - Plugin class method"""
@@ -6304,9 +6197,7 @@ class Plugin:
             decky.logger.error(f"Plugin.set_rog_ally_battery_charge_limit failed: {e}")
             return False
 
-    # =========================================================================
-    # InputPlumber Integration Methods
-    # =========================================================================
+    # InputPlumber integration
 
     async def get_inputplumber_status(self) -> Dict[str, Any]:
         """Get InputPlumber availability and capabilities - Plugin class method"""
@@ -7170,9 +7061,36 @@ async def apply_profile(profile_data: Dict[str, Any]) -> bool:
     """Apply a power profile to hardware - Global function called by frontend"""
     return await plugin.apply_profile(profile_data)
 
-async def get_pcie_aspm_policy() -> str:
-    """Get current PCIe ASPM power policy - Global function called by frontend"""
-    return await plugin.get_pcie_aspm_policy()
+async def update_and_apply_settings(partial: Dict[str, Any]) -> bool:
+
+    """Single UI control entry point. Merges partial into current_profile,
+    persists to disk, and re-applies the full profile so dependent
+    fields (governor<->EPP, SMT<->cores) stay in sync."""
+    try:
+        if not isinstance(partial, dict):
+            decky.logger.error(f"update_and_apply_settings: expected dict, got {type(partial).__name__}")
+            return False
+
+        merged = dict(plugin.current_profile or {})
+        for key, value in partial.items():
+            if value is None:
+                continue
+            merged[key] = value
+        plugin.current_profile = merged
+
+        profile_id = (plugin.current_profile or {}).get("profileId") or "00000000_ac"
+        try:
+            await plugin.set_game_profile(profile_id, dict(merged))
+        except Exception as save_err:
+            decky.logger.error(f"update_and_apply_settings: save to {profile_id} failed: {save_err}")
+
+        decky.logger.info(
+            f"update_and_apply_settings: reapplying full profile after partial={ {k: v for k, v in partial.items() if v is not None} }"
+        )
+        return await plugin.apply_profile(dict(merged))
+    except Exception as e:
+        decky.logger.error(f"update_and_apply_settings failed: {e}")
+        return False
 
 async def set_pcie_aspm_policy(policy: str) -> bool:
     """Set PCIe ASPM power policy - Global function called by frontend"""
