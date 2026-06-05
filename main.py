@@ -18,6 +18,12 @@ STEAMOS_MANAGER_DBUS_NAME = "com.steampowered.SteamOSManager1"
 STEAMOS_MANAGER_DBUS_PATH = "/com/steampowered/SteamOSManager1"
 STEAMOS_MANAGER_DBUS_IFACE = "com.steampowered.SteamOSManager1.RootManager"
 
+# ExternalManager1 interface for claiming power/fan subsystems
+# Available on JELOS (jelos-manager) and SteamFork 3.8+
+EXTERNAL_MANAGER_DBUS_IFACE = "com.steampowered.SteamOSManager1.ExternalManager1"
+EXTERNAL_MANAGER_SUBSYSTEM_POWER = "power"
+EXTERNAL_MANAGER_SUBSYSTEM_FAN = "fan"
+
 # Add py_modules directory to Python path for dynamic imports
 py_modules_path = os.path.join(os.path.dirname(__file__), 'py_modules')
 if py_modules_path not in sys.path:
@@ -355,6 +361,146 @@ class Plugin:
             decky.logger.warning(f"SteamOS Manager: {method} call exception: {e}")
             return False
 
+    def _external_manager_call(self, method: str, *args) -> Optional[Any]:
+        """Call a method on the ExternalManager1 DBus interface.
+        
+        Uses busctl for simplicity (no Python DBus binding dependency).
+        Returns the parsed result on success, None on failure.
+        """
+        if not self.steamos_manager_available:
+            return None
+        try:
+            # Build the busctl command
+            # Clear LD_LIBRARY_PATH to avoid Decky's bundled libs breaking busctl
+            clean_env = dict(os.environ)
+            clean_env.pop("LD_LIBRARY_PATH", None)
+            
+            cmd = [
+                "busctl", "call",
+                STEAMOS_MANAGER_DBUS_NAME,
+                STEAMOS_MANAGER_DBUS_PATH,
+                EXTERNAL_MANAGER_DBUS_IFACE,
+                method
+            ]
+            
+            # Add type signatures and arguments
+            if args:
+                sig_parts = []
+                str_args = []
+                for arg in args:
+                    if isinstance(arg, int):
+                        sig_parts.append("u")
+                        str_args.append(str(arg))
+                    elif isinstance(arg, str):
+                        sig_parts.append("s")
+                        str_args.append(f'"{arg}"')
+                    elif isinstance(arg, bool):
+                        sig_parts.append("b")
+                        str_args.append("true" if arg else "false")
+                    else:
+                        sig_parts.append("s")
+                        str_args.append(f'"{arg}"')
+                
+                cmd.append("".join(sig_parts))
+                cmd.extend(str_args)
+            
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
+                                   env=clean_env)
+            if result.returncode == 0:
+                decky.logger.info(f"ExternalManager: {method}({', '.join(str(a) for a in args)}) succeeded")
+                # Parse busctl output - it returns the DBus return value
+                output = result.stdout.strip()
+                # busctl output format: "string \"token\"" or "boolean true" etc.
+                if output.startswith("string "):
+                    return output[8:].strip('"')
+                elif output.startswith("boolean "):
+                    return output[8:].strip() == "true"
+                elif output.startswith("uint32 "):
+                    return int(output[7:].strip())
+                return output
+            else:
+                decky.logger.warning(
+                    f"ExternalManager: {method}({', '.join(str(a) for a in args)}) "
+                    f"failed: {result.stderr.strip()}"
+                )
+                return None
+        except subprocess.TimeoutExpired:
+            decky.logger.warning(f"ExternalManager: {method} call timed out")
+            return None
+        except Exception as e:
+            decky.logger.warning(f"ExternalManager: {method} call exception: {e}")
+            return None
+
+    async def _acquire_power_subsystem(self) -> bool:
+        """Acquire the power subsystem from jelos-manager.
+        
+        Returns True if acquisition succeeded, False otherwise.
+        """
+        if not self.steamos_manager_available:
+            return False
+        
+        token = self._external_manager_call(
+            "Acquire",
+            EXTERNAL_MANAGER_SUBSYSTEM_POWER,
+            "PowerDeck"
+        )
+        if token:
+            self._external_manager_token = token
+            decky.logger.info(f"PowerDeck acquired power subsystem (token: {token[:8]}...)")
+            return True
+        else:
+            decky.logger.warning("PowerDeck failed to acquire power subsystem (already claimed?)")
+            return False
+
+    async def _release_power_subsystem(self) -> bool:
+        """Release the power subsystem claim.
+        
+        Returns True if release succeeded, False otherwise.
+        """
+        if not self.steamos_manager_available or not hasattr(self, '_external_manager_token'):
+            return False
+        
+        token = self._external_manager_token
+        success = self._external_manager_call("Release", token)
+        if success:
+            decky.logger.info("PowerDeck released power subsystem")
+            delattr(self, '_external_manager_token')
+            return True
+        else:
+            decky.logger.warning("PowerDeck failed to release power subsystem")
+            return False
+
+    async def _heartbeat_power_subsystem(self) -> bool:
+        """Send a heartbeat to keep the power subsystem claim alive.
+        
+        Returns True if heartbeat succeeded, False otherwise.
+        """
+        if not self.steamos_manager_available or not hasattr(self, '_external_manager_token'):
+            return False
+        
+        token = self._external_manager_token
+        success = self._external_manager_call("Heartbeat", token)
+        if not success:
+            decky.logger.warning("PowerDeck heartbeat failed - claim may have expired")
+            # Clear the token so we don't keep trying
+            delattr(self, '_external_manager_token')
+        return success
+
+    async def _external_manager_heartbeat_loop(self):
+        """Background task to send periodic heartbeats for the power subsystem claim."""
+        while True:
+            try:
+                await asyncio.sleep(30)  # Heartbeat interval (matches jelos-manager's 30s)
+                if hasattr(self, '_external_manager_token'):
+                    await self._heartbeat_power_subsystem()
+                else:
+                    # No active claim, exit the loop
+                    break
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                decky.logger.error(f"ExternalManager heartbeat loop error: {e}")
+
     async def set_tdp_via_steamos_manager(self, tdp: int) -> bool:
 
         """SteamOS Manager SetTdpLimit wrapper. Returns True on success."""
@@ -508,6 +654,19 @@ class Plugin:
         self.is_jelos = self._detect_jelos()
         decky.logger.info(f"JELOS distribution detected: {self.is_jelos}")
 
+        # Acquire power subsystem from jelos-manager via ExternalManager1
+        # This tells jelos-manager to stop managing CPU/GPU so PowerDeck can take over
+        if self.steamos_manager_available:
+            acquired = await self._acquire_power_subsystem()
+            if acquired:
+                # Start heartbeat loop to keep the claim alive
+                self._external_manager_heartbeat_task = asyncio.create_task(
+                    self._external_manager_heartbeat_loop()
+                )
+                decky.logger.info("ExternalManager heartbeat task started")
+            else:
+                decky.logger.warning("Could not acquire power subsystem - jelos-manager will continue managing CPU/GPU")
+
         # Log device support status
         decky.logger.info(f"Device support available: {device_support_available}")
         
@@ -577,6 +736,20 @@ class Plugin:
         
     async def _unload(self):
         decky.logger.info("PowerDeck unloading...")
+        
+        # Release power subsystem claim from jelos-manager
+        if hasattr(self, '_external_manager_heartbeat_task'):
+            try:
+                self._external_manager_heartbeat_task.cancel()
+                decky.logger.info("ExternalManager heartbeat task cancelled")
+            except Exception as e:
+                decky.logger.error(f"Error cancelling ExternalManager heartbeat task: {e}")
+        
+        if hasattr(self, '_external_manager_token'):
+            try:
+                await self._release_power_subsystem()
+            except Exception as e:
+                decky.logger.error(f"Error releasing power subsystem: {e}")
         
         # Stop enhanced sleep/wake monitoring
         if self.sleep_wake_manager:
