@@ -3686,6 +3686,36 @@ class Plugin:
             decky.logger.error(f"Failed to apply profile: {e}")
             return False
 
+    async def update_and_apply_settings(self, partial: Dict[str, Any]) -> bool:
+        """Single UI control entry point. Merges partial into current_profile,
+        persists to disk, and re-applies the full profile so dependent
+        fields (governor<->EPP, SMT<->cores) stay in sync."""
+        try:
+            if not isinstance(partial, dict):
+                decky.logger.error(f"update_and_apply_settings: expected dict, got {type(partial).__name__}")
+                return False
+
+            merged = dict(self.current_profile or {})
+            for key, value in partial.items():
+                if value is None:
+                    continue
+                merged[key] = value
+            self.current_profile = merged
+
+            profile_id = (self.current_profile or {}).get("profileId") or "00000000_ac"
+            try:
+                await self.set_game_profile(profile_id, dict(merged))
+            except Exception as save_err:
+                decky.logger.error(f"update_and_apply_settings: save to {profile_id} failed: {save_err}")
+
+            decky.logger.info(
+                f"update_and_apply_settings: reapplying full profile after partial={ {k: v for k, v in partial.items() if v is not None} }"
+            )
+            return await self.apply_profile(dict(merged))
+        except Exception as e:
+            decky.logger.error(f"update_and_apply_settings failed: {e}")
+            return False
+
     async def get_cpu_limits(self) -> Dict[str, int]:
         """Get CPU frequency limits"""
         try:
@@ -7235,35 +7265,8 @@ async def apply_profile(profile_data: Dict[str, Any]) -> bool:
     return await plugin.apply_profile(profile_data)
 
 async def update_and_apply_settings(partial: Dict[str, Any]) -> bool:
-
-    """Single UI control entry point. Merges partial into current_profile,
-    persists to disk, and re-applies the full profile so dependent
-    fields (governor<->EPP, SMT<->cores) stay in sync."""
-    try:
-        if not isinstance(partial, dict):
-            decky.logger.error(f"update_and_apply_settings: expected dict, got {type(partial).__name__}")
-            return False
-
-        merged = dict(plugin.current_profile or {})
-        for key, value in partial.items():
-            if value is None:
-                continue
-            merged[key] = value
-        plugin.current_profile = merged
-
-        profile_id = (plugin.current_profile or {}).get("profileId") or "00000000_ac"
-        try:
-            await plugin.set_game_profile(profile_id, dict(merged))
-        except Exception as save_err:
-            decky.logger.error(f"update_and_apply_settings: save to {profile_id} failed: {save_err}")
-
-        decky.logger.info(
-            f"update_and_apply_settings: reapplying full profile after partial={ {k: v for k, v in partial.items() if v is not None} }"
-        )
-        return await plugin.apply_profile(dict(merged))
-    except Exception as e:
-        decky.logger.error(f"update_and_apply_settings failed: {e}")
-        return False
+    """Module-level wrapper for frontend callable - delegates to Plugin instance method"""
+    return await plugin.update_and_apply_settings(partial)
 
 async def set_pcie_aspm_policy(policy: str) -> bool:
     """Set PCIe ASPM power policy - Global function called by frontend"""
