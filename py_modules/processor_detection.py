@@ -82,6 +82,8 @@ def detect_processor() -> Dict[str, any]:
             'tdp_max': processor_info['tdp_max'],
             'l3_cache_mb': processor_info['l3_cache_mb'],
             'gpu_model': processor_info['gpu_model'],
+            'gpu_cu_count': processor_info.get('gpu_cu_count', 0),
+            'form_factor': processor_info.get('form_factor', 'Unknown'),
             'node_process': processor_info['node_process'],
             'launch_year': processor_info['launch_year'],
             'detected_model': processor_info.get('detected_model', model_name),
@@ -155,9 +157,11 @@ def get_current_processor_info() -> Dict[str, any]:
     processor = detect_processor()
     return {
         "detected": processor['database_source'] != 'fallback',
+        "processor_name": processor['model'],
         "model": processor['model'],
         "vendor": processor['vendor'],
         "family": processor['family'],
+        "series": processor['series'],
         "cores": processor['cores'],
         "threads": processor['threads'],
         "default_tdp": processor['default_tdp'],
@@ -166,6 +170,10 @@ def get_current_processor_info() -> Dict[str, any]:
         "base_freq_ghz": processor['base_freq_ghz'],
         "max_freq_ghz": processor['max_freq_ghz'],
         "gpu_model": processor['gpu_model'],
+        "gpu_cu_count": processor['gpu_cu_count'],
+        "form_factor": processor['form_factor'],
+        "node_process": processor['node_process'],
+        "launch_year": processor['launch_year'],
         "database_source": processor['database_source']
     }
 
