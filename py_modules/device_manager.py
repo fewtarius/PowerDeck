@@ -122,29 +122,6 @@ class DeviceDetector:
             gpu_frequency_range=(400, 2700)   # Pre-2025 models (6900HX/7745HX)
         )
 
-        # ASUS ROG Flow Z13 (2025) — GZ302, AMD Ryzen AI Max+ 395 (Strix Halo, 40 CU)
-        # DMI product_name: "GZ302*", sys_vendor: "ASUSTeK COMPUTER INC."
-        # cTDP: 45W–120W; sweet spot 55–70W confirmed on hardware
-        profiles['flow_z13_2025'] = DeviceProfile(
-            name="ASUS ROG Flow Z13 (2025)",
-            cpu_vendor=CPUVendor.AMD,
-            tdp_method=TDPMethod.RYZENADJ,
-            min_tdp=15,
-            max_tdp=120,
-            scaling_driver=ScalingDriver.AMD_PSTATE_EPP,
-            supports_gpu_control=True,
-            supports_epp=True,
-            gpu_frequency_range=(400, 2900),   # Radeon 8060S: up to 2.9 GHz SCLK
-            device_specific_features={
-                'handheld_device': False,
-                'ac_power_detection': True,
-                'thermal_protection': True,
-                'fclk_control': True,
-                'nvme_power_control': True,
-                'platform_profile': True,
-            }
-        )
-
         # AYANEO FLIP KB / FLIP DS / FLIP 1S — Ryzen 7 7840U / Radeon 780M 12 CU
         # DMI sys_vendor: "AYANEO", product_name: "FLIP KB", "FLIP-KB", "FLIP DS", "FLIP 1S"
         # Confirmed SMU ceiling: STAPM 30W, fast-limit 45W, slow-limit 43W
@@ -227,7 +204,95 @@ class DeviceDetector:
             supports_epp=True,
             gpu_frequency_range=(400, 2700)
         )
-        
+
+        # ── Strix Halo (Ryzen AI MAX 300 series) desktop / mini-PC profiles ──
+        # Strix Halo is the high-power desktop-class APU with 12-16 Zen 5
+        # cores and Radeon 8060S/8050S (40/32 CUs). cTDP per AMD spec is
+        # 45-120W but motherboard configs range from ~55W (Strix Point
+        # laptop boards) to 130+W (Beelink GTR9 / Framework Desktop).
+        # The Radeon 8060S peaks ~2.9 GHz SCLK, the 8050S ~2.8 GHz.
+        # All Strix Halo SKUs share one operational caveat: no APU skin
+        # temperature sensor (tctl only), and TDC/EDC values come back
+        # as NaN from ryzenadj. main.py handles both automatically.
+
+        # Nimo Direct N161L - Strix Halo mini-PC
+        # DMI product_name: "N161L", sys_vendor: "Nimo Direct INC."
+        # Confirmed: 16C/32T Ryzen AI MAX+ 395, default STAPM/PPT 105W,
+        # SMU BIOS interface v25.
+        profiles['nimo_n161l'] = DeviceProfile(
+            name="Nimo Direct N161L (Strix Halo)",
+            cpu_vendor=CPUVendor.AMD,
+            tdp_method=TDPMethod.RYZENADJ,
+            min_tdp=45,
+            max_tdp=120,
+            scaling_driver=ScalingDriver.AMD_PSTATE_EPP,
+            supports_gpu_control=True,
+            supports_epp=True,
+            gpu_frequency_range=(400, 2900),
+            device_specific_features={
+                'handheld_device': False,
+                'desktop_apu': True,
+                'strix_halo': True,
+                'tctl_only_thermal': True,   # no apu-skin-temp sensor
+                'fclk_control': True,
+                'nvme_power_control': True,
+                'platform_profile': True,
+            }
+        )
+
+        # ASUS ROG Flow Z13 (2025) - GZ302, AMD Ryzen AI Max+ 395 (Strix Halo, 40 CU)
+        # DMI product_name: "GZ302*", sys_vendor: "ASUSTeK COMPUTER INC."
+        # cTDP: 45W-120W; sweet spot 55-70W confirmed on hardware.
+        # Note: Z13 is technically a tablet/2-in-1 rather than a handheld,
+        # so it does not get the handheld_device flag (no AC/battery split).
+        profiles['flow_z13_2025'] = DeviceProfile(
+            name="ASUS ROG Flow Z13 (2025)",
+            cpu_vendor=CPUVendor.AMD,
+            tdp_method=TDPMethod.RYZENADJ,
+            min_tdp=15,
+            max_tdp=120,
+            scaling_driver=ScalingDriver.AMD_PSTATE_EPP,
+            supports_gpu_control=True,
+            supports_epp=True,
+            gpu_frequency_range=(400, 2900),
+            device_specific_features={
+                'handheld_device': False,
+                'desktop_apu': False,
+                'strix_halo': True,
+                'tctl_only_thermal': True,
+                'fclk_control': True,
+                'nvme_power_control': True,
+                'platform_profile': True,
+            }
+        )
+
+        # Generic Strix Halo desktop / mini-PC fallback
+        # Covers Framework Desktop, Beelink SER9 / GTR9, Minisforum AI X1
+        # / MS-A2, HP Z2 Mini G1a, and any other board we don't have
+        # explicit DMI for yet. New boards: send product_name + ryzenadj
+        # -i output and we'll add explicit profiles.
+        profiles['strix_halo_desktop'] = DeviceProfile(
+            name="AMD Strix Halo Desktop",
+            cpu_vendor=CPUVendor.AMD,
+            tdp_method=TDPMethod.RYZENADJ,
+            min_tdp=45,    # AMD cTDP min for the family
+            max_tdp=130,   # some boards (Beelink GTR9 PRO, Framework Desktop OC)
+                           # allow cTDP up to 130W; raise ceiling so users on
+                           # those boards aren't artificially capped.
+            scaling_driver=ScalingDriver.AMD_PSTATE_EPP,
+            supports_gpu_control=True,
+            supports_epp=True,
+            gpu_frequency_range=(400, 2900),
+            device_specific_features={
+                'handheld_device': False,
+                'desktop_apu': True,
+                'strix_halo': True,
+                'tctl_only_thermal': True,
+                'fclk_control': True,
+                'platform_profile': True,
+            }
+        )
+
         return profiles
     
     def _detect_cpu_vendor(self) -> CPUVendor:
@@ -336,7 +401,27 @@ class DeviceDetector:
                     return 'ayaneo_flip_kb'
                 # Other AYANEO models — conservative fallback
                 return 'ayaneo_generic'
-            
+
+            # Nimo Direct N161L — Strix Halo mini-PC
+            # DMI product_name: "N161L", sys_vendor: "Nimo Direct INC."
+            if 'nimo' in sys_vendor and 'n161' in product_name:
+                return 'nimo_n161l'
+
+            # Generic Strix Halo desktop / mini-PC patterns by DMI board_name.
+            # Framework Desktop uses "FRANDMD-*", Beelink SER9/GTR9 use product
+            # names like "SER9"/"GTR9"+"PRO", Minisforum AI X1 is "MS-A2",
+            # HP Z2 Mini G1a uses "Z2 Mini G1a" family. We don't enumerate
+            # every variant here; the characteristics-based fallback picks up
+            # Strix Halo systems we haven't DMI-matched yet.
+            strix_halo_indicators = [
+                'frandmd',           # Framework Desktop
+                'beelink ser9', 'beelink gtr9', 'beelink ai',
+                'minisforum ai x1', 'minisforum ms-a2', 'minisforum um890',
+                'z2 mini g1a',
+            ]
+            if any(ind in (product_name + ' ' + board_name) for ind in strix_halo_indicators):
+                return 'strix_halo_desktop'
+
             return None
             
         except Exception as e:
@@ -345,6 +430,16 @@ class DeviceDetector:
     
     def _detect_device_from_characteristics(self) -> str:
         """Fallback device detection based on CPU characteristics"""
+        # Strix Halo has its own operational profile (tctl-only thermal,
+        # 12-16 cores, no apu-skin-temp, high-power desktop APU) so detect
+        # it explicitly even when DMI didn't match a known board.
+        try:
+            from processor_detection import is_strix_halo
+            if is_strix_halo():
+                return 'strix_halo_desktop'
+        except Exception:
+            pass
+
         if self._cpu_vendor == CPUVendor.INTEL:
             return 'intel_generic'
         elif self._cpu_vendor == CPUVendor.AMD:
@@ -464,10 +559,13 @@ class DeviceManager:
     
     def is_handheld(self) -> bool:
         """Check if device is a handheld"""
-        # For now, consider specific known handhelds
+        # For now, consider specific known handhelds. Strix Halo desktops
+        # (nimo_n161l, strix_halo_desktop) and the Flow Z13 (tablet/2-in-1)
+        # are deliberately excluded — they run on AC power and don't have a
+        # battery profile split.
         device_id = self.detector.detect_device()
         handheld_devices = ['steam_deck', 'rog_ally', 'rog_ally_x', 'legion_go',
-                            'flow_z13', 'flow_z13_2025', 'ayaneo_2s', 'ayaneo_flip_kb', 'ayaneo_generic']
+                            'flow_z13', 'ayaneo_2s', 'ayaneo_flip_kb', 'ayaneo_generic']
         return device_id in handheld_devices
     
     def get_tdp_limits(self) -> tuple:

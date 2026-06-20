@@ -10838,7 +10838,7 @@
     "gpu_cu_count": 32,
     "node_process": "TSMC 4nm FinFET",
     "socket": "FP11",
-    "launch_year": 2020
+    "launch_year": 2025
   },
   {
     "name": "AMD Ryzen\u2122 AI Max 390",
@@ -10858,7 +10858,7 @@
     "gpu_cu_count": 32,
     "node_process": "TSMC 4nm FinFET",
     "socket": "FP11",
-    "launch_year": 2020
+    "launch_year": 2025
   },
   {
     "name": "AMD Ryzen\u2122 AI Max PRO 380",
@@ -10878,7 +10878,7 @@
     "gpu_cu_count": 16,
     "node_process": "TSMC 4nm FinFET",
     "socket": "FP11",
-    "launch_year": 2020
+    "launch_year": 2025
   },
   {
     "name": "AMD Ryzen\u2122 AI Max PRO 385",
@@ -10898,7 +10898,7 @@
     "gpu_cu_count": 32,
     "node_process": "TSMC 4nm FinFET",
     "socket": "FP11",
-    "launch_year": 2020
+    "launch_year": 2025
   },
   {
     "name": "AMD Ryzen\u2122 AI Max PRO 390",
@@ -10918,7 +10918,7 @@
     "gpu_cu_count": 32,
     "node_process": "TSMC 4nm FinFET",
     "socket": "FP11",
-    "launch_year": 2020
+    "launch_year": 2025
   },
   {
     "name": "AMD Ryzen\u2122 AI Max+ 395",
@@ -10938,7 +10938,7 @@
     "gpu_cu_count": 40,
     "node_process": "TSMC 4nm FinFET",
     "socket": "FP11",
-    "launch_year": 2020,
+    "launch_year": 2025,
     "tdp_fast_limit_max": 120,
     "tdp_slow_limit_max": 100,
     "tdp_burst_delta": 25
@@ -10961,7 +10961,7 @@
     "gpu_cu_count": 40,
     "node_process": "TSMC 4nm FinFET",
     "socket": "FP11",
-    "launch_year": 2020,
+    "launch_year": 2025,
     "tdp_fast_limit_max": 120,
     "tdp_slow_limit_max": 100,
     "tdp_burst_delta": 25
@@ -10984,7 +10984,7 @@
     "gpu_cu_count": 16,
     "node_process": "",
     "socket": "",
-    "launch_year": 2020
+    "launch_year": 2025
   },
   {
     "name": "AMD Ryzen\u2122 Threadripper\u2122 1900X",
@@ -11787,7 +11787,7 @@
     "gpu_cu_count": 12,
     "node_process": "",
     "socket": "",
-    "launch_year": 2020
+    "launch_year": 2025
   },
   {
     "name": "AMD Ryzen\u2122 Z2 A",
@@ -11807,7 +11807,7 @@
     "gpu_cu_count": 8,
     "node_process": "",
     "socket": "",
-    "launch_year": 2020
+    "launch_year": 2025
   },
   {
     "name": "AMD Ryzen\u2122 Z2 Extreme",
@@ -11827,7 +11827,7 @@
     "gpu_cu_count": 16,
     "node_process": "",
     "socket": "",
-    "launch_year": 2020
+    "launch_year": 2025
   },
   {
     "name": "AMD Ryzen\u2122 Z2 Go",
@@ -11847,7 +11847,7 @@
     "gpu_cu_count": 12,
     "node_process": "",
     "socket": "",
-    "launch_year": 2020
+    "launch_year": 2025
   },
   {
     "name": "Athlon\u2122 5150 APU with Radeon\u2122 R3 Series",

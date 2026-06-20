@@ -112,6 +112,47 @@ def find_processor_by_pattern(model_name: str) -> Optional[Dict[str, Any]]:
                 proc_lower = proc['name'].lower()
                 if "steam deck" in proc_lower or pattern.replace("amd ", "") in proc_lower:
                     return proc
+
+    # Special case for AMD's Ryzen AI families. The model strings overlap
+    # numerically with older parts (e.g. "AI Max+ 395" matches the 3950X),
+    # so identify the family first and only search entries within that
+    # family. Without this, the generic 3-4 digit matcher below happily
+    # returns a Ryzen 3000 desktop chip for a Strix Halo APU.
+    # Family keywords are matched as whole words to avoid false positives
+    # from substrings like "ai" inside "graphics".
+    family_keywords = [
+        ('ryzen ai max', r'\bai\s*max'),   # Strix Halo (Zen 5)
+        ('ryzen z2', r'\bz2'),             # Ryzen Z2 handhelds
+        ('ryzen ai', r'\bai\b'),           # Strix Point / Krackan Point (Zen 5)
+    ]
+    for family_match, family_pattern in family_keywords:
+        if family_match in model_lower:
+            family_re = re.compile(family_pattern)
+            digit_match = None
+            fallback = None
+            for proc in _PROCESSOR_DATABASE:
+                proc_lower = proc['name'].lower()
+                if not family_re.search(proc_lower):
+                    continue
+                # Within the family, prefer an exact (or substring)
+                # numeric match. The model string includes the actual
+                # SKU (e.g. "395") so a substring search returns the
+                # right part.
+                proc_digits = re.findall(r'(\d{3,4})', proc_lower)
+                model_digits = re.findall(r'(\d{3,4})', model_lower)
+                if proc_digits and model_digits and proc_digits[0] in model_digits:
+                    digit_match = proc
+                    break
+                # Remember the first family member with a valid TDP as
+                # a fallback. Returning it beats falling through to the
+                # generic 3-4 digit matcher, which would happily pick
+                # an unrelated older part that happens to share a SKU.
+                if fallback is None and proc.get('default_tdp', 0) > 0:
+                    fallback = proc
+            if digit_match is not None:
+                return digit_match
+            if fallback is not None:
+                return fallback
     
     # Extract specific model patterns first (more specific patterns)
     

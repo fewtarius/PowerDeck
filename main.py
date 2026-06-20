@@ -118,10 +118,13 @@ except ImportError as e:
 # Import processor detection modules
 try:
     from processor_detection import (
-        get_current_processor_info, 
+        get_current_processor_info,
         get_processor_tdp_limits,
         get_processor_default_tdp,
         is_handheld_device,
+        is_strix_halo,
+        cpu_supports_apu_skin_temp,
+        cpu_supports_tdc_edc_limits,
         refresh_processor_detection
     )
     # Import unified processor database instead of old separate databases  
@@ -1163,7 +1166,22 @@ class Plugin:
             # Generic AMD/Intel device
             else:
                 self.device_type = "generic"
-                decky.logger.info("Using generic power management")
+                # Annotate the device type for Strix Halo so logs and
+                # downstream code (TDP cap, thermal limits) know they're
+                # dealing with a desktop APU rather than a typical mobile
+                # part. Falls through to the same ryzenadj path.
+                try:
+                    if is_strix_halo():
+                        self.device_type = "strix_halo"
+                        decky.logger.info(
+                            "Detected AMD Strix Halo APU - using ryzenadj "
+                            "for TDP control (no APU skin temp sensor; "
+                            "tctl-temp provides thermal protection)."
+                        )
+                    else:
+                        decky.logger.info("Using generic power management")
+                except Exception as e:
+                    decky.logger.info(f"Using generic power management (Strix Halo detection failed: {e})")
             
             # TDP limits will be set later from processor database or sysfs detection
             # This ensures all devices use the same system-derived approach
@@ -2108,24 +2126,68 @@ class Plugin:
                 '--fast-limit',  str(fast_limit_mw),
                 '--slow-limit',  str(slow_limit_mw),
                 '--tctl-temp', '95',
-                '--apu-skin-temp', '95'
             ]
+
+            # Strix Halo (Zen 5 family 26) has no APU skin temperature
+            # sensor; ryzenadj's set_apu_skin_temp_limit returns
+            # ADJ_ERR_FAM_UNSUPPORTED and the CLI exits with rc=255 even
+            # though the TDP/STAPM/PPT writes above all succeed. Detect
+            # this up front so a successful apply doesn't look like a
+            # failure. Source: RyzenAdj/lib/api.c set_apu_skin_temp_limit.
+            try:
+                if cpu_supports_apu_skin_temp():
+                    cmd.extend(['--apu-skin-temp', '95'])
+                else:
+                    decky.logger.info(
+                        "Skipping --apu-skin-temp (not supported on this CPU family). "
+                        "tctl-temp provides thermal protection."
+                    )
+            except Exception:
+                # If detection fails for any reason, default to the legacy
+                # behavior (pass the flag). Power management is safety
+                # critical so we err on the side of attempting the call.
+                cmd.extend(['--apu-skin-temp', '95'])
 
             # Clear LD_LIBRARY_PATH to avoid Decky's bundled libs interfering
             clean_env = dict(os.environ)
             clean_env.pop("LD_LIBRARY_PATH", None)
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10,
                                    env=clean_env)
-            if result.returncode == 0:
-                decky.logger.info(
-                    f"AMD TDP set: sustained={tdp}W "
-                    f"fast={fast_limit_mw // 1000}W slow={slow_limit_mw // 1000}W"
-                )
+
+            # ryzenadj's _do_adjust macro returns -1 from the LAST failed
+            # adjustment, so rc=255 means at least one option failed even
+            # if the TDP writes earlier in the command succeeded. Treat
+            # the apply as successful when STAPM (the primary power limit)
+            # actually got written, since that's what the slider controls.
+            stapm_set = "Sucessfully set stapm_limit" in result.stdout
+            if result.returncode == 0 or stapm_set:
+                skipped = []
+                if "is not supported on this family" in result.stdout:
+                    for line in result.stdout.splitlines():
+                        if "is not supported on this family" in line:
+                            token = line.split(" ", 1)[1].split(" ", 1)[0] if " " in line else ""
+                            if token:
+                                skipped.append(token)
+                if skipped:
+                    decky.logger.info(
+                        f"AMD TDP set: sustained={tdp}W "
+                        f"fast={fast_limit_mw // 1000}W slow={slow_limit_mw // 1000}W "
+                        f"(skipped unsupported: {', '.join(skipped)})"
+                    )
+                else:
+                    decky.logger.info(
+                        f"AMD TDP set: sustained={tdp}W "
+                        f"fast={fast_limit_mw // 1000}W slow={slow_limit_mw // 1000}W"
+                    )
                 return True
-            else:
-                decky.logger.error(f"ryzenadj failed: {result.stderr}")
-                return False
-                
+
+            decky.logger.error(
+                f"ryzenadj failed (rc={result.returncode}): "
+                f"{(result.stderr or '').strip()} | "
+                f"{(result.stdout or '').strip()[:200]}"
+            )
+            return False
+
         except Exception as e:
             decky.logger.error(f"AMD TDP set failed: {e}")
             return False

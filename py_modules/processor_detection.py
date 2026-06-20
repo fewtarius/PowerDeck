@@ -10,6 +10,8 @@ import re
 import subprocess
 from typing import Dict, Optional, Tuple
 
+import psutil
+
 # Import handling for both module and standalone usage
 try:
     from .unified_processor_db import get_processor_info, get_processor_tdp_info
@@ -178,6 +180,96 @@ def get_processor_default_tdp() -> int:
     """Get default TDP for the current processor"""
     default_tdp, _, _ = get_tdp_limits()
     return default_tdp
+
+
+# CPU families known to lack APU skin temperature control via ryzenadj's
+# --apu-skin-temp option. The call returns ADJ_ERR_FAM_UNSUPPORTED and
+# ryzenadj exits with rc=255 even though the TDP/STAPM/PPT writes succeed,
+# which makes a successful TDP apply look like a failure. Detect these
+# cases up front so set_amd_tdp() can drop the unsupported option.
+# Source: RyzenAdj/lib/api.c set_apu_skin_temp_limit case table.
+_APU_SKIN_TEMP_UNSUPPORTED_FAMILIES = frozenset({26})  # Zen 5 family (Strix Halo)
+
+
+# CPU families where ryzenadj reports TDC/EDC values as NaN/unsupported.
+# These limits are valid in the PM table but the SMU doesn't surface them
+# on Strix Halo, so passing them is a no-op that wastes SMU commands.
+# Source: RyzenAdj/lib/api.c _do_adjust error logging on Strix Halo.
+_TDC_EDC_UNSUPPORTED_FAMILIES = frozenset({26})
+
+
+def _read_cpu_family_and_model() -> Optional[Tuple[int, int]]:
+    """Read (cpu_family, model) from /proc/cpuinfo without going through the DB."""
+    try:
+        with open('/proc/cpuinfo', 'r') as f:
+            family = None
+            model = None
+            for line in f:
+                if line.startswith('cpu family'):
+                    try:
+                        family = int(line.split(':', 1)[1].strip())
+                    except ValueError:
+                        pass
+                elif line.startswith('model') and ':' in line:
+                    key = line.split(':', 1)[0].strip()
+                    if key == 'model':
+                        try:
+                            model = int(line.split(':', 1)[1].strip())
+                        except ValueError:
+                            pass
+                if family is not None and model is not None:
+                    break
+        if family is None:
+            return None
+        return (family, model or 0)
+    except (FileNotFoundError, PermissionError):
+        return None
+
+
+def cpu_supports_apu_skin_temp() -> bool:
+    """Return True if ryzenadj's --apu-skin-temp option is expected to succeed.
+
+    False on CPU families where the call returns ADJ_ERR_FAM_UNSUPPORTED
+    (notably Strix Halo / family 26).
+    """
+    fam = _read_cpu_family_and_model()
+    if fam is None:
+        return True
+    return fam[0] not in _APU_SKIN_TEMP_UNSUPPORTED_FAMILIES
+
+
+def cpu_supports_tdc_edc_limits() -> bool:
+    """Return True if ryzenadj can read/write TDC/EDC limits on this CPU.
+
+    False on Strix Halo where the SMU doesn't surface those values.
+    """
+    fam = _read_cpu_family_and_model()
+    if fam is None:
+        return True
+    return fam[0] not in _TDC_EDC_UNSUPPORTED_FAMILIES
+
+
+def is_strix_halo() -> bool:
+    """Return True for AMD Strix Halo APUs (Ryzen AI MAX 300 series).
+
+    Strix Halo is the desktop-class Zen 5 APU with 12-16 cores and the
+    Radeon 8060S/8050S integrated GPU (40/32 CUs). Identified primarily
+    by the 'AI Max' model name suffix; cpu family 26 alone is ambiguous
+    because some Strix Point / Krackan Point chips also report 26.
+    """
+    model_name = get_processor_model().lower()
+    if 'ai max' in model_name:
+        return True
+    # Fallback: family 26 + large core count typical of Strix Halo.
+    fam = _read_cpu_family_and_model()
+    if fam and fam[0] == 26:
+        try:
+            cores = psutil.cpu_count(logical=False) or 0
+        except Exception:
+            cores = 0
+        if cores and cores >= 12:
+            return True
+    return False
 
 
 def is_handheld_device() -> bool:
