@@ -1998,8 +1998,21 @@ class Plugin:
             if self.steamos_manager_available:
                 steamos_success = await self.set_tdp_via_steamos_manager(tdp)
                 if steamos_success:
-                    decky.logger.info(f"TDP set to {tdp}W via SteamOS Manager (primary)")
-                    success = True
+                    # When the power subsystem is claimed (e.g. by
+                    # PowerDeck itself via ExternalManager1), the
+                    # RootManager SetTdpLimit method is a no-op that
+                    # returns success. If we hold the claim, don't
+                    # trust the DBus return value - fall through to
+                    # the device controller for actual TDP control.
+                    if hasattr(self, '_external_manager_token'):
+                        decky.logger.info(
+                            "Power subsystem claimed by PowerDeck; "
+                            "skipping SteamOS Manager TDP (no-op while "
+                            "claimed), falling through to device controller"
+                        )
+                    else:
+                        decky.logger.info(f"TDP set to {tdp}W via SteamOS Manager (primary)")
+                        success = True
                 else:
                     decky.logger.warning("SteamOS Manager TDP failed, falling back to device controller")
             
@@ -3420,6 +3433,25 @@ class Plugin:
                         decky.logger.info(f"Applied CPU boost: {profile_data['cpuBoost']}")
                     else:
                         decky.logger.warning(f"Failed to apply CPU boost: {profile_data['cpuBoost']}")
+                    # When the power subsystem is claimed by an external
+                    # manager (e.g. PowerDeck itself), the RootManager
+                    # DBus Set* methods return success without actually
+                    # writing to sysfs. Verify the file after a
+                    # "successful" DBus call and fall back to direct
+                    # sysfs write if the value didn't take effect.
+                    if self.steamos_manager_available and boost_success:
+                        actual_boost = await self.get_current_cpu_boost()
+                        if actual_boost != profile_data["cpuBoost"]:
+                            decky.logger.warning(
+                                "CPU boost DBus call returned success but "
+                                "sysfs shows %s (expected %s); "
+                                "falling back to direct sysfs write",
+                                actual_boost, profile_data["cpuBoost"],
+                            )
+                            boost_success = await self.set_cpu_boost(profile_data["cpuBoost"])
+                            if not boost_success:
+                                decky.logger.warning("CPU boost sysfs fallback also failed")
+                                success_count -= 1  # Un-count the false success from DBus
                 except Exception as e:
                     decky.logger.error(f"Error applying CPU boost: {e}")
             
@@ -3501,18 +3533,19 @@ class Plugin:
                     if current_governor == "performance" and epp_governor != "performance":
                         decky.logger.info(f"Active mode: temporarily setting governor to powersave to allow EPP change")
                         if self.steamos_manager_available:
-                            # Try SteamOS Manager first, but fall back to
-                            # direct sysfs if the dbus call fails (e.g.
-                            # SteamOS Holo builds where
-                            # SetCpuScalingGovernor is not registered on
-                            # com.steampowered.SteamOSManager1.RootManager).
                             sm_ok = await self.set_governor_via_steamos_manager("powersave")
                             if not sm_ok:
-                                decky.logger.warning(
-                                    "SteamOS Manager SetCpuScalingGovernor failed; "
-                                    "falling back to direct sysfs write"
-                                )
                                 await self.set_power_governor("powersave")
+                            elif hasattr(self, 'cpu_manager') and self.cpu_manager:
+                                actual = self.cpu_manager.get_current_governor()
+                                if actual != "powersave":
+                                    decky.logger.warning(
+                                        "Governor DBus call returned success but "
+                                        "sysfs shows %s (expected powersave); "
+                                        "falling back to direct sysfs write",
+                                        actual,
+                                    )
+                                    await self.set_power_governor("powersave")
                         else:
                             await self.set_power_governor("powersave")
                 
@@ -3523,15 +3556,18 @@ class Plugin:
                         # Prefer SteamOS Manager for governor on supported systems
                         if self.steamos_manager_available:
                             governor_success = await self.set_governor_via_steamos_manager(governor)
-                            # Fall back to direct sysfs if dbus call fails
-                            # (e.g. SteamOS Holo builds where the
-                            # SetCpuScalingGovernor method is not registered).
                             if not governor_success:
-                                decky.logger.warning(
-                                    "SteamOS Manager SetCpuScalingGovernor failed; "
-                                    "falling back to direct sysfs write"
-                                )
                                 governor_success = await self.set_power_governor(governor)
+                            elif hasattr(self, 'cpu_manager') and self.cpu_manager:
+                                actual = self.cpu_manager.get_current_governor()
+                                if actual != governor:
+                                    decky.logger.warning(
+                                        "Governor DBus call returned success but "
+                                        "sysfs shows %s (expected %s); "
+                                        "falling back to direct sysfs write",
+                                        actual, governor,
+                                    )
+                                    governor_success = await self.set_power_governor(governor)
                         else:
                             governor_success = await self.set_power_governor(governor)
                         if governor_success:
@@ -3592,8 +3628,21 @@ class Plugin:
                         gpu_level = gpu_level_map.get(gpu_mode, "auto")
                         gpu_success = await self.set_gpu_performance_via_steamos_manager(gpu_level)
                         if not gpu_success:
-                            # Fall back to direct GPU mode setting
                             gpu_success = await self.set_gpu_mode(gpu_mode)
+                        else:
+                            # When the power subsystem is claimed, the
+                            # RootManager DBus call returns success
+                            # without writing to DPM. Verify and fall
+                            # back to direct sysfs if needed.
+                            actual_gpu_mode = await self.get_current_gpu_mode()
+                            if actual_gpu_mode != gpu_mode:
+                                decky.logger.warning(
+                                    "GPU mode DBus call returned success but "
+                                    "sysfs shows %s (expected %s); "
+                                    "falling back to direct sysfs write",
+                                    actual_gpu_mode, gpu_mode,
+                                )
+                                gpu_success = await self.set_gpu_mode(gpu_mode)
                     else:
                         # Refuse "performance" on non-JELOS systems - it would write DPM "high"
                         # and trigger the AMD GPU hang on SteamFork/SteamOS stock kernels.
