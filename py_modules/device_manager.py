@@ -215,10 +215,10 @@ class DeviceDetector:
         # temperature sensor (tctl only), and TDC/EDC values come back
         # as NaN from ryzenadj. main.py handles both automatically.
 
-        # Nimo Direct N161L - Strix Halo mini-PC
+        # Nimo Direct N161L - Strix Halo laptop
         # DMI product_name: "N161L", sys_vendor: "Nimo Direct INC."
         # Confirmed: 16C/32T Ryzen AI MAX+ 395, default STAPM/PPT 105W,
-        # SMU BIOS interface v25.
+        # SMU BIOS interface v25. Battery-powered laptop with MediaTek MT7925.
         profiles['nimo_n161l'] = DeviceProfile(
             name="Nimo Direct N161L (Strix Halo)",
             cpu_vendor=CPUVendor.AMD,
@@ -231,12 +231,14 @@ class DeviceDetector:
             gpu_frequency_range=(400, 2900),
             device_specific_features={
                 'handheld_device': False,
-                'desktop_apu': True,
+                'desktop_apu': False,
                 'strix_halo': True,
                 'tctl_only_thermal': True,   # no apu-skin-temp sensor
                 'fclk_control': True,
                 'nvme_power_control': True,
                 'platform_profile': True,
+                'wifi_pcie_pm': True,
+                'pcie_l1ss_control': True,
             }
         )
 

@@ -3410,9 +3410,27 @@ class Plugin:
             if "cpuBoost" in profile_data:
                 total_operations += 1
                 try:
-                    # Prefer SteamOS Manager for CPU boost on supported systems
+                    # Prefer SteamOS Manager for CPU boost on supported systems.
+                    # Verify the sysfs file after the DBus call because the method
+                    # can return success without actually writing (no-op on some
+                    # SteamOS Holo / SteamFork builds).
                     if self.steamos_manager_available:
                         boost_success = await self.set_cpu_boost_via_steamos_manager(profile_data["cpuBoost"])
+                        if boost_success:
+                            try:
+                                boost_path = "/sys/devices/system/cpu/cpufreq/boost"
+                                if os.path.exists(boost_path):
+                                    with open(boost_path, 'r') as f:
+                                        actual = f.read().strip()
+                                    expected = "1" if profile_data["cpuBoost"] else "0"
+                                    if actual != expected:
+                                        decky.logger.warning(
+                                            f"SteamOS Manager claimed success but cpufreq boost is "
+                                            f"'{actual}' (expected '{expected}') - falling back to direct sysfs"
+                                        )
+                                        boost_success = await self.set_cpu_boost(profile_data["cpuBoost"])
+                            except Exception:
+                                boost_success = await self.set_cpu_boost(profile_data["cpuBoost"])
                     else:
                         boost_success = await self.set_cpu_boost(profile_data["cpuBoost"])
                     if boost_success:
@@ -3507,7 +3525,18 @@ class Plugin:
                             # SetCpuScalingGovernor is not registered on
                             # com.steampowered.SteamOSManager1.RootManager).
                             sm_ok = await self.set_governor_via_steamos_manager("powersave")
-                            if not sm_ok:
+                            if sm_ok:
+                                # Verify the governor actually took effect.
+                                try:
+                                    if self.cpu_manager.get_current_governor() != "powersave":
+                                        decky.logger.warning(
+                                            "SteamOS Manager claimed success but "
+                                            "governor did not change - falling back"
+                                        )
+                                        await self.set_power_governor("powersave")
+                                except Exception:
+                                    await self.set_power_governor("powersave")
+                            else:
                                 decky.logger.warning(
                                     "SteamOS Manager SetCpuScalingGovernor failed; "
                                     "falling back to direct sysfs write"
@@ -3523,10 +3552,22 @@ class Plugin:
                         # Prefer SteamOS Manager for governor on supported systems
                         if self.steamos_manager_available:
                             governor_success = await self.set_governor_via_steamos_manager(governor)
-                            # Fall back to direct sysfs if dbus call fails
-                            # (e.g. SteamOS Holo builds where the
-                            # SetCpuScalingGovernor method is not registered).
-                            if not governor_success:
+                            if governor_success:
+                                # Verify SteamOS Manager actually changed the governor.
+                                # On some systems the DBus method returns success but
+                                # is a no-op.
+                                try:
+                                    actual_gov = self.cpu_manager.get_current_governor()
+                                    if actual_gov != governor:
+                                        decky.logger.warning(
+                                            f"SteamOS Manager claimed success but governor is "
+                                            f"'{actual_gov}' (expected '{governor}') - falling "
+                                            f"back to direct sysfs write"
+                                        )
+                                        governor_success = await self.set_power_governor(governor)
+                                except Exception:
+                                    governor_success = await self.set_power_governor(governor)
+                            else:
                                 decky.logger.warning(
                                     "SteamOS Manager SetCpuScalingGovernor failed; "
                                     "falling back to direct sysfs write"
@@ -3555,6 +3596,51 @@ class Plugin:
                     except Exception as e:
                         decky.logger.error(f"Error applying EPP: {epp}")
             
+                # Set scaling_min_freq based on power profile intent.
+                # On amd-pstate-epp the kernel defaults to the CPPC lowest
+                # non-linear frequency which is often much higher than the
+                # true hardware floor (e.g. 2 GHz vs 625 MHz on Strix Halo).
+                # Drop to the hardware floor for power-saving profiles;
+                # restore the kernel default for performance profiles.
+                if governor and hasattr(self, 'cpu_manager'):
+                    try:
+                        freq_range = self.cpu_manager.get_cpu_frequency_range()
+                        kernel_default = self.cpu_manager.get_kernel_default_min_freq()
+
+                        if freq_range and kernel_default:
+                            hardware_floor = freq_range['min_freq_khz']
+
+                            # Only act when there is a meaningful gap
+                            if hardware_floor != kernel_default:
+                                is_power_saving = governor in ("powersave", "conservative")
+                                target_min = hardware_floor if is_power_saving else kernel_default
+
+                                # Read current value to avoid redundant writes
+                                current_limits = self.cpu_manager.get_cpu_frequency_limits()
+                                if current_limits:
+                                    first_cpu = next(iter(current_limits))
+                                    current_min = current_limits[first_cpu].get('min_freq_khz')
+                                else:
+                                    current_min = None
+
+                                if current_min is None or current_min != target_min:
+                                    total_operations += 1
+                                    freq_success = self.cpu_manager.set_scaling_min_freq(target_min)
+                                    if freq_success:
+                                        success_count += 1
+                                        label = "hardware floor" if is_power_saving else "kernel default"
+                                        decky.logger.info(
+                                            f"Applied CPU min frequency: {target_min // 1000}MHz"
+                                            f" ({label}, governor={governor})"
+                                        )
+                                    else:
+                                        decky.logger.warning(
+                                            f"Failed to set CPU min frequency to"
+                                            f" {target_min // 1000}MHz"
+                                        )
+                    except Exception as e:
+                        decky.logger.error(f"Error setting CPU min frequency: {e}")
+
             # Apply fan control profile (critical for proper cooling management)
             if "fanProfile" in profile_data:
                 total_operations += 1
@@ -3569,7 +3655,7 @@ class Plugin:
                 except Exception as e:
                     decky.logger.error(f"Error applying fan profile: {e}")
             
-            # Apply GPU mode and frequency settings
+           # Apply GPU mode and frequency settings
             if "gpuMode" in profile_data:
                 total_operations += 1
                 try:
@@ -3591,8 +3677,28 @@ class Plugin:
                         }
                         gpu_level = gpu_level_map.get(gpu_mode, "auto")
                         gpu_success = await self.set_gpu_performance_via_steamos_manager(gpu_level)
-                        if not gpu_success:
-                            # Fall back to direct GPU mode setting
+                        if gpu_success:
+                            # Verify SteamOS Manager actually changed the DPM file.
+                            # On some systems (SteamOS Holo, SteamFork) the DBus
+                            # method returns success but is a no-op.  Check the
+                            # actual sysfs value and fall back to direct write
+                            # when it didn't take effect.
+                            try:
+                                dpm_path = "/sys/class/drm/card0/device/power_dpm_force_performance_level"
+                                if not os.path.exists(dpm_path):
+                                    dpm_path = "/sys/class/drm/card1/device/power_dpm_force_performance_level"
+                                if os.path.exists(dpm_path):
+                                    with open(dpm_path, 'r') as f:
+                                        actual = f.read().strip()
+                                    if actual != gpu_level:
+                                        decky.logger.warning(
+                                            f"SteamOS Manager claimed success but DPM is '{actual}' "
+                                            f"(expected '{gpu_level}') - falling back to direct sysfs"
+                                        )
+                                        gpu_success = await self.set_gpu_mode(gpu_mode)
+                            except Exception:
+                                gpu_success = await self.set_gpu_mode(gpu_mode)
+                        else:
                             gpu_success = await self.set_gpu_mode(gpu_mode)
                     else:
                         # Refuse "performance" on non-JELOS systems - it would write DPM "high"
@@ -3642,20 +3748,19 @@ class Plugin:
                 except Exception as e:
                     decky.logger.error(f"Error applying USB autosuspend: {e}")
             
-            # Apply PCIe ASPM setting
+            # Apply PCIe ASPM setting (includes L1 substate control)
             if "pcieAspm" in profile_data:
                 total_operations += 1
                 try:
                     pcie_enabled = profile_data.get("pcieAspm", False)
-                    pcie_policy = "powersave" if pcie_enabled else "default"
-                    pcie_success = await self.set_pcie_aspm_policy(pcie_policy)
+                    pcie_success = await self.set_pcie_power_management(pcie_enabled)
                     if pcie_success:
                         success_count += 1
-                        decky.logger.info(f"Applied PCIe ASPM: {pcie_policy} policy")
+                        decky.logger.info(f"Applied PCIe power management (ASPM + L1SS): {'enabled' if pcie_enabled else 'disabled'}")
                     else:
-                        decky.logger.warning(f"Failed to apply PCIe ASPM: {pcie_policy}")
+                        decky.logger.warning(f"Failed to apply PCIe power management: {'enabled' if pcie_enabled else 'disabled'}")
                 except Exception as e:
-                    decky.logger.error(f"Error applying PCIe ASPM: {e}")
+                    decky.logger.error(f"Error applying PCIe power management: {e}")
 
             # Apply PCI runtime PM setting
             if "pciRuntimePm" in profile_data:
@@ -4151,16 +4256,67 @@ class Plugin:
             return False
 
     async def set_pcie_power_management(self, enabled: bool) -> bool:
-        """Set PCIe power management (wrapper for ASPM policy)"""
+        """Set PCIe power management (ASPM policy + L1 substate control).
+
+        Uses powersupersave policy to enable L1.1/L1.2 substates which add
+        deeper link power savings. On capable devices (MediaTek MT7925 WiFi,
+        modern NVMe SSDs) this saves ~0.4W at idle.
+        """
         try:
             if not self.device_info.get("supports_pcie_aspm"):
                 return False
-            
-            # Use powersave when enabled, default when disabled
-            policy = "powersave" if enabled else "default"
-            return await self.set_pcie_aspm_policy(policy)
+
+            # powersupersave is required for L1.1/L1.2 to take effect;
+            # powersave alone only enables standard L0s/L1 ASPM.
+            policy = "powersupersave" if enabled else "default"
+            aspm_ok = await self.set_pcie_aspm_policy(policy)
+
+            # Enable L1.1/L1.2 substates on capable devices
+            if enabled:
+                await self.set_pcie_l1ss_state(enable=True)
+
+            return aspm_ok
         except Exception as e:
             decky.logger.error(f"Failed to set PCIe power management: {e}")
+            return False
+
+    async def set_pcie_l1ss_state(self, enable: bool) -> bool:
+        """Enable or disable ASPM L1.1/L1.2 substates on PCIe devices.
+
+        L1 substates add deeper power savings on top of standard L1 ASPM.
+        Hardware must advertise support in L1SubCap; many devices (MediaTek
+        MT7925 WiFi, NVMe SSDs) support it but need explicit kernel toggling
+        via the link/l1_* sysfs nodes.
+
+        Args:
+            enable: True to enable L1.1 + L1.2, False to disable
+        """
+        try:
+            l1_nodes = ["l1_1_aspm", "l1_2_aspm"]
+            enabled_count = 0
+            total_count = 0
+
+            for l1_node in l1_nodes:
+                for link_file in glob.glob(
+                    f"/sys/bus/pci/devices/*/link/{l1_node}"
+                ):
+                    total_count += 1
+                    try:
+                        value = "1" if enable else "0"
+                        with open(link_file, "w") as f:
+                            f.write(value)
+                        enabled_count += 1
+                    except Exception:
+                        pass
+
+            if total_count > 0:
+                decky.logger.info(
+                    f"PCIe L1SS: {'enabled' if enable else 'disabled'} "
+                    f"{enabled_count}/{total_count} devices"
+                )
+            return enabled_count > 0 or total_count == 0
+        except Exception as e:
+            decky.logger.error(f"Failed to set PCIe L1 substates: {e}")
             return False
 
     async def get_pci_runtime_pm_status(self) -> Dict[str, bool]:
@@ -4181,9 +4337,17 @@ class Plugin:
             decky.logger.error(f"Failed to get PCI runtime PM status: {e}")
             return {}
 
-    async def set_pci_runtime_pm(self, enable: bool) -> bool:
+    async def set_pci_runtime_pm(self, enable: bool, autosuspend_delay_ms: int = 200) -> bool:
+        """Set PCI runtime PM on all capable devices.
 
-        """Sets power/control=auto on all PCI devices that support runtime PM."""
+        When enabling, sets power/control=auto and configures the autosuspend
+        delay so the device can actually transition to D3 after becoming idle.
+        Without a delay value, control=auto alone does not trigger suspension.
+
+        Args:
+            enable: True to enable runtime PM, False to disable
+            autosuspend_delay_ms: Idle timeout before D3 transition (default 200ms)
+        """
         try:
             # Devices that should always stay active
             EXCLUDED_CLASSES = {
@@ -4191,16 +4355,23 @@ class Plugin:
                 "0x030200",  # 3D controller
                 "0x0300ff",  # VGA compatible controller (unknown)
             }
-            
+            # Network adapters benefit from slightly longer delay to avoid
+            # excessive D transitions during bursty traffic
+            EXCLUDED_DELAY_CLASSES = {
+                "0x028000",  # Network controller
+            }
+
             success_count = 0
+            delay_set_count = 0
             total_count = 0
-            
+
             for control_file in glob.glob("/sys/bus/pci/devices/*/power/control"):
                 device_path = os.path.dirname(os.path.dirname(control_file))
                 device_name = os.path.basename(device_path)
-                
+
                 # Check device class to exclude GPU
                 class_file = os.path.join(device_path, "class")
+                device_class = ""
                 try:
                     with open(class_file, "r") as f:
                         device_class = f.read().strip()
@@ -4208,17 +4379,34 @@ class Plugin:
                         continue
                 except Exception:
                     pass
-                
+
                 total_count += 1
                 try:
                     value = "auto" if enable else "on"
                     with open(control_file, "w") as f:
                         f.write(value)
                     success_count += 1
+
+                    # Set autosuspend delay when enabling runtime PM
+                    if enable:
+                        delay_file = os.path.join(device_path, "power/autosuspend_delay_ms")
+                        if os.path.exists(delay_file):
+                            # Network devices get a longer delay to reduce D transitions
+                            delay = 2000 if device_class in EXCLUDED_DELAY_CLASSES else autosuspend_delay_ms
+                            with open(delay_file, "w") as f:
+                                f.write(str(delay))
+                            delay_set_count += 1
+                            decky.logger.debug(
+                                f"PCI {device_name}: runtime PM auto, "
+                                f"autosuspend_delay_ms={delay}"
+                            )
                 except Exception:
                     pass
-            
-            decky.logger.info(f"PCI runtime PM: {success_count}/{total_count} devices set to {'auto' if enable else 'on'}")
+
+            decky.logger.info(
+                f"PCI runtime PM: {success_count}/{total_count} devices set to "
+                f"{'auto' if enable else 'on'}, delays configured for {delay_set_count} devices"
+            )
             return success_count > 0
         except Exception as e:
             decky.logger.error(f"Failed to set PCI runtime PM: {e}")
@@ -4525,6 +4713,20 @@ class Plugin:
                         f.write(setting)
                     count += 1
                     decky.logger.debug(f"Set USB autosuspend to {setting} for device {device_name}")
+
+                    # Enable wakeup on Bluetooth/Wireless devices so they can
+                    # auto-resume when needed (pairing, connection events, etc.)
+                    if enable and ("bluetooth" in device_info or
+                                  "wireless" in device_info or
+                                  "bt" in device_info):
+                        wakeup_file = os.path.join(device_path, "power/wakeup")
+                        if os.path.exists(wakeup_file):
+                            with open(wakeup_file, "w") as f:
+                                f.write("enabled")
+                            decky.logger.debug(
+                                f"Enabled wakeup for BT/wireless device {device_name}"
+                            )
+
                 except Exception as e:
                     decky.logger.warning(f"Failed to set USB autosuspend for {device_name}: {e}")
                     continue
@@ -6116,6 +6318,25 @@ class Plugin:
             decky.logger.info(f"Calling self.save_profile with: {profile_with_id}")
             success = await self.save_profile(profile_with_id)
             decky.logger.info(f"Plugin.set_game_profile: Saved profile for {game_id}, success: {success}")
+            
+            # If this profile is the currently active one, apply it to hardware
+            # immediately.  The game-monitor loop only fires on game *change*,
+            # so a profile edit while a game is already running would never
+            # reach the hardware otherwise.
+            if success:
+                try:
+                    active_id = (self.current_profile or {}).get("profileId")
+                    if active_id and active_id == game_id:
+                        decky.logger.info(
+                            f"set_game_profile: active profile {game_id} saved, "
+                            f"re-applying to hardware"
+                        )
+                        await self.apply_profile(profile_with_id)
+                except Exception as apply_err:
+                    decky.logger.warning(
+                        f"set_game_profile: save succeeded but apply failed: {apply_err}"
+                    )
+            
             return success
         except Exception as e:
             decky.logger.error(f"Plugin.set_game_profile failed for {game_id}: {e}")
