@@ -1209,6 +1209,76 @@ class CPUManager:
             max_freq_khz=freq_range['max_freq_khz']
         )
     
+    def get_kernel_default_min_freq(self) -> Optional[int]:
+        """Get the kernel's default minimum frequency floor.
+
+        On amd-pstate-epp the kernel initialises scaling_min_freq to the
+        CPPC lowest non-linear frequency, which is often much higher than
+        the true hardware floor.  For battery / power-saving profiles we
+        want to drop below this floor to reach cpuinfo_min_freq.
+
+        On other drivers the hardware floor IS the kernel default.
+
+        Returns: frequency in kHz, or None if unavailable
+        """
+        try:
+            amd_path = "/sys/devices/system/cpu/cpu0/cpufreq/amd_pstate_lowest_nonlinear_freq"
+            if os.path.exists(amd_path):
+                with open(amd_path, 'r') as f:
+                    return int(f.read().strip())
+        except Exception:
+            pass
+
+        # Fall back to hardware floor (the kernel default on non-AMD platforms)
+        freq_range = self.get_cpu_frequency_range()
+        if freq_range:
+            return freq_range['min_freq_khz']
+        return None
+
+    def set_scaling_min_freq(self, min_freq_khz: int) -> bool:
+        """Set scaling_min_freq for all online CPUs.
+
+        Skips CPUs that are already at the target value to avoid
+        unnecessary sysfs writes.
+        """
+        success_count = 0
+        total = 0
+
+        for cpu in self._online_cpus:
+            path = f"/sys/devices/system/cpu/cpu{cpu}/cpufreq/scaling_min_freq"
+            if not os.path.exists(path):
+                continue
+
+            total += 1
+            try:
+                with open(path, 'r') as f:
+                    current = int(f.read().strip())
+                if current == min_freq_khz:
+                    success_count += 1
+                    continue
+
+                with open(path, 'w') as f:
+                    f.write(str(min_freq_khz))
+                success_count += 1
+                decky_plugin.logger.debug(
+                    f"CPU {cpu}: scaling_min_freq {current//1000}MHz -> {min_freq_khz//1000}MHz"
+                )
+            except Exception as e:
+                decky_plugin.logger.warning(
+                    f"Failed to set scaling_min_freq for CPU {cpu}: {e}"
+                )
+
+        if success_count > 0:
+            decky_plugin.logger.info(
+                f"Set scaling_min_freq to {min_freq_khz//1000}MHz on {success_count}/{total} CPUs"
+            )
+            return True
+
+        if total == 0:
+            decky_plugin.logger.warning("No online CPUs for scaling_min_freq")
+        return False
+
+    
     def get_cpu_info(self) -> Dict[str, Any]:
         """Get comprehensive CPU information"""
         info = {
