@@ -195,11 +195,11 @@ class EnhancedSleepWakeManager:
                     except asyncio.TimeoutError:
                         # No new journal entries - continue monitoring
                         continue
-                    except Exception:
+                    except Exception as _e:
                         # Silently handle journal reading errors to prevent NVMe wake
                         break
                 
-            except Exception:
+            except Exception as _e:
                 # Silently handle journal monitoring errors to prevent NVMe wake
                 pass
             finally:
@@ -391,7 +391,7 @@ class EnhancedSleepWakeManager:
                             await self.plugin.set_gpu_frequency(freq_min, freq_max)
                     else:
                         restoration_success = False
-                except Exception:
+                except Exception as _e:
                     restoration_success = False
             
             # 2. TDP Restoration (critical for power consumption)
@@ -403,7 +403,7 @@ class EnhancedSleepWakeManager:
                         decky.logger.info(f"TDP restored: {tdp}W")
                     else:
                         restoration_success = False
-                except Exception:
+                except Exception as _e:
                     restoration_success = False
             
             # 3. CPU Parameters Restoration
@@ -421,10 +421,10 @@ class EnhancedSleepWakeManager:
                         decky.logger.info("Complete profile restoration successful")
                     else:
                         restoration_success = False
-            except Exception:
+            except Exception as _e:
                 restoration_success = False
         
-        except Exception:
+        except Exception as _e:
             restoration_success = False
         
         return restoration_success
@@ -462,7 +462,7 @@ class EnhancedSleepWakeManager:
                 if hasattr(self.plugin, 'set_epp'):
                     await self.plugin.set_epp(epp)
                     
-        except Exception:
+        except Exception as _e:
             # Silently handle CPU parameter restoration errors to prevent NVMe wake
             pass
     
@@ -493,7 +493,7 @@ class EnhancedSleepWakeManager:
                 if hasattr(self.plugin, 'set_wifi_power_save'):
                     await self.plugin.set_wifi_power_save(wifi_power_save)
                     
-        except Exception:
+        except Exception as _e:
             # Silently handle power management restoration errors to prevent NVMe wake
             pass
     
@@ -584,7 +584,7 @@ class EnhancedSleepWakeManager:
                                     state[f'ryzenadj_{key}'] = float(value)
                                 except ValueError:
                                     state[f'ryzenadj_{key}'] = value
-            except Exception:
+            except Exception as _e:
                 # Silently handle RyzenAdj errors to prevent NVMe wake from logging
                 pass
             
@@ -610,28 +610,28 @@ class EnhancedSleepWakeManager:
             try:
                 with open('/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor', 'r') as f:
                     state['cpu_governor'] = f.read().strip()
-            except Exception:
+            except Exception as _e:
                 pass
             
             # Energy Performance Preference
             try:
                 with open('/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference', 'r') as f:
                     state['cpu_epp'] = f.read().strip()
-            except Exception:
+            except Exception as _e:
                 pass
             
             # CPU Boost status
             try:
                 with open('/sys/devices/system/cpu/cpufreq/boost', 'r') as f:
                     state['cpu_boost'] = int(f.read().strip())
-            except Exception:
+            except Exception as _e:
                 pass
             
             # SMT status
             try:
                 with open('/sys/devices/system/cpu/smt/control', 'r') as f:
                     state['cpu_smt'] = f.read().strip()
-            except Exception:
+            except Exception as _e:
                 pass
             
             # Count online CPUs
@@ -642,7 +642,7 @@ class EnhancedSleepWakeManager:
                     with open(cpu_file, 'r') as f:
                         if f.read().strip() == '1':
                             online_cpus += 1
-                except Exception:
+                except Exception as _e:
                     pass
             state['cpu_online_count'] = online_cpus
             
@@ -656,14 +656,14 @@ class EnhancedSleepWakeManager:
             try:
                 with open('/sys/class/drm/card0/device/power_dpm_force_performance_level', 'r') as f:
                     state['gpu_performance_level'] = f.read().strip()
-            except Exception:
+            except Exception as _e:
                 pass
             
             # GPU DPM state
             try:
                 with open('/sys/class/drm/card0/device/power_dpm_state', 'r') as f:
                     state['gpu_dpm_state'] = f.read().strip()
-            except Exception:
+            except Exception as _e:
                 pass
             
             # GPU clock frequencies
@@ -676,7 +676,7 @@ class EnhancedSleepWakeManager:
                             active_freq = line.strip()
                             break
                     state['gpu_active_freq'] = active_freq
-            except Exception:
+            except Exception as _e:
                 pass
             
             # GPU power profile mode
@@ -689,7 +689,7 @@ class EnhancedSleepWakeManager:
                             active_profile = line.strip()
                             break
                     state['gpu_power_profile'] = active_profile
-            except Exception:
+            except Exception as _e:
                 pass
                 
         except Exception as e:
@@ -710,7 +710,7 @@ class EnhancedSleepWakeManager:
                         usb_devices_checked += 1
                         if control == 'auto':
                             usb_autosuspend_enabled += 1
-                except Exception:
+                except Exception as _e:
                     pass
             state['usb_autosuspend_ratio'] = f"{usb_autosuspend_enabled}/{usb_devices_checked}" if usb_devices_checked > 0 else "0/0"
             
@@ -725,7 +725,7 @@ class EnhancedSleepWakeManager:
                     asmp_disabled_count = result.stdout.count('ASPM.*Disabled')
                     state['pcie_aspm_enabled_count'] = aspm_enabled_count
                     state['pcie_aspm_disabled_count'] = asmp_disabled_count
-            except Exception:
+            except Exception as _e:
                 # Silently handle lspci errors to prevent NVMe wake from logging
                 pass
             
@@ -733,7 +733,7 @@ class EnhancedSleepWakeManager:
             try:
                 with open('/sys/firmware/acpi/platform_profile', 'r') as f:
                     state['platform_profile'] = f.read().strip()
-            except Exception:
+            except Exception as _e:
                 pass
                 
         except Exception as e:

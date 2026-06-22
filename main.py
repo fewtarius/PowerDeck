@@ -205,6 +205,7 @@ class Plugin:
 
         # Enhanced sleep/wake management
         self.sleep_wake_manager = None
+        self.sleep_wake_task = None
         
         # Background update checking state
         self.last_update_check = None
@@ -717,11 +718,11 @@ class Plugin:
                     except Exception as e:
                         decky.logger.error(f"Failed to initialize enhanced sleep/wake management: {e}")
                         # Fallback to original monitoring
-                        asyncio.create_task(self.monitor_system_wake())
+                        self.sleep_wake_task = asyncio.create_task(self.monitor_system_wake())
                         decky.logger.info("Falling back to basic sleep/wake monitoring")
                 else:
                     # Fallback to original monitoring if device support unavailable
-                    asyncio.create_task(self.monitor_system_wake())
+                    self.sleep_wake_task = asyncio.create_task(self.monitor_system_wake())
                     decky.logger.info("Using basic sleep/wake monitoring (no device support)")
                 
                 # Start background update checking task (non-blocking)
@@ -761,6 +762,14 @@ class Plugin:
                 decky.logger.info("Enhanced sleep/wake monitoring stopped")
             except Exception as e:
                 decky.logger.error(f"Error stopping sleep/wake monitoring: {e}")
+        
+        # Cancel basic sleep/wake monitoring task (fallback path)
+        if self.sleep_wake_task:
+            try:
+                self.sleep_wake_task.cancel()
+                decky.logger.info("Sleep/wake monitoring task cancelled")
+            except Exception as e:
+                decky.logger.error(f"Error cancelling sleep/wake monitoring task: {e}")
         
         # Cancel background update checker task
         if self.background_update_task:
@@ -927,7 +936,7 @@ class Plugin:
                             self.device_info["min_tdp"] = 4
                             self.device_info["max_tdp"] = 25
                             decky.logger.warning("Using last resort TDP limits: 4W - 25W")
-                    except Exception:
+                    except Exception as e:
                         self.tdp_limits = {"min": 4, "max": 25}
                         self.device_info["min_tdp"] = 4
                         self.device_info["max_tdp"] = 25
@@ -955,7 +964,7 @@ class Plugin:
                         if self.current_profile["tdp"] is None:
                             self.current_profile["tdp"] = 15
                         decky.logger.warning("Used absolute fallback TDP limits: 4W - 25W")
-                except Exception:
+                except Exception as e:
                     self.tdp_limits = {"min": 4, "max": 25}
                     self.device_info["min_tdp"] = 4
                     self.device_info["max_tdp"] = 25
@@ -1076,7 +1085,7 @@ class Plugin:
                             else:
                                 self.device_info["max_cpu_cores"] = 8  # Conservative fallback  
                                 decky.logger.warning("Used conservative fallback: 8 cores")
-                        except Exception:
+                        except Exception as e:
                             self.device_info["max_cpu_cores"] = 8
                             decky.logger.warning("Used absolute last resort: 8 cores")
             
@@ -1332,7 +1341,7 @@ class Plugin:
                     self.device_info["supports_wifi_power_save"] = True
                     decky.logger.info("WiFi power save supported (detected via iw dev)")
                     return True
-            except Exception:
+            except Exception as e:
                 pass
             
             # Fallback: check for wireless interfaces in /sys/class/net
@@ -1586,7 +1595,7 @@ class Plugin:
                         proc_info = get_current_processor_info()
                         if proc_info and proc_info.get('detected', False):
                             processor_default_tdp = proc_info.get('default_tdp', proc_info.get('tdp_min', 25))
-                    except Exception:
+                    except Exception as e:
                         pass
                 
                 loaded_tdp = profile_data.get("tdp", 10)  # TDP from saved profile
@@ -1867,7 +1876,7 @@ class Plugin:
             import os
             import json
             
-            game_id = profile_data.get("gameId", "default")
+            game_id = profile_data.get("gameId", "00000000")
             profile_copy = dict(profile_data)
             if "gameId" in profile_copy:
                 del profile_copy["gameId"]
@@ -2057,19 +2066,10 @@ class Plugin:
                     success = await self.set_amd_tdp(tdp)
             
             if success:
-                # Always update current_profile for hardware state tracking
+                # Track in current_profile for state reporting.
+                # Profile persistence is handled by apply_profile() / save_profile().
                 self.current_profile["tdp"] = tdp
-                
-                if save_to_profile:
-                    # Also save the profile to persistent storage when requested
-                    try:
-                        await self.save_profile(self.current_game.game_id, self.current_profile)
-                        decky.logger.info(f"SET_TDP: Hardware TDP set to {tdp}W and SAVED to profile")
-                    except Exception as e:
-                        decky.logger.error(f"Failed to save profile after TDP change: {e}")
-                        decky.logger.info(f"SET_TDP: Hardware TDP set to {tdp}W but FAILED to save profile")
-                else:
-                    decky.logger.info(f"SET_TDP: Hardware TDP set to {tdp}W (state tracked, no profile save)")
+                decky.logger.info(f"SET_TDP: Hardware TDP set to {tdp}W (state tracked)")
                 return True
             else:
                 decky.logger.error(f"Failed to set TDP to {tdp}W")
@@ -2146,7 +2146,7 @@ class Plugin:
                         "Skipping --apu-skin-temp (not supported on this CPU family). "
                         "tctl-temp provides thermal protection."
                     )
-            except Exception:
+            except Exception as e:
                 # If detection fails for any reason, default to the legacy
                 # behavior (pass the flag). Power management is safety
                 # critical so we err on the side of attempting the call.
@@ -2608,7 +2608,8 @@ class Plugin:
                 if available_freqs:
                     # Find closest available frequencies
                     closest_min = min(available_freqs, key=lambda x: abs(x - min_freq))
-                    closest_max = max(freq for freq in available_freqs if freq >= closest_min)
+                    higher_freqs = [f for f in available_freqs if f >= closest_min]
+                    closest_max = max(higher_freqs) if higher_freqs else max(available_freqs)
                     
                     # Ensure min <= max
                     if closest_min > closest_max:
@@ -2879,7 +2880,7 @@ class Plugin:
                     if self.cpu_manager._is_passive_mode_for_epp():
                         governor = "schedutil"
                         decky.logger.info("amd-pstate passive mode: using schedutil instead of powersave for dynamic scaling within freq cap")
-                except Exception:
+                except Exception as e:
                     pass  # Fall through to normal governor setting
 
             # Get available governors from sysfs (the authoritative source)
@@ -3056,7 +3057,7 @@ class Plugin:
             return False
 
     async def get_tdp_limits(self) -> Dict[str, int]:
-        """Get current TDP limits"""
+        """Get cached TDP limits. Replaced by the async version below that queries device_info."""
         return self.tdp_limits
 
     async def set_tdp_limits(self, min_tdp: int, max_tdp: int) -> bool:
@@ -3337,7 +3338,7 @@ class Plugin:
                     if processor_support_available:
                         try:
                             profile_data["tdp"] = get_processor_default_tdp()
-                        except Exception:
+                        except Exception as e:
                             profile_data["tdp"] = self.tdp_limits.get("max", 25)
                     else:
                         profile_data["tdp"] = self.tdp_limits.get("max", 25)
@@ -3782,7 +3783,7 @@ class Plugin:
                     limits["min"] = int(f.read().strip()) // 1000  # Convert to MHz
                 with open("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq", "r") as f:
                     limits["max"] = int(f.read().strip()) // 1000  # Convert to MHz
-            except Exception:
+            except Exception as e:
                 pass
                 
             return limits
@@ -3902,12 +3903,17 @@ class Plugin:
             return 1600
 
     async def get_current_cpu_boost(self) -> bool:
-        """Get current CPU boost status"""
+        """Get current CPU boost status (supports AMD and Intel)."""
         try:
             boost_path = "/sys/devices/system/cpu/cpufreq/boost"
             if os.path.exists(boost_path):
                 with open(boost_path, "r") as f:
                     return f.read().strip() == "1"
+            # Intel: /sys/devices/system/cpu/intel_pstate/no_turbo (1 = turbo disabled)
+            intel_path = "/sys/devices/system/cpu/intel_pstate/no_turbo"
+            if os.path.exists(intel_path):
+                with open(intel_path, "r") as f:
+                    return f.read().strip() == "0"
             return self.current_profile.get("cpuBoost", True)
         except Exception as e:
             decky.logger.error(f"Failed to get CPU boost status: {e}")
@@ -4167,7 +4173,7 @@ class Plugin:
                     with open(control_file, "r") as f:
                         status = f.read().strip()
                         pci_devices[device_name] = status == "auto"
-                except Exception:
+                except Exception as e:
                     pass
             return pci_devices
         except Exception as e:
@@ -4199,7 +4205,7 @@ class Plugin:
                         device_class = f.read().strip()
                     if device_class in EXCLUDED_CLASSES:
                         continue
-                except Exception:
+                except Exception as e:
                     pass
                 
                 total_count += 1
@@ -4208,7 +4214,7 @@ class Plugin:
                     with open(control_file, "w") as f:
                         f.write(value)
                     success_count += 1
-                except Exception:
+                except Exception as e:
                     pass
             
             decky.logger.info(f"PCI runtime PM: {success_count}/{total_count} devices set to {'auto' if enable else 'on'}")
@@ -4327,7 +4333,7 @@ class Plugin:
                                 should_exclude = True
                                 break
                     
-                except Exception:
+                except Exception as e:
                     should_exclude = True  # Exclude if we can't read device info
                 
                 # Only include non-excluded devices in the status
@@ -4336,7 +4342,7 @@ class Plugin:
                         with open(control_file, "r") as f:
                             control = f.read().strip()
                             usb_devices[device_name] = (control == "auto")
-                    except Exception:
+                    except Exception as e:
                         continue
                     
             return usb_devices
@@ -5120,7 +5126,7 @@ class Plugin:
 
             try:
                 is_newer = version.parse(latest_version) > version.parse(current_version)
-            except Exception:
+            except Exception as e:
                 is_newer = latest_version != current_version
 
             if not is_newer:
@@ -5807,7 +5813,7 @@ class Plugin:
                     # Detect AC power state change
                     try:
                         ac = await self.get_ac_power_status()
-                    except Exception:
+                    except Exception as e:
                         ac = True  # safe default
 
                     ac_changed = (self._last_ac_power_state is not None and

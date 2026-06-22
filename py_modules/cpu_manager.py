@@ -269,6 +269,8 @@ class CPUManager:
             decky_plugin.logger.error(f"Failed to get current governor: {e}")
         
         return None
+    
+    def _is_passive_mode_for_epp(self) -> bool:
         """Check if we switched amd-pstate-epp to passive mode for boost-disable enforcement."""
         try:
             if self._scaling_driver != ScalingDriver.AMD_PSTATE_EPP:
@@ -277,8 +279,8 @@ class CPUManager:
             return current_mode == "passive"
         except Exception:
             return False
-    
-    # Energy Performance Preference (EPP) Management
+
+   # Energy Performance Preference (EPP) Management
     def get_available_epp_options(self) -> List[str]:
         """Get available EPP options"""
         try:
