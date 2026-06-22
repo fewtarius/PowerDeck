@@ -1995,24 +1995,15 @@ class Plugin:
             # On SteamFork 3.8+ and SteamOS 3.5+, steamos-manager provides
             # the canonical power management interface. It coordinates with
             # amd_pmf natively, so no ryzenadj supplement is needed.
-            if self.steamos_manager_available:
+            # When PowerDeck holds the power subsystem claim, skip
+            # steamos-manager entirely - RootManager Set* methods are
+            # no-ops while claimed. PowerDeck drives the hardware directly
+            # via its own device controller / sysfs / ryzenadj path.
+            if self.steamos_manager_available and not hasattr(self, '_external_manager_token'):
                 steamos_success = await self.set_tdp_via_steamos_manager(tdp)
                 if steamos_success:
-                    # When the power subsystem is claimed (e.g. by
-                    # PowerDeck itself via ExternalManager1), the
-                    # RootManager SetTdpLimit method is a no-op that
-                    # returns success. If we hold the claim, don't
-                    # trust the DBus return value - fall through to
-                    # the device controller for actual TDP control.
-                    if hasattr(self, '_external_manager_token'):
-                        decky.logger.info(
-                            "Power subsystem claimed by PowerDeck; "
-                            "skipping SteamOS Manager TDP (no-op while "
-                            "claimed), falling through to device controller"
-                        )
-                    else:
-                        decky.logger.info(f"TDP set to {tdp}W via SteamOS Manager (primary)")
-                        success = True
+                    decky.logger.info(f"TDP set to {tdp}W via SteamOS Manager (primary)")
+                    success = True
                 else:
                     decky.logger.warning("SteamOS Manager TDP failed, falling back to device controller")
             
@@ -3423,8 +3414,10 @@ class Plugin:
             if "cpuBoost" in profile_data:
                 total_operations += 1
                 try:
-                    # Prefer SteamOS Manager for CPU boost on supported systems
-                    if self.steamos_manager_available:
+                    # Prefer SteamOS Manager for CPU boost on supported systems,
+                    # but skip it when we hold the power claim (all DBus Set*
+                    # methods are no-ops while claimed - go directly to hardware).
+                    if self.steamos_manager_available and not hasattr(self, '_external_manager_token'):
                         boost_success = await self.set_cpu_boost_via_steamos_manager(profile_data["cpuBoost"])
                     else:
                         boost_success = await self.set_cpu_boost(profile_data["cpuBoost"])
@@ -3433,25 +3426,6 @@ class Plugin:
                         decky.logger.info(f"Applied CPU boost: {profile_data['cpuBoost']}")
                     else:
                         decky.logger.warning(f"Failed to apply CPU boost: {profile_data['cpuBoost']}")
-                    # When the power subsystem is claimed by an external
-                    # manager (e.g. PowerDeck itself), the RootManager
-                    # DBus Set* methods return success without actually
-                    # writing to sysfs. Verify the file after a
-                    # "successful" DBus call and fall back to direct
-                    # sysfs write if the value didn't take effect.
-                    if self.steamos_manager_available and boost_success:
-                        actual_boost = await self.get_current_cpu_boost()
-                        if actual_boost != profile_data["cpuBoost"]:
-                            decky.logger.warning(
-                                "CPU boost DBus call returned success but "
-                                "sysfs shows %s (expected %s); "
-                                "falling back to direct sysfs write",
-                                actual_boost, profile_data["cpuBoost"],
-                            )
-                            boost_success = await self.set_cpu_boost(profile_data["cpuBoost"])
-                            if not boost_success:
-                                decky.logger.warning("CPU boost sysfs fallback also failed")
-                                success_count -= 1  # Un-count the false success from DBus
                 except Exception as e:
                     decky.logger.error(f"Error applying CPU boost: {e}")
             
@@ -3532,20 +3506,10 @@ class Plugin:
                     current_governor = self.cpu_manager.get_current_governor()
                     if current_governor == "performance" and epp_governor != "performance":
                         decky.logger.info(f"Active mode: temporarily setting governor to powersave to allow EPP change")
-                        if self.steamos_manager_available:
+                        if self.steamos_manager_available and not hasattr(self, '_external_manager_token'):
                             sm_ok = await self.set_governor_via_steamos_manager("powersave")
                             if not sm_ok:
                                 await self.set_power_governor("powersave")
-                            elif hasattr(self, 'cpu_manager') and self.cpu_manager:
-                                actual = self.cpu_manager.get_current_governor()
-                                if actual != "powersave":
-                                    decky.logger.warning(
-                                        "Governor DBus call returned success but "
-                                        "sysfs shows %s (expected powersave); "
-                                        "falling back to direct sysfs write",
-                                        actual,
-                                    )
-                                    await self.set_power_governor("powersave")
                         else:
                             await self.set_power_governor("powersave")
                 
@@ -3553,21 +3517,12 @@ class Plugin:
                 if "governor" in profile_data or "powerGovernor" in profile_data:
                     total_operations += 1
                     try:
-                        # Prefer SteamOS Manager for governor on supported systems
-                        if self.steamos_manager_available:
+                        # Prefer SteamOS Manager for governor on supported systems,
+                        # but skip it when we hold the power claim (no-ops while claimed).
+                        if self.steamos_manager_available and not hasattr(self, '_external_manager_token'):
                             governor_success = await self.set_governor_via_steamos_manager(governor)
                             if not governor_success:
                                 governor_success = await self.set_power_governor(governor)
-                            elif hasattr(self, 'cpu_manager') and self.cpu_manager:
-                                actual = self.cpu_manager.get_current_governor()
-                                if actual != governor:
-                                    decky.logger.warning(
-                                        "Governor DBus call returned success but "
-                                        "sysfs shows %s (expected %s); "
-                                        "falling back to direct sysfs write",
-                                        actual, governor,
-                                    )
-                                    governor_success = await self.set_power_governor(governor)
                         else:
                             governor_success = await self.set_power_governor(governor)
                         if governor_success:
@@ -3610,8 +3565,10 @@ class Plugin:
                 total_operations += 1
                 try:
                     gpu_mode = profile_data["gpuMode"]
-                    # Prefer SteamOS Manager for GPU performance level on supported systems
-                    if self.steamos_manager_available:
+                    # Prefer SteamOS Manager for GPU performance level on
+                    # supported systems, but skip it when we hold the
+                    # power claim (no-ops while claimed).
+                    if self.steamos_manager_available and not hasattr(self, '_external_manager_token'):
                         # Map PowerDeck GPU modes to steamos-manager performance levels
                         # "performance" maps to "high" for SteamOS Manager (DPM "high").
                         # Only safe on JELOS due to the AMD power_dpm_force_performance_level
@@ -3629,20 +3586,6 @@ class Plugin:
                         gpu_success = await self.set_gpu_performance_via_steamos_manager(gpu_level)
                         if not gpu_success:
                             gpu_success = await self.set_gpu_mode(gpu_mode)
-                        else:
-                            # When the power subsystem is claimed, the
-                            # RootManager DBus call returns success
-                            # without writing to DPM. Verify and fall
-                            # back to direct sysfs if needed.
-                            actual_gpu_mode = await self.get_current_gpu_mode()
-                            if actual_gpu_mode != gpu_mode:
-                                decky.logger.warning(
-                                    "GPU mode DBus call returned success but "
-                                    "sysfs shows %s (expected %s); "
-                                    "falling back to direct sysfs write",
-                                    actual_gpu_mode, gpu_mode,
-                                )
-                                gpu_success = await self.set_gpu_mode(gpu_mode)
                     else:
                         # Refuse "performance" on non-JELOS systems - it would write DPM "high"
                         # and trigger the AMD GPU hang on SteamFork/SteamOS stock kernels.
@@ -3760,8 +3703,9 @@ class Plugin:
             if "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally" and self.rog_ally_native_tdp_enabled:
                 total_operations += 1
                 try:
-                    # Prefer SteamOS Manager for platform profile on supported systems
-                    if self.steamos_manager_available:
+                    # Prefer SteamOS Manager for platform profile on supported
+                    # systems, but skip it when we hold the power claim.
+                    if self.steamos_manager_available and not hasattr(self, '_external_manager_token'):
                         pp_success = await self.set_performance_profile_via_steamos_manager(profile_data["platformProfile"])
                     else:
                         pp_success = await self.set_rog_ally_platform_profile(profile_data["platformProfile"])
@@ -4784,8 +4728,9 @@ class Plugin:
     async def get_tdp_control_mode(self) -> str:
         """Get current TDP control mode (steamos_manager, rog_ally_native, powerdeck, etc.)"""
         try:
-            # SteamOS Manager takes priority when available
-            if self.steamos_manager_available:
+            # When PowerDeck holds the power subsystem claim, it drives the
+            # hardware directly - report "powerdeck" as the active controller.
+            if self.steamos_manager_available and not hasattr(self, '_external_manager_token'):
                 return "steamos_manager"
             if self.device_type == "rog_ally":
                 if self.rog_ally_native_tdp_enabled:
