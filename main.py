@@ -24,7 +24,12 @@ EXTERNAL_MANAGER_DBUS_IFACE = "com.steampowered.SteamOSManager1.ExternalManager1
 EXTERNAL_MANAGER_SUBSYSTEM_POWER = "power"
 EXTERNAL_MANAGER_SUBSYSTEM_FAN = "fan"
 
-# Add py_modules directory to Python path for dynamic imports
+# Add plugin root and py_modules directory to Python path
+# The installed plugin flattens py_modules/ to the plugin root,
+# so we need BOTH paths for repo dev and installed environments.
+plugin_root = os.path.dirname(__file__)
+if plugin_root not in sys.path:
+    sys.path.insert(0, plugin_root)
 py_modules_path = os.path.join(os.path.dirname(__file__), 'py_modules')
 if py_modules_path not in sys.path:
     sys.path.insert(0, py_modules_path)

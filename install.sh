@@ -332,11 +332,25 @@ download_and_install() {
     fi
     
     # Set proper ownership
-    if ! sudo chown -R "$(whoami):$(whoami)" "$PLUGIN_DIR"; then
-        log_warning "Failed to set ownership of plugin directory (this may be okay)"
-    fi
+   if ! sudo chown -R "$(whoami):$(whoami)" "$PLUGIN_DIR"; then
+       log_warning "Failed to set ownership of plugin directory (this may be okay)"
+   fi
     
-    # Install RyzenAdj if available in the package
+    # Ensure dist/ directory exists for Decky Loader v3+ dynamic import()
+    # The decky CLI may flatten dist/ contents to the plugin root during packaging.
+    # Decky Loader v3+ expects the frontend at dist/index.js.
+    if [ ! -d "${PLUGIN_DIR}/dist" ]; then
+        log_info "Creating dist/ directory for Decky Loader v3+ compatibility..."
+        sudo mkdir -p "${PLUGIN_DIR}/dist"
+        if [ -f "${PLUGIN_DIR}/index.js" ]; then
+            sudo cp "${PLUGIN_DIR}/index.js" "${PLUGIN_DIR}/dist/index.js"
+        fi
+        if [ -f "${PLUGIN_DIR}/index.js.map" ]; then
+            sudo cp "${PLUGIN_DIR}/index.js.map" "${PLUGIN_DIR}/dist/index.js.map"
+        fi
+    fi
+   
+   # Install RyzenAdj if available in the package
     install_ryzenadj_if_available "$temp_dir"
 }
 

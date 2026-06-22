@@ -90,11 +90,20 @@ jobs:
             echo "Adding RyzenAdj binary to plugin package..."
             unzip "out/PowerDeck.zip" -d "out/PowerDeck"
             
-            # Create RyzenAdj directory structure in plugin
-            mkdir -p "out/PowerDeck/RyzenAdj/build"
-            cp "RyzenAdj/build/ryzenadj" "out/PowerDeck/RyzenAdj/build/"
+           # Create RyzenAdj directory structure in plugin
+           mkdir -p "out/PowerDeck/RyzenAdj/build"
+           cp "RyzenAdj/build/ryzenadj" "out/PowerDeck/RyzenAdj/build/"
             
-            # Also copy install script
+            # Decky CLI may flatten dist/ to root. Decky Loader v3+ expects
+            # the frontend at dist/index.js for dynamic import(). Ensure it exists.
+            if [ ! -d "out/PowerDeck/dist" ]; then
+              echo "Preserving dist/ directory for Decky Loader v3+ compatibility..."
+              mkdir -p "out/PowerDeck/dist"
+              cp "out/PowerDeck/index.js" "out/PowerDeck/dist/index.js" 2>/dev/null || true
+              cp "out/PowerDeck/index.js.map" "out/PowerDeck/dist/index.js.map" 2>/dev/null || true
+            fi
+           
+           # Also copy install script
             cp "install-ryzenadj.sh" "out/PowerDeck/" 2>/dev/null || echo "Warning: install-ryzenadj.sh not found"
             
             # Repack the plugin with RyzenAdj
