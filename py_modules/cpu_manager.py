@@ -407,20 +407,26 @@ class CPUManager:
         """Set CPU boost enabled/disabled with proper AMD/Intel handling and frequency limits.
         
     For amd-pstate-epp in active mode: boost=0 is not enforced by the hardware
-    (kernel bug/feature). Instead of switching to passive mode (which increases
-    idle power draw significantly), we rely on EPP=power + powersave governor
-    to autonomously manage frequencies for optimal power efficiency, matching
-    the v1.0.14 behavior that achieved ~5W idle."""
+(kernel ignores scaling_max_freq in active mode). Switch to passive mode
+so the kernel actually honors the frequency cap. Without this the CPU
+runs at full clock speed regardless of the limit, burning 3-5W extra
+under any real workload (the EPP scheduler biases toward lower frequencies
+but does NOT enforce a hard cap)."""
         try:
             boost_success = False
             
             # amd-pstate-epp: Do NOT switch to passive mode for boost disable.
-            # Passive mode with schedutil governor increases idle power from ~5W to ~7.5W.
-            # Active mode with EPP=power + powersave governor achieves the best idle power
-            # by letting the hardware autonomously manage P-states efficiently.
             if self._scaling_driver == ScalingDriver.AMD_PSTATE_EPP:
                 if not enabled:
-                    decky_plugin.logger.info("amd-pstate-epp: boost=0 requested but not enforced in active mode; EPP=power + powersave governor manages frequencies autonomously for optimal power efficiency")
+                    # Switch to passive mode so scaling_max_freq is honoured.
+                    # Active mode ignores the limit; the CPU runs at full clock
+                    # regardless, burning 3-5W extra under any real workload.
+                    self.set_pstate_mode("passive")
+                    decky_plugin.logger.info("amd-pstate-epp: boost=0 -> switched to passive mode for frequency cap enforcement")
+                else:
+                    # Boost enabled: switch back to active for full EPP control.
+                    self.set_pstate_mode("active")
+                    decky_plugin.logger.info("amd-pstate-epp: boost=1 -> switched to active mode for full performance")
             
             # Intel: no_turbo (inverted logic)
             intel_path = "/sys/devices/system/cpu/intel_pstate/no_turbo"
@@ -463,11 +469,10 @@ class CPUManager:
                     decky_plugin.logger.error(f"Per-CPU boost partially failed: {success_count}/{total_attempts} CPUs succeeded")
                     return False
             
-            # For amd-pstate-epp active mode: frequency limits are managed autonomously
-            # by the EPP scheduler. Do NOT set scaling_max_freq as it's ignored in active
-            # mode and switching to passive mode for enforcement increases idle power.
-            # For Intel and other drivers: enforce frequency limits based on boost state.
-            if boost_success and self._scaling_driver != ScalingDriver.AMD_PSTATE_EPP:
+            # AMD P-State EPP: we are now in passive mode when boost is
+            # disabled (see above), so scaling_max_freq is honoured.
+            # Active mode (boost enabled): full range from hardware.
+            if boost_success:
                 freq_range = self.get_cpu_frequency_range()
                 if freq_range:
                     if enabled:
@@ -478,13 +483,30 @@ class CPUManager:
                         if limit_success:
                             decky_plugin.logger.info(f"Set frequency limits to full range for boost enabled")
                     else:
-                        base_freq = freq_range['max_freq_khz']
+                        # Cap at the lowest efficient frequency for battery saving.
+                        # On amd-pstate, use lowest_nonlinear_freq (most efficient
+                        # operating point - 1.1GHz on Z1 Extreme). On other drivers,
+                        # use the base (non-boost) max frequency.
+                        cap_freq = freq_range['max_freq_khz']
+                        try:
+                            nln_path = "/sys/devices/system/cpu/cpu0/cpufreq/amd_pstate_lowest_nonlinear_freq"
+                            if os.path.exists(nln_path):
+                                with open(nln_path, 'r') as f:
+                                    nln = int(f.read().strip())
+                                if nln > 0:
+                                    cap_freq = nln
+                                    decky_plugin.logger.info(
+                                        f"amd-pstate: capping boost-off frequency "
+                                        f"at lowest_nonlinear_freq={nln//1000}MHz"
+                                    )
+                        except Exception:
+                            pass  # fall through to base freq
                         limit_success = self.set_cpu_frequency_limits(
                             min_freq_khz=freq_range['min_freq_khz'],
-                            max_freq_khz=base_freq
+                            max_freq_khz=cap_freq
                         )
                         if limit_success:
-                            decky_plugin.logger.info(f"Set frequency limits to base frequency {base_freq//1000}MHz for boost disabled")
+                            decky_plugin.logger.info(f"Set frequency limits to {cap_freq//1000}MHz for boost disabled")
             
             return boost_success
                 
