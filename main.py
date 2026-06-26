@@ -1982,8 +1982,13 @@ class Plugin:
                     decky.logger.info(f"PowerDeck Backend: No profile found in settings for {game_id}")
             
             # No profile found anywhere
-            decky.logger.info(f"PowerDeck Backend: No profile found for {game_id}, returning current profile")
-            return self.current_profile
+            decky.logger.info(f"PowerDeck Backend: No profile found for {game_id}")
+            # Return None (not self.current_profile) so callers can distinguish
+            # "no saved profile" from "loaded profile". Returning current_profile
+            # here silently masks missing profiles and breaks monitor fallback
+            # paths (e.g. game-specific profile missing -> should fall back to
+            # 00000000_ac/_battery, not silently re-apply the active profile).
+            return None
             
         except Exception as e:
             decky.logger.error(f"PowerDeck Backend: Failed to load profile for {game_id}: {e}")
@@ -5849,18 +5854,52 @@ class Plugin:
 
                     # Determine AC/battery suffix via hardware detection
                     suffix = "_ac" if ac else "_battery"
-                    profile_id = game_id + suffix
+                    # Per-game profile selection (when enabled) or always use
+                    # the base profile (when disabled). When per-game is off,
+                    # every game shares the same 00000000_{ac,battery} profile.
+                    if self.enable_per_game_profiles:
+                        profile_id = game_id + suffix
+                    else:
+                        profile_id = "00000000" + suffix
 
                     # Load the profile (falls back to 00000000 if game-specific missing)
                     profile = await self.load_profile(profile_id)
-                    if not profile:
+                    if not profile and self.enable_per_game_profiles:
                         fallback_id = "00000000" + suffix
                         profile = await self.load_profile(fallback_id)
                         if profile:
                             decky.logger.info(
                                 f"Game monitor: no profile for {profile_id}, "
-                                f"using fallback {fallback_id}"
+                                f"using fallback {fallback_id} and auto-creating game-specific profile"
                             )
+                            # Auto-create the game-specific profile from the
+                            # base so future power switches / game launches
+                            # don't need to fall back again. Gated on
+                            # enable_per_game_profiles so per-game-off devices
+                            # don't accumulate orphan profiles.
+                            try:
+                                game_profile = dict(profile)
+                                game_profile["profileId"] = profile_id
+                                # The filename in save_profile is derived from
+                                # gameId, so the per-power-mode suffix has to be
+                                # included here or the file ends up named just
+                                # "{numeric_id}.json" instead of
+                                # "{numeric_id}_ac.json" / "{numeric_id}_battery.json".
+                                # Convention matches set_game_profile(): the caller
+                                # passes the full profile id (with suffix) as the
+                                # game_id slot.
+                                game_profile["gameId"] = profile_id
+                                # Preserve gameName if set; otherwise use the
+                                # raw id as a placeholder (frontend refines it
+                                # when the user opens the profile UI).
+                                if "gameName" not in game_profile or game_profile["gameName"] in (None, ""):
+                                    # Use the numeric id as a placeholder; frontend
+                                    # refines it once the user opens the profile.
+                                    game_profile["gameName"] = profile_id
+                                await self.save_profile(game_profile)
+                                decky.logger.info(f"Game monitor: auto-created {profile_id} from {fallback_id}")
+                            except Exception as save_err:
+                                decky.logger.warning(f"Game monitor: failed to auto-create {profile_id}: {save_err}")
 
                     if profile:
                         await self.apply_profile(profile)
