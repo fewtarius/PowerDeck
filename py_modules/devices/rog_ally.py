@@ -615,23 +615,78 @@ class ROGAllyController:
             decky_plugin.logger.error(f"Invalid fan ID: {fan_id} (must be 1 or 2)")
             return False
         
-        if mode not in [0, 2]:
+        if mode not in (0, 2):
             decky_plugin.logger.error(f"Invalid fan mode: {mode} (must be 0=Manual or 2=Auto)")
             return False
-        
+
+        # The ROG Ally firmware exposes two fan control surfaces:
+        #
+        #   1. /sys/devices/platform/asus-nb-wmi/hwmon/hwmon7 (asus) -
+        #      "pwm1_enable" / "pwm2_enable". Values:
+        #        0 = Manual (firmware drives fan at 100% PWM, no duty writeback)
+        #        2 = Automatic (firmware/EC controls fan from temp)
+        #      There is NO pwm1/pwm2 duty file on this surface, so writing
+        #      mode=0 gives the user zero actual control - it just pins
+        #      the fan to maximum and burns ~1-2W per fan of battery on
+        #      top of normal operation.
+        #
+        #   2. /sys/devices/platform/asus-nb-wmi/hwmon/hwmon8
+        #      (asus_custom_fan_curve) - exposes pwm1_enable plus 8
+        #      curve points (temp -> pwm duty). Values:
+        #        1 = Manual curve (firmware follows the 8 user-set points)
+        #        2 = Automatic curve (curve is always used)
+        #      This is the only path that gives the user real control
+        #      over fan speed on this device.
+        #
+        # To avoid the "Manual pins fans at 100%" footgun we route mode=0
+        # to the custom-curve interface (hwmon8 pwm1_enable=1) so the
+        # firmware follows the curve points instead of going to max.
+        # mode=2 (Auto) is written to the basic surface so the firmware
+        # takes over completely.
+
+        fan_name = "CPU" if fan_id == 1 else "GPU"
+        pwm_file = WMI_FAN1_PWM if fan_id == 1 else WMI_FAN2_PWM
+
+        if mode == 0:
+            # Manual -> custom curve. The curve points themselves are not
+            # touched here; whatever the user (or firmware defaults) wrote
+            # to hwmon8 pwm{1,2}_auto_point{N}_{pwm,temp} is what the
+            # firmware follows. If the user has never set a curve, the
+            # existing points (read-only defaults from the firmware) are
+            # used.
+            #
+            # Order matters: the basic-asus surface (hwmon7) overrides the
+            # custom-curve surface (hwmon8) when set to Manual (0) and
+            # pins the fan at 100% PWM. We have to flip hwmon7 to Auto
+            # (2) FIRST so the EC releases the 100% lockout, then set
+            # hwmon8 to Manual (1) for the curve to actually drive the
+            # fan. Setting them in the opposite order leaves the fan
+            # stuck at max regardless of the curve points.
+            if self.hwmon_path:
+                basic_path = os.path.join(self.hwmon_path, pwm_file)
+                self._write_sysfs_value(basic_path, "2")
+            curve_path = os.path.join(WMI_HWMON_BASE, "hwmon8", pwm_file)
+            success = self._write_sysfs_value(curve_path, "1")
+            if success:
+                decky_plugin.logger.info(
+                    f"ROG Ally {fan_name} fan mode set to: Manual "
+                    f"(custom curve via asus_custom_fan_curve, pwm1_enable=1)"
+                )
+            return success
+
+        # mode == 2 (Auto): let the firmware/EC drive the fan from temp.
         if not self.hwmon_path:
             decky_plugin.logger.error("No ASUS hwmon interface available")
             return False
-        
-        pwm_file = WMI_FAN1_PWM if fan_id == 1 else WMI_FAN2_PWM
         pwm_path = os.path.join(self.hwmon_path, pwm_file)
-        
-        success = self._write_sysfs_value(pwm_path, str(mode))
+        success = self._write_sysfs_value(pwm_path, "2")
         if success:
-            fan_name = "CPU" if fan_id == 1 else "GPU"
-            mode_names = {0: 'Manual', 2: 'Auto'}
-            decky_plugin.logger.info(f"ROG Ally {fan_name} fan mode set to: {mode_names[mode]}")
-        
+            decky_plugin.logger.info(f"ROG Ally {fan_name} fan mode set to: Auto")
+        # Clear the custom-curve manual flag so the curve doesn't override
+        # the firmware's auto behaviour. We leave the curve points intact
+        # so flipping back to Manual later keeps the user's curve.
+        curve_path = os.path.join(WMI_HWMON_BASE, "hwmon8", pwm_file)
+        self._write_sysfs_value(curve_path, "2")
         return success
     
     def get_fan_status(self) -> Dict[str, Any]:
