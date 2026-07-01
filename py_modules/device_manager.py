@@ -215,12 +215,12 @@ class DeviceDetector:
         # temperature sensor (tctl only), and TDC/EDC values come back
         # as NaN from ryzenadj. main.py handles both automatically.
 
-        # Nimo Direct N161L - Strix Halo laptop
+        # Nimo Axis N161L - Strix Halo mini-PC
         # DMI product_name: "N161L", sys_vendor: "Nimo Direct INC."
         # Confirmed: 16C/32T Ryzen AI MAX+ 395, default STAPM/PPT 105W,
-        # SMU BIOS interface v25. Battery-powered laptop with MediaTek MT7925.
+        # SMU BIOS interface v25. Battery-powered with MediaTek MT7925.
         profiles['nimo_n161l'] = DeviceProfile(
-            name="Nimo Direct N161L (Strix Halo)",
+            name="Nimo Axis N161L (Strix Halo)",
             cpu_vendor=CPUVendor.AMD,
             tdp_method=TDPMethod.RYZENADJ,
             min_tdp=45,
@@ -404,7 +404,7 @@ class DeviceDetector:
                 # Other AYANEO models — conservative fallback
                 return 'ayaneo_generic'
 
-            # Nimo Direct N161L — Strix Halo mini-PC
+            # Nimo Axis N161L — Strix Halo mini-PC
             # DMI product_name: "N161L", sys_vendor: "Nimo Direct INC."
             if 'nimo' in sys_vendor and 'n161' in product_name:
                 return 'nimo_n161l'

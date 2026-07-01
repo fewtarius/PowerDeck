@@ -92,7 +92,7 @@ This project is licensed under the GNU General Public License v3.0. See the LICE
 
 #### Strix Halo Desktop / Mini-PCs
 - ASUS ROG Flow Z13 (2025) — GZ302
-- Nimo Direct N161L
+- Nimo Axis N161L
 - Framework Desktop
 - Beelink SER9 / GTR9
 - Minisforum AI X1 / MS-A2
