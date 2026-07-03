@@ -844,7 +844,7 @@ class ROGAllyController:
             'available_controls': {
                 'platform_profiles': True,
                 'thermal_policy': True,
-                'fan_control': True,
+                'fan_control': False,  # Disabled - curve interface ignored by EC on ROG Ally/X
                 'battery_management': True,
                 'mcu_powersave': True,
                 'power_limits': True,
