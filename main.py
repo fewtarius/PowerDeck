@@ -1197,6 +1197,63 @@ class Plugin:
                 except Exception as e:
                     decky.logger.info(f"Using generic power management (Strix Halo detection failed: {e})")
             
+            # ── kernel power_profile sysfs interface ──────────────────
+            # Strix Halo kernel patch (0203-amdgpu-power-profile-sysfs)
+            # exposes power_profile/power_dc_limit to override OEM EC
+            # firmware power caps on battery. Detect it once at init.
+            self.has_kernel_power_profile = False
+            self._kernel_pp_profile_path = None
+            self._kernel_pp_dc_limit_path = None
+            try:
+                for card in glob.glob("/sys/class/drm/card*/device/vendor"):
+                    with open(card, "r") as f:
+                        if f.read().strip() == "0x1002":
+                            card_dir = os.path.dirname(card)
+                            pp_path = os.path.join(card_dir, "power_profile")
+                            dc_path = os.path.join(card_dir, "power_dc_limit")
+                            if os.path.exists(pp_path):
+                                self._kernel_pp_profile_path = pp_path
+                                self._kernel_pp_dc_limit_path = dc_path
+                                self.has_kernel_power_profile = True
+                                decky.logger.info(
+                                    f"Kernel power_profile interface available at {card_dir}"
+                                )
+                            break
+            except Exception as e:
+                decky.logger.debug(f"Kernel power_profile detection: {e}")
+            
+            # ── Strix Halo: trigger EnableAllSmuFeatures at init ──────────
+            # The kernel's smu_apply_power_profile() calls EnableAllSmuFeatures
+            # for smu_v13_0_12, which unlocks FCLK DPM (bit 1) disabled by
+            # SMU firmware on APU devices. This is critical for GPU memory
+            # bandwidth scaling on battery.
+            # Write profile=1 then 0 to trigger exactly once at boot.
+            if self.device_type == "strix_halo" and self.has_kernel_power_profile:
+                try:
+                    with open(self._kernel_pp_profile_path, "w") as f:
+                        f.write("1")
+                    await asyncio.sleep(0.1)
+                    with open(self._kernel_pp_profile_path, "w") as f:
+                        f.write("0")
+                    decky.logger.info(
+                        "Strix Halo: EnableAllSmuFeatures triggered via "
+                        "power_profile sysfs (FCLK DPM unlocked)"
+                    )
+                except Exception as e:
+                    decky.logger.warning(
+                        f"Strix Halo SMU feature unlock failed: {e}"
+                    )
+
+            # ── EC POWF detection (Strix Halo handhelds) ──────────────────
+            if self.device_type == "strix_halo":
+                powf_val = await self._check_ec_powf()
+                if powf_val is not None:
+                    self._ec_powf_value = powf_val
+                    gate_status = "LOCKED (EC writes blocked)" if powf_val == 0x0A else f"UNLOCKED (0x{powf_val:02X})"
+                    decky.logger.info(f"EC POWF gate: {gate_status}")
+                else:
+                    self._ec_powf_value = None
+
             # TDP limits will be set later from processor database or sysfs detection
             # This ensures all devices use the same system-derived approach
             decky.logger.info(f"Device controller initialized as {self.device_type} - TDP limits will be determined from processor database")
@@ -1228,6 +1285,28 @@ class Plugin:
                         else:
                             return vendor
         except OSError:
+            pass
+        return None
+
+    async def _check_ec_powf(self) -> Optional[int]:
+        """Read EC register 0x01 (POWF gate) on Strix Halo handhelds.
+        
+        POWF controls whether ACPI AML can write to the SMU PM table.
+        - 0x0A: LOCKED (default) - AML SMU writes blocked
+        - 0x01: UNLOCKED - AML can overwrite STAPM to 30W OEM cap
+        
+        Returns the register value as int, or None if ectool unavailable.
+        """
+        try:
+            result = subprocess.run(
+                ["ectool", "-r", "0x01"],
+                capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                match = re.search(r'=\s*(0x[0-9a-fA-F]+)', result.stdout)
+                if match:
+                    return int(match.group(1), 16)
+        except Exception:
             pass
         return None
 
@@ -2193,6 +2272,39 @@ class Plugin:
                         f"AMD TDP set: sustained={tdp}W "
                         f"fast={fast_limit_mw // 1000}W slow={slow_limit_mw // 1000}W"
                     )
+
+                # ── kernel power_profile: override OEM EC battery caps ──
+                # The kernel patch (0203-amdgpu-power-profile-sysfs) adds a
+                # 1-second re-apply loop that fights the OEM EC firmware
+                # which rewrites STAPM via ACPI AML on battery. Writing
+                # power_dc_limit + power_profile=2 arms the kernel's defense.
+                if self.has_kernel_power_profile:
+                    try:
+                        dc_limit_uw = tdp * 1000000  # W -> µW
+                        with open(self._kernel_pp_dc_limit_path, "w") as f:
+                            f.write(str(dc_limit_uw))
+                        # Determine AC status for profile selection
+                        is_ac = await self.get_ac_power_status()
+                        # Strix Halo on battery: use AC profile (1) to
+                        # trigger EnableAllSmuFeatures which unlocks FCLK
+                        # DPM. Without this, GPU bandwidth is severely
+                        # limited on battery. Other devices use DC profile (2).
+                        if self.device_type == "strix_halo" and not is_ac:
+                            profile_val = "1"
+                        else:
+                            profile_val = "0" if is_ac else "2"
+                        with open(self._kernel_pp_profile_path, "w") as f:
+                            f.write(profile_val)
+                        decky.logger.info(
+                            f"kernel power_profile: dc_limit={tdp}W, "
+                            f"profile={profile_val} "
+                            f"({'auto' if is_ac else 'dc re-apply active'})"
+                        )
+                    except Exception as e:
+                        decky.logger.warning(
+                            f"kernel power_profile write failed: {e}"
+                        )
+
                 return True
 
             decky.logger.error(

@@ -20,6 +20,7 @@ __pycache__/
 *~
 
 # AI-assisted working docs (not for source control)
+docs/
 PERFORMANCE_IMPROVEMENTS.md
 ai-assisted/
 
