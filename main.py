@@ -2283,16 +2283,20 @@ class Plugin:
                         dc_limit_uw = tdp * 1000000  # W -> µW
                         with open(self._kernel_pp_dc_limit_path, "w") as f:
                             f.write(str(dc_limit_uw))
-                        # Determine AC status for profile selection
                         is_ac = await self.get_ac_power_status()
-                        # Strix Halo on battery: use AC profile (1) to
-                        # trigger EnableAllSmuFeatures which unlocks FCLK
-                        # DPM. Without this, GPU bandwidth is severely
-                        # limited on battery. Other devices use DC profile (2).
-                        if self.device_type == "strix_halo" and not is_ac:
-                            profile_val = "1"
-                        else:
-                            profile_val = "0" if is_ac else "2"
+                        # Determine AC status for profile selection.
+                        # Profile 0 (auto): EC handles power limits
+                        #   correctly on AC — no kernel intervention needed.
+                        # Profile 2 (dc): kernel re-apply loop fights
+                        #   OEM EC firmware that overwrites STAPM via
+                        #   ACPI AML on battery (~every 1s).
+                        # NOTE: Do NOT use profile 1 (ac) on battery.
+                        #   profile=1 forces max_power_limit, which is
+                        #   the opposite of what you want for battery
+                        #   life. On Strix Halo, the FCLK DPM unlock
+                        #   (EnableAllSmuFeatures) is already triggered
+                        #   once at init — no need to re-trigger here.
+                        profile_val = "0" if is_ac else "2"
                         with open(self._kernel_pp_profile_path, "w") as f:
                             f.write(profile_val)
                         decky.logger.info(
