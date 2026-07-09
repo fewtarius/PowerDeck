@@ -415,18 +415,26 @@ but does NOT enforce a hard cap)."""
         try:
             boost_success = False
             
-            # amd-pstate-epp: Do NOT switch to passive mode for boost disable.
+            # amd-pstate-epp (active mode) ignores scaling_max_freq, so
+            # capping the CPU at 1.1GHz requires switching to passive
+            # mode where schedutil/powersave actually honour the limit.
+            # On Phoenix/Hawk/Strix (Zen 4+) and VanGogh/Rembrandt (Zen 3+)
+            # the kernel cmdline no longer forces amd_pstate=active, so
+            # the system usually boots in passive already; this branch
+            # is the safety net when it does not.
             if self._scaling_driver == ScalingDriver.AMD_PSTATE_EPP:
                 if not enabled:
-                    # Switch to passive mode so scaling_max_freq is honoured.
-                    # Active mode ignores the limit; the CPU runs at full clock
-                    # regardless, burning 3-5W extra under any real workload.
                     self.set_pstate_mode("passive")
-                    decky_plugin.logger.info("amd-pstate-epp: boost=0 -> switched to passive mode for frequency cap enforcement")
+                    decky_plugin.logger.info(
+                        "amd-pstate-epp: boost=0 -> switched to passive mode "
+                        "so scaling_max_freq is honoured (active mode ignores it)"
+                    )
                 else:
-                    # Boost enabled: switch back to active for full EPP control.
                     self.set_pstate_mode("active")
-                    decky_plugin.logger.info("amd-pstate-epp: boost=1 -> switched to active mode for full performance")
+                    decky_plugin.logger.info(
+                        "amd-pstate-epp: boost=1 -> switched to active mode "
+                        "for full EPP-driven performance scaling"
+                    )
             
             # Intel: no_turbo (inverted logic)
             intel_path = "/sys/devices/system/cpu/intel_pstate/no_turbo"

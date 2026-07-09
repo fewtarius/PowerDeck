@@ -511,51 +511,40 @@ class Plugin:
                 decky.logger.error(f"ExternalManager heartbeat loop error: {e}")
 
     async def set_tdp_via_steamos_manager(self, tdp: int) -> bool:
+        """Signal jelos-manager / steamos-manager to set the SMU TDP limit.
 
-        """SteamOS Manager SetTdpLimit wrapper. Returns True on success."""
+        The SetTdpLimit DBus call writes to the device TDP backend
+        (asus-armoury on ROG Ally, amdgpu hwmon on Steam Deck). On JELOS
+        / SteamFork the firmware-attribute backend re-applies its values
+        to the SMU every second via amd_pmf, so a successful write
+        sticks in every platform profile.
+
+        The previous version force-wrote ACPI=performance to sysfs
+        before the TDP call. That workaround was a hack for the old
+        jelos-manager behaviour where SetTdpLimit was a no-op unless
+        the platform profile was performance. The jelos-manager TOML
+        gate has been removed, so the workaround is no longer needed
+        and is harmful here: it races with set_performance_profile_*
+        running later in apply_profile, and the platform profile write
+        always wins, so the user TDP is silently ignored.
+        """
         try:
-            ACPI_PLATFORM_PROFILE = '/sys/firmware/acpi/platform_profile'
-            ACPI_PLATFORM_CHOICES = '/sys/firmware/acpi/platform_profile_choices'
-            
-            # First, check and set the ACPI platform profile directly
-            # steamos-manager SetPerformanceProfile fails when transitioning
-            # from "custom" profile, so we do it directly here
-            try:
-                if os.path.exists(ACPI_PLATFORM_PROFILE):
-                    current_profile = open(ACPI_PLATFORM_PROFILE, 'r').read().strip()
-                    
-                    # Only change if not already "performance"
-                    if current_profile != "performance":
-                        decky.logger.info(f"ACPI platform profile transitioning from '{current_profile}' to 'performance'")
-                        
-                        # Get valid choices
-                        valid_profiles = []
-                        if os.path.exists(ACPI_PLATFORM_CHOICES):
-                            valid_profiles = open(ACPI_PLATFORM_CHOICES, 'r').read().strip().split()
-                        
-                        if "performance" in valid_profiles:
-                            with open(ACPI_PLATFORM_PROFILE, 'w') as f:
-                                f.write("performance\n")
-                                f.flush()
-                                os.fsync(f.fileno())
-                            decky.logger.info("ACPI platform profile set to 'performance' directly")
-            except Exception as e:
-                decky.logger.warning(f"Failed to set ACPI platform profile directly: {e}")
-            
-            # Now call steamos-manager (should succeed since profile is already "performance")
+            # Force jelos-manager into performance only as a
+            # coordination hint (already a no-op when the power
+            # subsystem is claimed). The real write is SetTdpLimit.
             profile_success = self._steamos_manager_call("SetPerformanceProfile", "performance")
             if not profile_success:
-                decky.logger.warning("SteamOS Manager: Failed to set 'performance' profile, TDP limiting may not be active")
-            
-            # Set TDP limit (works after performance profile is set)
+                decky.logger.warning("SteamOS Manager: Failed to set performance profile, TDP limiting may not be active")
+
             success = self._steamos_manager_call("SetTdpLimit", tdp)
-            
+
             if success:
                 decky.logger.info(f"TDP set to {tdp}W via SteamOS Manager")
             return success
         except Exception as e:
             decky.logger.error(f"SteamOS Manager TDP set failed: {e}")
             return False
+
 
     async def set_cpu_boost_via_steamos_manager(self, enabled: bool) -> bool:
         """Set CPU boost state via steamos-manager DBus interface."""
@@ -591,68 +580,71 @@ class Plugin:
             return False
 
     async def set_performance_profile_via_steamos_manager(self, profile: str) -> bool:
+        """steamos-manager profile: low-power | balanced | performance.
 
-        """steamos-manager profile: low-power | balanced | performance."""
+        The previous version wrote both the ASUS WMI and ACPI
+        platform-profile sysfs paths directly and then called DBus
+        SetPerformanceProfile. The DBus call was a no-op (jelos-manager
+        has its own platform-profile driver and ignores these sysfs
+        writes), and our direct writes would race with jelos-manager,
+        causing platform-profile bounces that re-asserted EC defaults
+        for STAPM/PPT.
+
+        Now: let jelos-manager own the platform-profile transition
+        entirely via the DBus call. If the call fails (claim held,
+        no jelos-manager, etc.), fall back to a single ACPI sysfs
+        write so the user still gets their chosen profile.
+        """
         try:
-            ACPI_PLATFORM_PROFILE = '/sys/firmware/acpi/platform_profile'
-            ASUS_PLATFORM_PROFILE = '/sys/devices/platform/asus-nb-wmi/platform-profile/platform-profile-1/profile'
-            ACPI_PLATFORM_CHOICES = '/sys/firmware/acpi/platform_profile_choices'
-            
-            # Map profile names to steamos-manager compatible values
             profile_map = {
                 "performance": "performance",
                 "balanced": "balanced",
                 "battery_saver": "low-power",
                 "power-saver": "low-power",
                 "low-power": "low-power",
-                "game": "performance",  # "game" is not valid, map to "performance"
-                "custom": "balanced",  # "custom" is not valid, map to "balanced"
+                "game": "performance",
+                "custom": "balanced",
             }
             mapped_profile = profile_map.get(profile, profile)
-            
-            # Write to both ACPI and ASUS platform profiles
-            # Writing to ASUS profile syncs to ACPI, but we write both for reliability
-            profile_paths = [
-                (ASUS_PLATFORM_PROFILE, "ASUS"),
-                (ACPI_PLATFORM_PROFILE, "ACPI"),
-            ]
-            
-            for profile_path, profile_name in profile_paths:
-                try:
-                    if os.path.exists(profile_path):
-                        # Read current value
-                        current_value = open(profile_path, 'r').read().strip()
-                        
-                        if current_value != mapped_profile:
-                            # Check if value is valid (for ACPI profile)
-                            if profile_name == "ACPI":
-                                valid_profiles = []
-                                if os.path.exists(ACPI_PLATFORM_CHOICES):
-                                    valid_profiles = open(ACPI_PLATFORM_CHOICES, 'r').read().strip().split()
-                                
-                                if valid_profiles and mapped_profile not in valid_profiles:
-                                    decky.logger.warning(f"Invalid {profile_name} profile '{mapped_profile}', available: {valid_profiles}")
-                                    continue
-                            
-                            decky.logger.info(f"{profile_name} platform profile: '{current_value}' -> '{mapped_profile}'")
-                            with open(profile_path, 'w') as f:
-                                f.write(mapped_profile + "\n")
-                                f.flush()
-                                os.fsync(f.fileno())
-                        else:
-                            decky.logger.info(f"{profile_name} platform profile already set to '{mapped_profile}'")
-                except Exception as e:
-                    decky.logger.warning(f"Failed to set {profile_name} platform profile: {e}")
-            
-            # Call steamos-manager to coordinate with amd_pmf
+
+            # Try the DBus call first; jelos-manager coordinates
+            # with amd_pmf / asus-wmi internally so the SMU react
+            # correctly.
             success = self._steamos_manager_call("SetPerformanceProfile", mapped_profile)
             if success:
-                decky.logger.info(f"Performance profile set to {mapped_profile} (mapped from {profile}) via SteamOS Manager")
-            return success
+                decky.logger.info(
+                    f"Performance profile set to {mapped_profile} "
+                    f"(mapped from {profile}) via SteamOS Manager"
+                )
+                return True
+
+            # Fallback: write the ACPI sysfs path directly. We do not
+            # touch the ASUS WMI path because it races with the
+            # amd-pmf platform-profile driver on JELOS / SteamFork.
+            acpi_path = "/sys/firmware/acpi/platform_profile"
+            if os.path.exists(acpi_path):
+                current_value = open(acpi_path, "r").read().strip()
+                if current_value != mapped_profile:
+                    choices_path = "/sys/firmware/acpi/platform_profile_choices"
+                    if os.path.exists(choices_path):
+                        valid = open(choices_path, "r").read().strip().split()
+                        if valid and mapped_profile not in valid:
+                            decky.logger.warning(
+                                f"Invalid platform profile {mapped_profile!r}, available: {valid}"
+                            )
+                            return False
+                    decky.logger.info(
+                        f"ACPI platform profile: {current_value!r} -> {mapped_profile!r} (DBus fallback)"
+                    )
+                    with open(acpi_path, "w") as f:
+                        f.write(mapped_profile + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+            return True
         except Exception as e:
             decky.logger.error(f"SteamOS Manager performance profile set failed: {e}")
             return False
-        
+
     async def _main(self):
         decky.logger.info("PowerDeck initializing...")
 
@@ -2283,19 +2275,17 @@ class Plugin:
                         dc_limit_uw = tdp * 1000000  # W -> µW
                         with open(self._kernel_pp_dc_limit_path, "w") as f:
                             f.write(str(dc_limit_uw))
+                        # AC -> 0 (auto), battery -> 2 (DC re-apply). The
+                        # kernel's 1-second re-apply loop fights the OEM
+                        # EC firmware which rewrites STAPM via ACPI AML
+                        # on battery; writing power_profile=2 arms that
+                        # defense. We do not use power_profile=1 anywhere:
+                        # the earlier Strix Halo "use AC profile on
+                        # battery" workaround was incorrect and has been
+                        # removed - it bypassed the kernel's intended
+                        # battery-mode behaviour and was a source of
+                        # confusing GPU bandwidth regressions.
                         is_ac = await self.get_ac_power_status()
-                        # Determine AC status for profile selection.
-                        # Profile 0 (auto): EC handles power limits
-                        #   correctly on AC — no kernel intervention needed.
-                        # Profile 2 (dc): kernel re-apply loop fights
-                        #   OEM EC firmware that overwrites STAPM via
-                        #   ACPI AML on battery (~every 1s).
-                        # NOTE: Do NOT use profile 1 (ac) on battery.
-                        #   profile=1 forces max_power_limit, which is
-                        #   the opposite of what you want for battery
-                        #   life. On Strix Halo, the FCLK DPM unlock
-                        #   (EnableAllSmuFeatures) is already triggered
-                        #   once at init — no need to re-trigger here.
                         profile_val = "0" if is_ac else "2"
                         with open(self._kernel_pp_profile_path, "w") as f:
                             f.write(profile_val)
@@ -3846,14 +3836,26 @@ class Plugin:
             elif "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally" and not self.rog_ally_native_tdp_enabled:
                 decky.logger.info(f"Skipping platform profile '{profile_data['platformProfile']}' - native TDP disabled, ryzenadj manages power limits directly")
 
-            # NOTE: No TDP re-apply needed after platform profile.
-            # When ROG Ally native TDP is enabled, amd_pmf manages TDP limits
-            # and will enforce them based on the platform profile we just set.
-            # When native TDP is disabled, ryzenadj manages TDP directly and
-            # platform profile is skipped to avoid amd_pmf conflicts.
-            # Using both ryzenadj and amd_pmf simultaneously causes register
-            # fights (amd_pmf overrides ryzenadj within 1 second), so they
-            # must be mutually exclusive.
+            # Re-apply TDP after platform profile change.
+            # When the platform profile changes, the OEM EC re-asserts
+            # its own STAPM/PPT defaults (and the amd_pmf platform-profile
+            # driver rewrites them within 1 second). The user-chosen TDP
+            # is lost in that transition, so we set it again to win the
+            # final write. This is a no-op when the platform profile did
+            # not change.
+            if "tdp" in profile_data and "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally" and self.rog_ally_native_tdp_enabled:
+                try:
+                    decky.logger.info(
+                        f"Re-applying TDP {profile_data['tdp']}W after platform profile "
+                        f"change to {profile_data['platformProfile']}"
+                    )
+                    tdp_reapply = await self.set_tdp(profile_data["tdp"])
+                    if tdp_reapply:
+                        decky.logger.info(f"TDP re-applied: {profile_data['tdp']}W (after platform profile change)")
+                    else:
+                        decky.logger.warning(f"TDP re-apply failed: {profile_data['tdp']}W")
+                except Exception as e:
+                    decky.logger.error(f"Error re-applying TDP after platform profile: {e}")
 
             # Calculate success rate
             if total_operations > 0:
