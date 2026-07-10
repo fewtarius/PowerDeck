@@ -505,17 +505,10 @@ class EnhancedSleepWakeManager:
             # 4. Power Management Features Restoration
             await self._restore_power_management_features(current_profile)
             
-            # 5. Force profile application to ensure complete hardware state
-            # Note: This re-applies settings from steps 1-4, which provides a safety net.
-            try:
-                if hasattr(self.plugin, 'apply_profile'):
-                    profile_success = await self.plugin.apply_profile(current_profile)
-                    if profile_success:
-                        decky.logger.info("Complete profile restoration successful")
-                    else:
-                        restoration_success = False
-            except Exception as _e:
-                restoration_success = False
+            # NOTE: The final apply_profile() call was removed to avoid double-applying
+            # settings that are already restored individually above (GPU mode, TDP,
+            # CPU params, power management). The individual restores are sufficient
+            # and avoid redundant sysfs writes.
         
         except Exception as _e:
             restoration_success = False
@@ -556,8 +549,9 @@ class EnhancedSleepWakeManager:
                     await self.plugin.set_epp(epp)
                     
         except Exception as _e:
-            # Silently handle CPU parameter restoration errors to prevent NVMe wake
-            pass
+            # Log at debug level to avoid NVMe wake from ERROR/WARNING logs,
+            # but still surface the issue for debugging
+            decky.logger.debug(f"CPU parameter restoration error: {_e}")
     
     async def _restore_power_management_features(self, current_profile: Dict[str, Any]):
         """Restore power management features (minimal logging to prevent NVMe wake)"""
@@ -587,8 +581,9 @@ class EnhancedSleepWakeManager:
                     await self.plugin.set_wifi_power_save(wifi_power_save)
                     
         except Exception as _e:
-            # Silently handle power management restoration errors to prevent NVMe wake
-            pass
+            # Log at debug level to avoid NVMe wake from ERROR/WARNING logs,
+            # but still surface the issue for debugging
+            decky.logger.debug(f"Power management restoration error: {_e}")
     
     async def _save_state_comparison(self, pre_state: Dict, current_state: Dict, final_state: Dict, 
                                   initial_differences: List[str], final_differences: List[str]):

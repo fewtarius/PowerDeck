@@ -4,6 +4,7 @@ Handles power profiles, per-game settings, and preset configurations
 """
 import json
 import os
+import time
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, asdict, field
 from enum import Enum
@@ -105,8 +106,28 @@ class ProfileManager:
                 with open(self.settings_file, 'r') as f:
                     self._settings = json.load(f)
                     
+        except (json.JSONDecodeError, OSError) as e:
+            # Corrupted or unreadable file - backup and reset
+            decky_plugin.logger.error(f"Failed to load profile data (corrupted file?): {e}")
+            # Backup corrupted files before resetting
+            import shutil
+            timestamp = int(time.time())
+            if os.path.exists(self.profiles_file):
+                backup_profiles = f"{self.profiles_file}.corrupt.{timestamp}"
+                shutil.move(self.profiles_file, backup_profiles)
+                decky_plugin.logger.info(f"Backed up corrupted profiles file to {backup_profiles}")
+            if os.path.exists(self.settings_file):
+                backup_settings = f"{self.settings_file}.corrupt.{timestamp}"
+                shutil.move(self.settings_file, backup_settings)
+                decky_plugin.logger.info(f"Backed up corrupted settings file to {backup_settings}")
+            self._profiles = {}
+            self._game_profiles = {}
+            self._settings = {}
         except Exception as e:
-            decky_plugin.logger.error(f"Failed to load profile data: {e}")
+            # Unexpected error - log and reset
+            decky_plugin.logger.error(f"Unexpected error loading profile data: {e}")
+            import traceback
+            traceback.print_exc()
             self._profiles = {}
             self._game_profiles = {}
             self._settings = {}

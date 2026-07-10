@@ -1289,7 +1289,7 @@ const Content: React.FC = () => {
               debug.log(`Router reports default, but we had game ${currentGame.name}. Waiting to confirm game exit...`);
               
               // Wait 2 seconds and check again
-              setTimeout(async () => {
+              gameExitTimeoutRef.current = setTimeout(async () => {
                 const confirmGameInfo = getCurrentGameInfo();
                 if (confirmGameInfo && (confirmGameInfo.id === "default" || confirmGameInfo.id === "00000000")) {
                   debug.log("Game exit confirmed after delay check, switching to handheld profile");
@@ -1427,48 +1427,55 @@ const Content: React.FC = () => {
       } catch (error) {
         debug.error('Unified monitoring failed:', error);
       }
-    }, 7500); // Single 7.5-second interval for all monitoring - balance of responsiveness vs efficiency
+   }, 7500); // Single 7.5-second interval for all monitoring - balance of responsiveness vs efficiency
 
-    // Get initial states
-    getAcPowerStatus().then(acStatus => {
-      setAcPower(acStatus);
-      setActiveProfile(acStatus ? 'ac' : 'battery');
-    }).catch(debug.error);
-    
-    if (perGameProfilesEnabled) {
-      // Initial game detection using frontend Router  
-      const initialGameInfo = getCurrentGameInfo();
-      if (initialGameInfo && initialGameInfo.id !== "default") {
-        debug.log(`Initial game detected: ${initialGameInfo.name} (${initialGameInfo.id})`);
-        setCurrentGame(initialGameInfo);
-      }
+   // Get initial states
+   getAcPowerStatus().then(acStatus => {
+     setAcPower(acStatus);
+     setActiveProfile(acStatus ? 'ac' : 'battery');
+   }).catch(debug.error);
+   
+   if (perGameProfilesEnabled) {
+     // Initial game detection using frontend Router  
+     const initialGameInfo = getCurrentGameInfo();
+     if (initialGameInfo && initialGameInfo.id !== "default") {
+       debug.log(`Initial game detected: ${initialGameInfo.name} (${initialGameInfo.id})`);
+       setCurrentGame(initialGameInfo);
+     }
+   }
+
+  return () => {
+    debug.log("Stopping unified monitoring system");
+    clearInterval(unifiedMonitoringInterval);
+    if (gameExitTimeoutRef.current) {
+      clearTimeout(gameExitTimeoutRef.current);
+      gameExitTimeoutRef.current = null;
     }
+  };
+ }, [perGameProfilesEnabled]);
 
-    return () => {
-      debug.log("Stopping unified monitoring system");
-      clearInterval(unifiedMonitoringInterval);
-    };
-  }, [perGameProfilesEnabled, currentGame.id, currentGame.name, currentProfile, acPower]);
+ // Track the game-exit confirmation timeout so we can cancel it on unmount/cleanup
+  const gameExitTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Single point of change: backend re-runs the full set_* sequence so
-  // dependent fields (governor<->EPP, SMT<->cores) stay in sync.
-  const applySetting = useCallback(async (
-    profileUpdate: Partial<PowerProfile>,
-    settingName: string
-  ) => {
-    try {
-      const newProfile = { ...currentProfile, ...profileUpdate };
-      setCurrentProfile(newProfile);
-      const success = await updateAndApplySettings(newProfile);
+ // Single point of change: backend re-runs the full set_* sequence so
+ // dependent fields (governor<->EPP, SMT<->cores) stay in sync.
+ const applySetting = useCallback(async (
+   profileUpdate: Partial<PowerProfile>,
+   settingName: string
+ ) => {
+   try {
+      // Pass partial directly to backend; it merges with current profile
+      // atomically to avoid stale-closure race when multiple toggles fire.
+      const success = await updateAndApplySettings(profileUpdate);
       if (success) {
-        setLastAppliedProfile(newProfile);
+        setLastAppliedProfile(prev => ({ ...prev, ...profileUpdate }));
       } else {
         setError(`Failed to apply ${settingName}`);
       }
     } catch (err) {
       setError(`Error applying ${settingName}: ${err}`);
     }
-  }, [currentProfile]);
+  }, []);
 
   // Hardware control functions
   const handleTdpChange = useCallback(async (value: number) => {

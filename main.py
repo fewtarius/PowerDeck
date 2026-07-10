@@ -1550,9 +1550,6 @@ class Plugin:
 
     async def get_ac_power_status_with_retry(self, max_retries: int = 5, delay_seconds: float = 2.0) -> bool:
         """Get AC power status with retry logic for initialization during boot"""
-        import asyncio
-        import glob
-        
         for attempt in range(max_retries):
             try:
                 decky.logger.info(f"AC power detection attempt {attempt + 1}/{max_retries}")
@@ -1815,10 +1812,6 @@ class Plugin:
                 except Exception as e:
                     decky.logger.error(f"Failed to apply original hardware default profile during initialization: {e}")
                 
-            # Enable per-game profiles by default (as per cleanup requirements)
-            self.enable_per_game_profiles = True
-            debug_log(f"Enabled per-game profiles by default: {self.enable_per_game_profiles}")
-            
             # ROG Ally native TDP support - this is loaded from saved settings, not reset here
             debug_log(f"ROG Ally native TDP support loaded from settings: {self.rog_ally_native_tdp_enabled}")
             
@@ -1948,10 +1941,6 @@ class Plugin:
     async def save_profile(self, profile_data: Dict[str, Any]) -> bool:
         """Save a power profile to individual JSON file per profile ID"""
         try:
-            import sys
-            import os
-            import json
-            
             game_id = profile_data.get("gameId", "00000000")
             profile_copy = dict(profile_data)
             if "gameId" in profile_copy:
@@ -2005,8 +1994,6 @@ class Plugin:
         """Load a power profile from individual JSON file per profile ID"""
         try:
             import os
-            import json
-            
             decky.logger.info(f"PowerDeck Backend: Loading profile for {game_id}")
             
             # Try to load from individual JSON file first (unified schema)
@@ -3598,10 +3585,13 @@ class Plugin:
                     if mapped_governor and mapped_governor != governor:
                         decky.logger.info(f"Guided mode: mapping platform profile '{platform_profile}' to governor '{mapped_governor}' (was '{governor}')")
                         governor = mapped_governor
+                    elif mapped_governor is None:
+                        decky.logger.warning(f"Guided mode: unknown platform profile '{platform_profile}', defaulting to 'schedutil'")
+                        governor = "schedutil"
                 
                 # In active mode (amd-pstate-epp), governor must follow EPP:
-                # - EPP power/balance_power → governor must be powersave (EPP controls behavior)
-                # - EPP performance/balance_performance → governor must be performance
+                # - EPP power/balance_power -> governor must be powersave (EPP controls behavior)
+                # - EPP performance/balance_performance -> governor must be performance
                 # Also, EPP cannot be set while governor is performance, so we must
                 # set governor to powersave FIRST, then set EPP, then optionally
                 # switch governor to performance if EPP demands it.
@@ -3613,11 +3603,13 @@ class Plugin:
                         "balance_performance": "performance",
                         "performance": "performance",
                     }
-                    epp_governor = active_governor_map.get(epp, "powersave")
+                    epp_governor = active_governor_map.get(epp)
+                    if epp_governor is None:
+                        decky.logger.warning(f"Active mode: unknown EPP '{epp}', defaulting to 'powersave' governor")
+                        epp_governor = "powersave"
                     if epp_governor != governor:
                         decky.logger.info(f"Active mode: EPP '{epp}' requires governor '{epp_governor}' (profile has '{governor}'), adjusting governor to match EPP")
-                        governor = epp_governor
-                    
+                        governor = epp_governor                    
                     # Set governor to powersave first to allow EPP changes
                     # (EPP cannot be changed while governor is performance)
                     current_governor = self.cpu_manager.get_current_governor()
@@ -3861,7 +3853,7 @@ class Plugin:
             if total_operations > 0:
                 success_rate = success_count / total_operations
                 decky.logger.info(f"Profile application completed: {success_count}/{total_operations} operations successful ({success_rate:.1%})")
-                return success_rate >= 0.7  # Consider successful if 70% or more operations succeed
+                return success_count == total_operations  # Require ALL operations to succeed
             else:
                 decky.logger.warning("No profile operations to apply")
                 return False
@@ -5801,8 +5793,7 @@ class Plugin:
                     decky.logger.info(f"Updated VERSION to {version}")
                     
                     # Give a moment for file operations to complete
-                    import time
-                    time.sleep(2)
+                    await asyncio.sleep(2)
                     
                     # Restart plugin loader to load the new version (use restart, not stop/start)
                     decky.logger.info("Restarting plugin loader to load updated plugin...")
@@ -5920,19 +5911,17 @@ class Plugin:
     async def game_monitor(self):
 
         """Poll Router for the running Steam game every 5s and apply its profile."""
-        import re as _re
-        import subprocess as _sp
         POLL_INTERVAL = 5  # seconds
         try:
             while True:
                 await asyncio.sleep(POLL_INTERVAL)
                 try:
                     # Detect running Steam game via process list
-                    result = _sp.run(
+                    result = subprocess.run(
                         ["ps", "aux"],
                         capture_output=True, text=True, timeout=3
                     )
-                    match = _re.search(r'SteamLaunch AppId=(\d+)', result.stdout)
+                    match = re.search(r'SteamLaunch AppId=(\d+)', result.stdout)
                     raw_id = match.group(1) if match else "00000000"
 
                     # Normalise: treat AppId 0 / 1 as desktop/handheld
@@ -6041,7 +6030,6 @@ class Plugin:
                     
                     # Skip if too soon since last check
                     if self.last_update_check:
-                        import time
                         time_since_last = time.time() - self.last_update_check
                         if time_since_last < self.update_check_interval:
                             continue
@@ -6059,7 +6047,6 @@ class Plugin:
                             timeout=30.0
                         )
                         
-                        import time
                         self.last_update_check = time.time()
                         
                         # Check if update available
@@ -6091,8 +6078,6 @@ class Plugin:
     async def get_update_status(self) -> Dict[str, Any]:
         """Get background update check status for frontend"""
         try:
-            import time
-            
             status = {
                 "update_available": self.update_available,
                 "latest_version": self.latest_available_version,
@@ -6119,51 +6104,36 @@ class Plugin:
 
     # Redux-compatible backend functions
     async def save_profile_settings(self, ac_profile: Dict[str, Any], battery_profile: Dict[str, Any]) -> bool:
-        """Save profile settings to persistent storage"""
+        """Save profile settings to persistent storage using Decky settings system"""
         try:
-            settings_dir = os.path.join(os.path.dirname(__file__), "settings")
-            os.makedirs(settings_dir, exist_ok=True)
-            
-            # Save AC profile
-            ac_path = os.path.join(settings_dir, "ac_profile.json")
-            with open(ac_path, 'w') as f:
-                json.dump(ac_profile, f, indent=2)
-            
-            # Save Battery profile  
-            battery_path = os.path.join(settings_dir, "battery_profile.json")
-            with open(battery_path, 'w') as f:
-                json.dump(battery_profile, f, indent=2)
-            
-            decky.logger.info("Profile settings saved successfully")
-            return True
+            if self.settings:
+                settings_data = {
+                    "acProfile": ac_profile,
+                    "batteryProfile": battery_profile
+                }
+                self.settings.set("profileSettings", settings_data)
+                decky.logger.info("Profile settings saved to Decky settings system")
+                return True
+            else:
+                decky.logger.error("SAVE_PROFILE_SETTINGS: self.settings is None!")
+                return False
         except Exception as e:
             decky.logger.error(f"Failed to save profile settings: {e}")
             return False
 
     async def load_profile_settings(self) -> Optional[Dict[str, Any]]:
-        """Load saved profile settings"""
+        """Load saved profile settings from Decky settings system"""
         try:
-            settings_dir = os.path.join(os.path.dirname(__file__), "settings")
-            ac_path = os.path.join(settings_dir, "ac_profile.json") 
-            battery_path = os.path.join(settings_dir, "battery_profile.json")
-            
-            settings = {}
-            
-            # Load AC profile if exists
-            if os.path.exists(ac_path):
-                with open(ac_path, 'r') as f:
-                    settings["acProfile"] = json.load(f)
-            
-            # Load Battery profile if exists
-            if os.path.exists(battery_path):
-                with open(battery_path, 'r') as f:
-                    settings["batteryProfile"] = json.load(f)
-            
-            if settings:
-                decky.logger.info("Profile settings loaded successfully")
-                return settings
+            if self.settings:
+                settings = self.settings.get("profileSettings", {})
+                if settings:
+                    decky.logger.info("Profile settings loaded from Decky settings system")
+                    return settings
+                else:
+                    decky.logger.info("No saved profile settings found in Decky settings")
+                    return None
             else:
-                decky.logger.info("No saved profile settings found")
+                decky.logger.error("LOAD_PROFILE_SETTINGS: self.settings is None!")
                 return None
         except Exception as e:
             decky.logger.error(f"Failed to load profile settings: {e}")
@@ -6330,7 +6300,6 @@ class Plugin:
         try:
             if self.sleep_wake_manager:
                 # Load events from the log file
-                import json
                 events_file = "/tmp/powerdeck_sleep_wake_events.json"
                 events = []
                 
@@ -6342,7 +6311,6 @@ class Plugin:
                         events = []
                 
                 # Filter events by timeframe
-                import time
                 cutoff_time = time.time() - (hours * 3600)
                 recent_events = [e for e in events if e.get('timestamp', 0) > cutoff_time]
                 
@@ -7466,7 +7434,6 @@ async def debug_get_state_comparison():
     """Debug function to get the latest state comparison data (frontend callable)"""
     decky.logger.debug(" debug_get_state_comparison()")
     try:
-        import json
         comparison_file = "/tmp/powerdeck_state_comparison.json"
         if os.path.exists(comparison_file):
             with open(comparison_file, 'r') as f:
