@@ -607,7 +607,7 @@ const Content: React.FC = () => {
   const [defaultTdp, setDefaultTdp] = useState<number>(15);  // Database default (ctdp_min)
 
   // AMD P-State Mode Control State
-  const [pstateMode, setLocalPStateMode] = useState<string>("guided");
+  const [pstateMode, setLocalPStateMode] = useState<string>("passive");
   const [pstateCapabilities, setLocalPStateCapabilities] = useState<PStateModeCapabilities | null>(null);
   const [pstateAvailable, setLocalPStateAvailable] = useState<boolean>(false);
 

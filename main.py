@@ -230,7 +230,7 @@ class Plugin:
         # Active: Full EPP control, powersave governor only, best power efficiency
         # Passive: Scheduler-driven, all governors available, standard cpufreq
         # Guided: Hybrid, EPP as hint for scheduler, performance/powersave only
-        self.pstate_mode = "guided"  # Default to guided for compatibility
+        self.pstate_mode = "passive"  # Default to passive so scaling_max_freq is honored (active ignores it)
         
     def log_warning_once(self, message: str):
         """Log a warning message only once to prevent spam"""
@@ -2821,14 +2821,14 @@ class Plugin:
                 # - Guided mode does NOT have EPP
                 # - Passive mode does NOT have EPP
                 # We can't distinguish guided from passive by EPP alone,
-                # but guided is the safer default
+                # but passive is the safer default (honors scaling_max_freq)
                 epp_path = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
                 if os.path.exists(epp_path):
                     self.pstate_mode = "active"
                     return "active"
                 else:
-                    self.pstate_mode = "guided"
-                    return "guided"
+                    self.pstate_mode = "passive"
+                    return "passive"
             return self.pstate_mode
         except Exception as e:
             decky.logger.error(f"Failed to get pstate mode: {e}")
