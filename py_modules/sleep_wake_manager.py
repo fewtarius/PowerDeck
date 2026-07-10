@@ -12,6 +12,7 @@ Author: PowerDeck Development Team
 import asyncio
 import json
 import os
+import re
 import time
 import subprocess
 from pathlib import Path
@@ -45,12 +46,21 @@ class EnhancedSleepWakeManager:
     
     def __init__(self, plugin_instance):
         self.plugin = plugin_instance
-        
+
         # Event detection state
         self.monitoring_active = False
         self.last_suspend_count = None
         self.suspend_stats_file = "/sys/power/suspend_stats/success"
-        
+
+        # Suspend-in-flight guard. Set when a sleep event is detected, cleared
+        # when a real wake event is confirmed via the suspend counter. The
+        # journal-based detector is faster but sees ambiguous text (the
+        # 'wakehook' service log contains the substring 'wake', for example),
+        # so we use the suspend counter as the source of truth and gate
+        # profile application on it.
+        self.suspend_in_progress = False
+        self.suspend_detected_at = 0.0
+
         # State tracking
         self.pre_sleep_state = {}
         self.pre_sleep_state_file = "/tmp/powerdeck_pre_sleep_state.json"
@@ -171,25 +181,26 @@ class EnhancedSleepWakeManager:
                             break
                             
                         line = line_bytes.decode('utf-8', errors='ignore').strip()
-                        
-                        # Check for resume indicators
-                        # Check for resume indicators (wake events)
-                        if any(indicator in line.lower() for indicator in [
-                            'resuming', 'resumed', 'wake', 'psp is resuming', 
-                            'smu is resuming', 'finished preparing resuming'
-                        ]):
-                            decky.logger.info(f"Journal wake detection: {line}")
+
+                        # Wake detection: match specific kernel/driver phrases
+                        # with word boundaries. The previous substring check on
+                        # 'wake' incorrectly matched the wakehook service log
+                        # '[wakehook] Going to sleep? 1', which fired
+                        # apply_profile mid-suspend and deadlocked amdgpu's
+                        # smu_apply_power_profile against its own reapply work.
+                        wake_match = self._match_wake_indicator(line)
+                        if wake_match:
+                            decky.logger.info(f"Journal wake detection ({wake_match}): {line}")
                             await self._handle_wake_event("journal_monitor")
                             break  # Exit to restart monitoring
-                        
-                        # Check for suspend indicators (sleep events)
-                        if any(indicator in line.lower() for indicator in [
-                            'suspend', 'sleeping', 'going to sleep', 'preparing to sleep',
-                            'pm-suspend', 'kernel: PM: suspend'
-                        ]):
+
+                        # Suspend detection: keep broader matching because the
+                        # system sleep scripts (systemd-sleep) and the kernel
+                        # emit these phrases reliably.
+                        if self._match_suspend_indicator(line):
                             decky.logger.info(f"Journal sleep detection: {line}")
                             await self._prepare_for_sleep()
-                            # Wake will be detected by suspend_counter_monitor
+                            # Wake will be confirmed by suspend_counter_monitor
                             break  # Exit to restart monitoring
                         
                     except asyncio.TimeoutError:
@@ -218,12 +229,94 @@ class EnhancedSleepWakeManager:
                 # Brief pause before restarting monitoring
                 if self.monitoring_active:
                     await asyncio.sleep(1)
-    
+
+    # Wake indicators: kernel/driver phrases that uniquely identify a real
+    # resume event. Word boundaries prevent substring false positives such
+    # as 'wakehook' (a JELOS service whose log lines contain 'wake' as a
+    # substring) or 'rewake'. Each entry is matched as a case-insensitive
+    # regex with \b boundaries around it.
+    WAKE_INDICATORS = [
+        r'PM: resume',
+        r'PM: suspend exit',
+        r'PM: resume from',
+        r'finished preparing resuming',
+        r'psp is resuming',
+        r'smu is resuming',
+        r'resumed from suspend',
+        r'controller resume with wake event',
+        r'crng reseeded on system resumption',
+    ]
+
+    # Suspend indicators: phrases emitted by systemd-sleep and the kernel
+    # during suspend entry. Kept tighter than the old list so we don't fire
+    # on stray uses of 'sleeping' or 'suspend' in unrelated logs.
+    SUSPEND_INDICATORS = [
+        r'PM: suspend entry',
+        r'PM-Suspend',
+        r'pm-suspend',
+        r'systemd-sleep.*Performing sleep operation',
+        r'The system will suspend now',
+        r'Preparing to suspend all target devices',
+        r'Going to sleep',
+        r'going to sleep',
+    ]
+
+    @classmethod
+    def _match_indicator(cls, line: str, patterns: List[str]) -> Optional[str]:
+        """Return the first matching pattern, or None.
+
+        Wraps each pattern with \\b boundaries so substrings like 'wake' in
+        'wakehook' do not match 'wake'.
+        """
+        for pat in patterns:
+            try:
+                if re.search(r'(?i)\b' + pat + r'\b', line):
+                    return pat
+            except re.error:
+                continue
+        return None
+
+    def _match_wake_indicator(self, line: str) -> Optional[str]:
+        return self._match_indicator(line, self.WAKE_INDICATORS)
+
+    def _match_suspend_indicator(self, line: str) -> Optional[str]:
+        return self._match_indicator(line, self.SUSPEND_INDICATORS)
+
     async def _handle_wake_event(self, detection_method: str):
         """Handle detected wake event with comprehensive parameter restoration"""
         try:
             decky.logger.info(f"WAKE EVENT DETECTED via {detection_method}")
-            
+
+            # Suspend-in-flight guard. If a suspend was detected recently and
+            # the suspend counter has NOT yet advanced (i.e. we never actually
+            # slept and came back), this wake signal is a false positive from
+            # journal pattern matching. Skip profile reapplication to avoid
+            # writing to power_dpm_force_performance_level while the kernel is
+            # mid-suspend-entry -- that write deadlocks amdgpu's SMU work
+            # queue against its own reapply work.
+            if self.suspend_in_progress and detection_method == "journal_monitor":
+                if self.last_suspend_count is not None:
+                    try:
+                        with open(self.suspend_stats_file, 'r') as _f:
+                            current_count = int(_f.read().strip())
+                        if current_count <= self.last_suspend_count:
+                            decky.logger.warning(
+                                "Skipping journal wake event - suspend in "
+                                "progress and counter has not advanced; "
+                                "treating as false positive from journal "
+                                "pattern match."
+                            )
+                            # Do not clear suspend_in_progress here; if the
+                            # wake was a false positive we are still mid-
+                            # suspend and must keep rejecting wake signals
+                            # until the suspend counter advances.
+                            return
+                    except Exception as _e:
+                        pass
+
+            # Confirmed wake: clear the suspend guard.
+            self.suspend_in_progress = False
+
             # Create event record
             event = SleepWakeEvent(
                 timestamp=time.time(),
@@ -523,6 +616,11 @@ class EnhancedSleepWakeManager:
     async def _prepare_for_sleep(self):
         """Prepare system for sleep - save critical state"""
         try:
+            # Mark that a suspend is in progress so any spurious wake signal
+            # from the journal monitor is ignored. Cleared in
+            # _handle_wake_event once a real resume is confirmed.
+            self.suspend_in_progress = True
+            self.suspend_detected_at = time.time()
             decky.logger.info("Preparing for sleep - saving comprehensive state")
             
             # Capture comprehensive system state
