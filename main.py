@@ -2865,6 +2865,13 @@ class Plugin:
             
             self.pstate_mode = mode
             decky.logger.info(f"Pstate mode set to: {mode}")
+
+            # Mirror into current_profile so the per-state saved JSON
+            # includes pstateMode; otherwise AC toggle -> load battery
+            # profile -> apply_profile silently leaves pstateMode at the
+            # kernel default instead of restoring the user's choice.
+            if isinstance(self.current_profile, dict):
+                self.current_profile["pstateMode"] = mode
             
             # In active/guided modes, ensure a valid governor is set (performance or powersave)
             # since older governors like ondemand/schedutil won't be available
@@ -3728,7 +3735,28 @@ class Plugin:
                         decky.logger.warning(f"Failed to apply GPU frequency range: {min_freq}-{max_freq} MHz")
                 except Exception as e:
                     decky.logger.error(f"Error applying GPU frequency: {e}")
-            
+
+            # Apply amd-pstate mode (active/passive/guided) when present.
+            # The frontend has its own slider callable, but loading a
+            # profile from disk (game change, AC toggle) needs to honor
+            # the field or it silently reverts to the kernel default.
+            if "pstateMode" in profile_data:
+                total_operations += 1
+                try:
+                    requested = profile_data["pstateMode"]
+                    current = await self.get_pstate_mode()
+                    if requested != current:
+                        pstate_success = await self.set_pstate_mode(requested)
+                    else:
+                        pstate_success = True
+                    if pstate_success:
+                        success_count += 1
+                        decky.logger.info(f"Applied pstate mode: {requested}")
+                    else:
+                        decky.logger.warning(f"Failed to apply pstate mode: {requested}")
+                except Exception as e:
+                    decky.logger.error(f"Error applying pstate mode: {e}")
+
             # Apply USB autosuspend setting
             if "usbAutosuspend" in profile_data:
                 total_operations += 1
@@ -3864,8 +3892,16 @@ class Plugin:
 
     async def update_and_apply_settings(self, partial: Dict[str, Any]) -> bool:
         """Single UI control entry point. Merges partial into current_profile,
-        persists to disk, and re-applies the full profile so dependent
-        fields (governor<->EPP, SMT<->cores) stay in sync."""
+        persists to disk, and applies only the changed fields to hardware.
+
+        Each per-field setter is responsible for its own dependent-state
+        coordination (e.g. set_epp temporarily switches governor to powersave
+        under amd-pstate-epp active; set_smt calls set_cpu_cores internally
+        and re-applies CPU settings on topology change). A full
+        apply_profile would also work but its 13 setters take ~1-2s per
+        slider drag, mostly from the fan service restart and the USB
+        enumeration pass. Per-field dispatch keeps single-slider drags
+        well under 100ms."""
         try:
             if not isinstance(partial, dict):
                 decky.logger.error(f"update_and_apply_settings: expected dict, got {type(partial).__name__}")
@@ -3884,14 +3920,114 @@ class Plugin:
             except Exception as save_err:
                 decky.logger.error(f"update_and_apply_settings: save to {profile_id} failed: {save_err}")
 
+            # Apply only the changed fields. Profile metadata (profileId,
+            # gameId, gameName, lastUpdated) is skipped - no hardware setter.
+            applied_keys = []
+            failures = []
+            for key, value in partial.items():
+                if value is None:
+                    continue
+                if key in ("profileId", "gameId", "gameName", "lastUpdated",
+                           "lastUpdatedAt"):
+                    continue
+                try:
+                    ok = await self._apply_partial_field(key, value, partial)
+                except Exception as field_err:
+                    decky.logger.error(f"update_and_apply_settings: {key} raised: {field_err}")
+                    ok = False
+                if ok is False:
+                    failures.append(key)
+                elif ok is True:
+                    applied_keys.append(key)
+                # ok is None for non-hardware keys we deliberately skip
+
+            if failures:
+                decky.logger.error(
+                    f"update_and_apply_settings: applied={applied_keys} failed={failures} "
+                    f"partial={ {k: v for k, v in partial.items() if v is not None} }"
+                )
+                return False
             decky.logger.info(
-                f"update_and_apply_settings: reapplying full profile after partial={ {k: v for k, v in partial.items() if v is not None} }"
+                f"update_and_apply_settings: applied={applied_keys} partial={ {k: v for k, v in partial.items() if v is not None} }"
             )
-            return await self.apply_profile(dict(merged))
+            return True
         except Exception as e:
             decky.logger.error(f"update_and_apply_settings failed: {e}")
             return False
 
+    async def _apply_partial_field(self, key: str, value: Any, partial: Dict[str, Any]) -> Optional[bool]:
+        """Apply a single profile field to hardware. Returns True on success,
+        False on failure, None when the key has no hardware setter (e.g.
+        metadata like profileId). Each branch mirrors the relevant block of
+        apply_profile but uses the per-field hardware setter directly so the
+        full profile isn't reapplied."""
+        try:
+            if key == "tdp":
+                return await self.set_tdp(value)
+            if key == "cpuBoost":
+                # Match apply_profile: prefer SteamOS Manager but skip when
+                # we hold the power subsystem claim (no-ops while claimed).
+                if self.steamos_manager_available and not hasattr(self, "_external_manager_token"):
+                    ok = await self.set_cpu_boost_via_steamos_manager(value)
+                    if ok:
+                        return True
+                return await self.set_cpu_boost(value)
+            if key == "smt":
+                # set_smt handles internal cpuCores adjustment and topology
+                # re-init; partial may also include cpuCores which is
+                # fine because set_smt reads from self.current_profile.
+                return await self.set_smt(value)
+            if key == "cpuCores":
+                return await self.set_cpu_cores(value)
+            if key == "governor":
+                if self.steamos_manager_available and not hasattr(self, "_external_manager_token"):
+                    ok = await self.set_governor_via_steamos_manager(value)
+                    if ok:
+                        return True
+                return await self.set_power_governor(value)
+            if key == "epp":
+                return await self.set_epp(value)
+            if key == "fanProfile":
+                result = await self.set_fan_cooling_profile(value)
+                return result.get("success", False)
+            if key == "gpuMode":
+                return await self.set_gpu_mode(value)
+            if key in ("gpuFreqMin", "gpuFreqMax", "gpuFreqFixed"):
+                # Need both bounds even when only one is in partial
+                cur = dict(self.current_profile or {})
+                min_freq = partial.get("gpuFreqMin", cur.get("gpuFreqMin"))
+                max_freq = partial.get("gpuFreqMax", cur.get("gpuFreqMax"))
+                if min_freq is None or max_freq is None:
+                    return None
+                return await self.set_gpu_frequency(min_freq, max_freq)
+            if key == "usbAutosuspend":
+                return await self.set_usb_autosuspend(value)
+            if key == "pcieAspm":
+                policy = "powersave" if value else "default"
+                return await self.set_pcie_aspm_policy(policy)
+            if key == "pciRuntimePm":
+                return await self.set_pci_runtime_pm(value)
+            if key == "wifiPowerSave":
+                return await self.set_wifi_power_save(value)
+            if key == "platformProfile":
+                return await self.set_rog_ally_platform_profile(value)
+            if key == "mcuPowersave":
+                return await self.set_rog_ally_mcu_powersave(value)
+            if key == "thermalPolicy":
+                return await self.set_rog_ally_thermal_throttle_policy(value)
+            if key in ("batteryChargeLimit", "rogAllyBatteryChargeLimit"):
+                return await self.set_rog_ally_battery_charge_limit(value)
+            if key in ("cpuFanMode", "gpuFanMode"):
+                fan_id = 1 if key == "cpuFanMode" else 2
+                return await self.set_rog_ally_fan_mode(fan_id, value)
+            # Keys without hardware setters (pstateMode uses its own
+            # callable via setPStateMode so it's handled in a different
+            # code path; metadata is filtered above).
+            decky.logger.debug(f"_apply_partial_field: no hardware setter for {key}")
+            return None
+        except Exception as e:
+            decky.logger.error(f"_apply_partial_field({key}) exception: {e}")
+            return False
     async def get_cpu_limits(self) -> Dict[str, int]:
         """Get CPU frequency limits"""
         try:

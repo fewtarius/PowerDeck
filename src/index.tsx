@@ -578,6 +578,18 @@ const Content: React.FC = () => {
   // Last applied profile (skip reapply when unchanged)
   const [lastAppliedProfile, setLastAppliedProfile] = useState<PowerProfile | null>(null);
 
+  // Mirror of React state so the monitor's 7.5s setInterval closure
+  // can read fresh values. The interval's useEffect intentionally
+  // depends only on [perGameProfilesEnabled] (so the poll stays stable
+  // across state updates); without these refs, an AC flicker would
+  // save the useState defaults to disk over the user's settings.
+  const latestAcPower = useRef(acPower);
+  const latestCurrentGame = useRef(currentGame);
+  const latestCurrentProfile = useRef(currentProfile);
+  useEffect(() => { latestAcPower.current = acPower; }, [acPower]);
+  useEffect(() => { latestCurrentGame.current = currentGame; }, [currentGame]);
+  useEffect(() => { latestCurrentProfile.current = currentProfile; }, [currentProfile]);
+
   // Advanced power management
   const [showAdvancedMenu, setShowAdvancedMenu] = useState<boolean>(false);
   const [wifiPowerSaveEnabled, setWifiPowerSaveEnabled] = useState<boolean>(true);
@@ -851,6 +863,24 @@ const Content: React.FC = () => {
     setPcieAspmEnabled(profile.pcieAspm ?? false);
     setWifiPowerSaveEnabled(profile.wifiPowerSave ?? false);
     setPciRuntimePmEnabled(profile.pciRuntimePm ?? false);
+  }, []);
+
+  // After a profile apply, read amd_pstate/status back so the slider
+  // thumb reflects the post-apply mode rather than the initial load.
+  const syncPStateMode = useCallback(async () => {
+    try {
+      const [mode, caps, governors] = await Promise.all([
+        getPStateMode(),
+        getPStateModeCapabilities(),
+        getAvailableGovernors(),
+      ]);
+      setLocalPStateMode(mode);
+      setLocalPStateCapabilities(caps);
+      setAvailableGovernors(governors);
+    } catch (error) {
+      // amd-pstate not available on this device - nothing to sync.
+      debug.log("syncPStateMode skipped: amd-pstate not available");
+    }
   }, []);
 
   // Load device info and initial settings
@@ -1254,6 +1284,11 @@ const Content: React.FC = () => {
     
     const unifiedMonitoringInterval = setInterval(async () => {
       try {
+        // Snapshot fresh state via refs so the interval reads post-init
+        // values instead of the closed-over stale ones.
+        const acPower = latestAcPower.current;
+        const currentGame = latestCurrentGame.current;
+        const currentProfile = latestCurrentProfile.current;
         // Check AC power status
         const newAcPower = await getAcPowerStatus();
         let acPowerChanged = newAcPower !== acPower;
@@ -1372,6 +1407,10 @@ const Content: React.FC = () => {
               await syncRogAllySettings(normalizedProfile);
               // FORCE APPLY: AC/battery or game changed, always re-apply settings to hardware
               await applyProfileQuiet(normalizedProfile, true);
+
+              // After apply, sync UI to the kernel mode so the slider
+              // reflects the new value (see syncPStateMode above).
+              await syncPStateMode();
               
               // Save normalized profile if it was missing fields
               if (normalizedProfile.usbAutosuspend !== newProfile.usbAutosuspend || 
@@ -1457,8 +1496,10 @@ const Content: React.FC = () => {
  // Track the game-exit confirmation timeout so we can cancel it on unmount/cleanup
   const gameExitTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
- // Single point of change: backend re-runs the full set_* sequence so
- // dependent fields (governor<->EPP, SMT<->cores) stay in sync.
+ // Single point of change. Backend applies ONLY the changed fields so a
+ // single slider drag doesn't re-run the full 13-setter apply_profile.
+ // Per-field setters handle their own dependent-state coordination
+ // (governor<->EPP, SMT<->cores).
  const applySetting = useCallback(async (
    profileUpdate: Partial<PowerProfile>,
    settingName: string
@@ -1468,6 +1509,10 @@ const Content: React.FC = () => {
       // atomically to avoid stale-closure race when multiple toggles fire.
       const success = await updateAndApplySettings(profileUpdate);
       if (success) {
+        // Mirror the partial into React state. Without this the
+        // unified monitor's "save current profile" later writes stale
+        // useState defaults to disk over the user's settings.
+        setCurrentProfile(prev => ({ ...prev, ...profileUpdate }));
         setLastAppliedProfile(prev => ({ ...prev, ...profileUpdate }));
       } else {
         setError(`Failed to apply ${settingName}`);
@@ -1827,6 +1872,9 @@ const Content: React.FC = () => {
                     // Also refresh available governors since they change with pstate mode
                     const governors = await getAvailableGovernors();
                     setAvailableGovernors(governors);
+                    // Persist the new mode to the current profile so the
+                    // next AC toggle / game change restores it.
+                    updateCurrentProfile({ pstateMode: selectedMode });
                     debug.log(`PState mode changed to: ${selectedMode}`);
                   } else {
                     // Backend rejected the change, rollback UI
