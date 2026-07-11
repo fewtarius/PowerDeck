@@ -1909,6 +1909,68 @@ class Plugin:
             decky.logger.error(f"Failed to get device info: {e}")
             return self.device_info
 
+    def _sanitize_profile_for_native_mode(self, profile: Dict[str, Any]) -> Dict[str, Any]:
+        """Strip hardware-managed fields from a profile for ROG Ally native mode.
+
+        Native mode owns a narrow slice of the CPU performance path
+        (pstate mode, governor, EPP, TDP band via platform_profile).
+        Everything else — smt, cpuCores, cpuBoost, gpuMode, platformProfile,
+        thermalPolicy, wifiPowerSave, usbAutosuspend, pcieAspm,
+        pciRuntimePm — stays user-tunable. The earlier version of this
+        function stripped smt/cpuCores/cpuBoost too, which made the UI
+        sliders stop persisting and the front end render their values as
+        undefined. Keep these user-facing fields; only remove the four
+        that PowerDeck actively owns in native mode.
+        """
+        sanitized = dict(profile)
+        # PowerDeck-owned in native mode: dropped before write so a stale
+        # Handheld-cloned value can't sneak back in via save. pstateMode
+        # and epp are gone (passive mode has no EPP sysfs). tdp and
+        # governor are ignored on apply — PowerDeck picks them up from
+        # platformProfile and the governor lock respectively.
+        for field in ("tdp", "governor", "epp", "pstateMode"):
+            sanitized.pop(field, None)
+        return sanitized
+
+    def _build_default_profile_template(self, platform_profile: str = "balanced") -> Dict[str, Any]:
+        """Sensible defaults for a new game profile.
+
+        Mirrors the system-derived defaults used at plugin init
+        (self.current_profile in __init__) but filled in with concrete
+        values from device_info and processor_db so the file on disk
+        is self-contained. Avoids the trap where a new game inherits
+        the Handheld (00000000_battery) profile's power-saver values
+        via the game monitor's auto-create fallback.
+
+        Platform profile is parameterised so a Handheld->AC switch
+        during game launch can request balanced (not power-saver).
+        """
+        # CPU TDP: start from the processor-database nominal TDP and
+        # clamp to the device's TDP limits. Fall back to 15W if the
+        # database hasn't populated yet (plugin init order race).
+        tdp = self.device_info.get("tdp_default") or self.current_profile.get("tdp") or 15
+        try:
+            tdp = max(self.tdp_limits.get("min", 4),
+                       min(int(tdp), self.tdp_limits.get("max") or int(tdp)))
+        except Exception:
+            tdp = 15
+        return {
+            "tdp": int(tdp),
+            "cpuBoost": True,
+            "smt": True,
+            "cpuCores": self.device_info.get("max_cpu_cores") or 16,
+            "governor": "schedutil",
+            "epp": "balance_performance" if getattr(self, "ac_power", True) else "balance_power",
+            "platformProfile": platform_profile,
+            "gpuMode": "auto",
+            "usbAutosuspend": False,
+            "pcieAspm": False,
+            "pciRuntimePm": False,
+            "wifiPowerSave": False,
+            "thermalPolicy": 1,
+            "pstateMode": "passive",
+        }
+
     async def get_current_profile(self) -> Dict[str, Any]:
         """Get current power profile"""
         decky.logger.info(f"GET_CURRENT_PROFILE: Returning current_profile: {self.current_profile}")
@@ -1945,7 +2007,19 @@ class Plugin:
             profile_copy = dict(profile_data)
             if "gameId" in profile_copy:
                 del profile_copy["gameId"]
-            
+
+            # ROG Ally native TDP mode owns the CPU performance path via
+            # platform_profile. Per-game profiles in this mode should
+            # describe USER choices (gpuMode, wifiPowerSave, etc.) and
+            # not carry fields PowerDeck already decides (TDP band,
+            # cpuBoost, governor, etc.). Strip the hardware-managed
+            # fields so a stale Handheld-cloned profile doesn't keep
+            # coming back. The apply-side sanitizer covers existing
+            # files; this covers new writes.
+            if (getattr(self, 'device_type', None) == "rog_ally"
+                    and getattr(self, 'rog_ally_native_tdp_enabled', False)):
+                profile_copy = self._sanitize_profile_for_native_mode(profile_copy)
+
             # CRITICAL DEBUGGING: Full call context
             debug_log(f"SAVE_PROFILE called for profile ID: {game_id}")
             debug_log(f"Profile TDP: {profile_copy.get('tdp', 'UNKNOWN')}")
@@ -3505,9 +3579,38 @@ class Plugin:
             decky.logger.info(f"=== APPLYING POWER PROFILE ===")
             decky.logger.info(f"Profile data: {profile_data}")
 
+            # ROG Ally native TDP mode owns the CPU performance path.
+            # Sanitise the profile here so EVERY branch below (TDP, boost,
+            # SMT, cores, governor, EPP) sees the cleaned fields. Doing
+            # this at the top is critical: the original code applied SMT
+            # and cpuCores BEFORE the governor/EPP override block, so
+            # smt=false / cpuCores=4 from a Handheld-cloned profile would
+            # already be applied by the time the governor override ran.
+            # Sanitising once at the top keeps the per-field branches
+            # below simple and consistent.
+            if (getattr(self, 'device_type', None) == "rog_ally"
+                    and getattr(self, 'rog_ally_native_tdp_enabled', False)):
+                profile_data = self._sanitize_profile_for_native_mode(dict(profile_data))
+                decky.logger.info(f"Native TDP active: sanitised profile for apply: {profile_data}")
+                # Also enforce pstate=passive once at the top so every
+                # downstream branch sees passive mode (notably set_tdp's
+                # ROG Ally native path which sets Armoury limits and
+                # reloads amd_pmf — that flow assumes passive mode).
+                try:
+                    if await self.get_pstate_mode() != "passive":
+                        decky.logger.info("Native TDP active: forcing pstate -> passive")
+                        await self.set_pstate_mode("passive")
+                except Exception as e:
+                    decky.logger.warning(f"Native TDP pstate pre-check failed (non-fatal): {e}")
+                # Lock governor=performance so apply_profile's governor
+                # branch (if it fires) writes the right value rather
+                # than the powersave the profile may have carried.
+                self.current_profile["governor"] = "performance"
+                self.current_profile["pstateMode"] = "passive"
+
             success_count = 0
             total_operations = 0
-            
+
             # Apply TDP setting
             if "tdp" in profile_data:
                 total_operations += 1
@@ -3576,29 +3679,12 @@ class Plugin:
 
                 pstate_mode = await self.get_pstate_mode()
 
-                # ROG Ally native TDP mode owns the CPU performance path via
-                # platform_profile. Override pstate to passive and lock
-                # governor=performance so the profile doesn't fight amd_pmf
-                # or trigger the EPP recovery flip-flop in set_epp. Without
-                # this override, a profile with pstateMode=active would land
-                # the system back in the race condition that motivates
-                # native mode existing in the first place.
-                if (getattr(self, 'device_type', None) == "rog_ally"
-                        and getattr(self, 'rog_ally_native_tdp_enabled', False)):
-                    if pstate_mode != "passive":
-                        decky.logger.info(
-                            f"Native TDP active on ROG Ally: forcing pstate {pstate_mode} -> passive"
-                        )
-                        await self.set_pstate_mode("passive")
-                        pstate_mode = "passive"
-                    # Lock governor=performance for predictable behaviour.
-                    governor = "performance"
-                    # EPP is meaningless in passive mode (no EPP sysfs) so
-                    # strip it from the profile to prevent the recovery flow
-                    # in set_epp from racing with governor writes.
-                    profile_data = dict(profile_data)
-                    profile_data.pop("epp", None)
-                    epp = None
+                # Native TDP sanitisation already happened at the top of
+                # apply_profile, so by this point profile_data has no
+                # bad fields, pstate is passive, and governor is
+                # performance. The branch below handles the remaining
+                # non-native cases (guided mode governor mapping, EPP
+                # recovery flow) without needing another override here.
 
                 # In guided mode, map platform profile to appropriate governor
                 # amd_pmf handles hardware scheduling, so governor should complement
@@ -5017,6 +5103,24 @@ class Plugin:
                 self.current_profile["pstateMode"] = "passive"
                 self.current_profile["governor"] = "performance"
 
+                # Sanitise the in-memory profile so any leftover Handheld
+                # values (tdp=8, smt=false, cpuCores=4, etc.) are gone
+                # before the next apply_profile runs. Also persist the
+                # sanitised version to disk so a plugin restart doesn't
+                # re-introduce them via settings.json's currentProfile.
+                # Existing per-game profiles will be sanitised on their
+                # next apply via the apply_profile sanitizer; no need to
+                # rewrite every file on disk here.
+                sanitised = self._sanitize_profile_for_native_mode(
+                    dict(self.current_profile)
+                )
+                self.current_profile.clear()
+                self.current_profile.update(sanitized)
+                decky.logger.info(
+                    f"Native TDP enabled: sanitised current_profile: {self.current_profile}"
+                )
+                await self.save_settings()
+
             # Re-apply current TDP using the new control method
             # This ensures the active TDP controller matches the selected mode
             if old_mode != enabled:
@@ -6173,7 +6277,36 @@ class Plugin:
                             # enable_per_game_profiles so per-game-off devices
                             # don't accumulate orphan profiles.
                             try:
-                                game_profile = dict(profile)
+                                # Build a sensible default rather than cloning
+                                # the Handheld (00000000) profile. The Handheld
+                                # profile is the no-game-running power-saver
+                                # baseline; cloning it locks every new game
+                                # into 8W / powersave / smt=off / cores=4 until
+                                # the user manually edits every field. Instead
+                                # start new games from the same balanced
+                                # defaults the system uses (see self.current_profile
+                                # initialisation in __init__): cpuBoost on, SMT on,
+                                # all cores, schedutil governor. ROG Ally native
+                                # mode additionally strips CPU-managed fields via
+                                # the sanitizer in save_profile so platform_profile
+                                # alone drives CPU performance.
+                                game_profile = self._build_default_profile_template(
+                                    platform_profile=profile.get("platformProfile", "balanced")
+                                )
+                                # Layer in non-CPU user choices from the loaded
+                                # fallback profile (gpuMode, wifi, usb, pcie,
+                                # etc.) so a power-mode switch during game
+                                # launch preserves the user's other choices. The
+                                # default template already covers CPU fields.
+                                user_choices = {
+                                    k: v for k, v in profile.items()
+                                    if k not in (
+                                        "tdp", "cpuBoost", "smt", "cpuCores",
+                                        "governor", "epp", "pstateMode",
+                                        "profileId", "gameId", "gameName",
+                                    )
+                                }
+                                game_profile.update(user_choices)
                                 game_profile["profileId"] = profile_id
                                 # The filename in save_profile is derived from
                                 # gameId, so the per-power-mode suffix has to be
