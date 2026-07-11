@@ -3573,9 +3573,33 @@ class Plugin:
                 # Default EPP depends on whether we're on AC or battery
                 _default_epp = "balance_performance" if getattr(self, "ac_power", True) else "balance_power"
                 epp = profile_data.get("epp", _default_epp)
-                
+
                 pstate_mode = await self.get_pstate_mode()
-                
+
+                # ROG Ally native TDP mode owns the CPU performance path via
+                # platform_profile. Override pstate to passive and lock
+                # governor=performance so the profile doesn't fight amd_pmf
+                # or trigger the EPP recovery flip-flop in set_epp. Without
+                # this override, a profile with pstateMode=active would land
+                # the system back in the race condition that motivates
+                # native mode existing in the first place.
+                if (getattr(self, 'device_type', None) == "rog_ally"
+                        and getattr(self, 'rog_ally_native_tdp_enabled', False)):
+                    if pstate_mode != "passive":
+                        decky.logger.info(
+                            f"Native TDP active on ROG Ally: forcing pstate {pstate_mode} -> passive"
+                        )
+                        await self.set_pstate_mode("passive")
+                        pstate_mode = "passive"
+                    # Lock governor=performance for predictable behaviour.
+                    governor = "performance"
+                    # EPP is meaningless in passive mode (no EPP sysfs) so
+                    # strip it from the profile to prevent the recovery flow
+                    # in set_epp from racing with governor writes.
+                    profile_data = dict(profile_data)
+                    profile_data.pop("epp", None)
+                    epp = None
+
                 # In guided mode, map platform profile to appropriate governor
                 # amd_pmf handles hardware scheduling, so governor should complement
                 # the platform profile rather than conflict with it
@@ -4958,13 +4982,41 @@ class Plugin:
             if not await self.is_rog_ally_device():
                 decky.logger.warning("ROG Ally native TDP setting only available on ROG Ally devices")
                 return False
-            
+
             old_mode = self.rog_ally_native_tdp_enabled
             self.rog_ally_native_tdp_enabled = enabled
             self._rog_ally_native_tdp_explicitly_set = True  # Mark as explicitly set by user
             await self.save_settings()
             decky.logger.info(f"ROG Ally native TDP support changed to: {enabled} (explicitly set by user)")
-            
+
+            # When native mode is enabled, force pstate=passive and lock
+            # governor=performance. Native mode owns the CPU power path
+            # via platform_profile (which sets BIOS-level EC behaviour);
+            # letting the user keep pstate=active invites a three-way race
+            # between PowerDeck sysfs writes, amd_pmf's 1s SMU refresh
+            # loop, and the EC reasserting OEM defaults on platform
+            # profile transitions. Passive mode has no EPP sysfs so the
+            # EPP/governor recovery flip-flop in set_epp cannot fire here.
+            if enabled and old_mode != enabled:
+                current_pstate = await self.get_pstate_mode()
+                if current_pstate != "passive":
+                    decky.logger.info(
+                        f"Native TDP enabled: forcing pstate {current_pstate} -> passive"
+                    )
+                    await self.set_pstate_mode("passive")
+                # Governor=performance matches the platform_profile=performance
+                # intent and gives PowerDeck a single source of truth for
+                # CPU performance on this device.
+                current_governor = self.cpu_manager.get_current_governor() if hasattr(self, 'cpu_manager') and self.cpu_manager else None
+                if current_governor != "performance":
+                    decky.logger.info(
+                        f"Native TDP enabled: setting governor {current_governor} -> performance"
+                    )
+                    await self.set_power_governor("performance")
+                # Persist so apply_profile doesn't fight us on next reload.
+                self.current_profile["pstateMode"] = "passive"
+                self.current_profile["governor"] = "performance"
+
             # Re-apply current TDP using the new control method
             # This ensures the active TDP controller matches the selected mode
             if old_mode != enabled:
@@ -4972,7 +5024,7 @@ class Plugin:
                 if current_tdp:
                     decky.logger.info(f"Re-applying TDP {current_tdp}W using new control mode (native={enabled})")
                     await self.set_tdp(current_tdp)
-            
+
             return True
         except Exception as e:
             decky.logger.error(f"Failed to set ROG Ally native TDP setting: {e}")

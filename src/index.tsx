@@ -192,6 +192,15 @@ function getCurrentGameInfo() {
 }
 
 // Frontend-backend coordination: Update backend when frontend detects different game
+// Snapshot of the last profile content this function wrote back to disk.
+// The unified monitor invokes updateBackendGameDetection() every 7.5s while
+// a game runs; without dedup, PowerDeck rewrites the same JSON 8x/minute,
+// which both wastes IO and can clobber any divergence between React state
+// and disk content (e.g. when the user changes a setting through a path
+// that bypasses this function). Keyed on gameId so switching profiles
+// resets the snapshot.
+let lastSavedProfileByGame: Record<string, string> = {};
+
 async function updateBackendGameDetection() {
   try {
     const frontendGame = getCurrentGameInfo();
@@ -200,10 +209,19 @@ async function updateBackendGameDetection() {
       // Trigger backend to switch to the real game profile
       const isAC = await getAcPowerStatus();
       const realGameId = isAC ? `${frontendGame.id}_ac` : `${frontendGame.id}_battery`;
-      
+
       // Load/create profile for the real game
       const gameProfile = await getGameProfile(realGameId);
       if (gameProfile) {
+        // Skip no-op writes when disk content is unchanged from last save.
+        // Stable key sort handles field reordering between runs.
+        const snapshot = JSON.stringify(gameProfile, Object.keys(gameProfile).sort());
+        if (lastSavedProfileByGame[realGameId] === snapshot) {
+          debug.log(`updateBackendGameDetection: ${realGameId} unchanged, skipping re-save`);
+          return;
+        }
+        lastSavedProfileByGame[realGameId] = snapshot;
+
         debug.log("Switching backend to real game profile:", realGameId);
         await setGameProfile(realGameId, gameProfile);
       }
@@ -1541,17 +1559,28 @@ const Content: React.FC = () => {
   const handleSmtChange = useCallback(async (enabled: boolean) => {
     const maxCores = deviceInfo?.max_cpu_cores || 16;
     const currentCores = currentProfile.cpuCores;
-    
+
     // When disabling SMT, ensure CPU cores don't exceed physical cores
     // When enabling SMT, allow access to logical cores
     let adjustedCores = currentCores;
     if (!enabled && currentCores > Math.floor(maxCores / 2)) {
       adjustedCores = Math.floor(maxCores / 2);
     }
-    
+
     await applySetting(
       { smt: enabled, cpuCores: adjustedCores },
       'SMT (Simultaneous Multithreading) setting'
+    );
+  }, [applySetting]);
+
+  // cpuBoost has no topology coupling (unlike SMT<->cpuCores), so this
+  // is a straight passthrough. Backend's _apply_partial_field routes
+  // this to set_cpu_boost_via_steamos_manager or set_cpu_boost based on
+  // whether the SteamOS Manager subsystem is claimed by PowerDeck.
+  const handleCpuBoostChange = useCallback(async (enabled: boolean) => {
+    await applySetting(
+      { cpuBoost: enabled },
+      'CPU boost setting'
     );
   }, [applySetting]);
 
@@ -1842,9 +1871,15 @@ const Content: React.FC = () => {
       )}
 
       {/* TDP Control Section - Hidden on ROG Ally (use Platform Profiles instead) */}
-      
+
       {/* AMD P-State Mode Control - Only shown on AMD devices with amd-pstate */}
-      {pstateAvailable && (
+      {/* Hide when ROG Ally native TDP is on: native mode owns the CPU
+          power path and forces pstate=passive (set in main.py when the
+          user toggles set_rog_ally_native_tdp_enabled). Exposing this
+          slider would let users put the system into pstate=active, which
+          races with amd_pmf and creates the EPP/governor flip-flop
+          documented in main.py set_epp. */}
+      {pstateAvailable && !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled) && (
         <PanelSection title="CPU Driver Mode">
           <PanelSectionRow>
             <SliderWithIcons
@@ -2118,6 +2153,16 @@ const Content: React.FC = () => {
             />
           </PanelSectionRow>
         )}
+        {deviceInfo?.supports_cpu_boost && (
+          <PanelSectionRow>
+            <ToggleField
+              label="CPU Boost"
+              description="Allow CPU to exceed base clock (better FPS, more heat)"
+              checked={currentProfile.cpuBoost}
+              onChange={handleCpuBoostChange}
+            />
+          </PanelSectionRow>
+        )}
         {/* CPU Governor - show in all modes except amd-pstate active (where only performance/powersave are available) */}
         {deviceInfo?.scalingDriver !== "amd-pstate-epp" && (
           <PanelSectionRow>
@@ -2191,7 +2236,12 @@ const Content: React.FC = () => {
         )}
         
         {/* EPP Section - only show in amd-pstate active mode where EPP is available */}
-        {deviceInfo?.scalingDriver === "amd-pstate-epp" && (
+        {/* Defense in depth: also hide when ROG Ally native TDP is on.
+            Native mode forces pstate=passive (no EPP sysfs) so this UI is
+            never functional in that mode, but showing it lets users
+            send set_epp calls that would fail silently or be rejected
+            by the kernel. Hidden alongside the pstate slider above. */}
+        {deviceInfo?.scalingDriver === "amd-pstate-epp" && !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled) && (
           <>
             <PanelSectionRow>
               <SliderWithIcons

@@ -889,8 +889,15 @@ but does NOT enforce a hard cap)."""
     def is_smt_enabled(self) -> bool:
         """Check if SMT (Simultaneous Multithreading) is enabled."""
         try:
-            with open('/sys/devices/system/cpu/smt/active', 'r') as f:
-                return f.read().strip() == '1'
+            # Check the user's REQUESTED state via smt/control, not
+            # smt/active. smt/active reports whether SMT threads are
+            # currently online and returns 0 whenever the sibling CPUs
+            # are offline (e.g. mid-topology-change after set_smt(True)
+            # but before online_physical_core has been called). That
+            # false negative caused the cpuCores slider to silently cap
+            # 16-logical requests at 8 physical.
+            with open('/sys/devices/system/cpu/smt/control', 'r') as f:
+                return f.read().strip() == 'on'
         except OSError:
             # Fallback: check if any CPU has multiple siblings
             if not self._topology_initialized:
@@ -949,18 +956,34 @@ but does NOT enforce a hard cap)."""
             
             if target_cores < 1:
                 target_cores = 1
-            if target_cores > max_physical_cores:
-                target_cores = max_physical_cores
-            
+
+            # target_cores is interpreted as LOGICAL cores (threads), matching
+            # the PowerDeck UI slider which lets the user pick up to
+            # max_cpu_cores = physical * 2 when SMT is enabled. The previous
+            # clamp to max_physical_cores silently capped a 16-core request at
+            # 8 when SMT was on, leaving the SMT-enabled sibling threads
+            # offline and the game CPU-bound on 8 threads instead of 16.
+            max_logical_cores = max_physical_cores * (2 if smt_enabled else 1)
+            if target_cores > max_logical_cores:
+                target_cores = max_logical_cores
+
             decky_plugin.logger.info(f"Setting CPU cores to {target_cores} with SMT-aware C-state optimization")
             decky_plugin.logger.info(f"Available primary CPUs: {primary_cpus}, SMT enabled: {smt_enabled}")
-            
+
             success = True
-            
+
             # First, bring online the needed physical cores (including all sibling logical CPUs)
-            for i in range(target_cores):
+            # With SMT on, target_cores is logical; round up to the physical
+            # count so a request of 9 logical (need 5 physical) gets 5
+            # primary + 4 siblings rather than 4 physical (= 8 logical)
+            # leaving thread 9 offline.
+            if smt_enabled:
+                physical_target = (target_cores + 1) // 2
+            else:
+                physical_target = target_cores
+            for i in range(physical_target):
                 primary_cpu = primary_cpus[i]
-                
+
                 if smt_enabled:
                     # With SMT, manage the entire physical core (primary + siblings)
                     if not self.online_physical_core(primary_cpu):
@@ -971,9 +994,9 @@ but does NOT enforce a hard cap)."""
                     if primary_cpu != 0 and not self.online_cpu(primary_cpu):
                         decky_plugin.logger.warning(f"Failed to bring online primary CPU {primary_cpu} for physical core {i}")
                         success = False
-            
+
             # Then, offline excess physical cores (including all sibling logical CPUs)
-            for i in range(target_cores, max_physical_cores):
+            for i in range(physical_target, max_physical_cores):
                 primary_cpu = primary_cpus[i]
                 if primary_cpu == 0:
                     continue  # Never offline CPU 0 or its siblings
