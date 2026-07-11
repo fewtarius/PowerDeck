@@ -2164,7 +2164,14 @@ const Content: React.FC = () => {
           </PanelSectionRow>
         )}
         {/* CPU Governor - show in all modes except amd-pstate active (where only performance/powersave are available) */}
-        {deviceInfo?.scalingDriver !== "amd-pstate-epp" && (
+        {/* Hide in two cases:
+            1. amd-pstate-epp active mode (only performance/powersave exposed - useless slider)
+            2. ROG Ally native TDP enabled (main.py forces governor=performance when
+               native mode is on; exposing a slider here would let users pick a
+               governor that gets clobbered on the next apply_profile). Native mode
+               owns the CPU performance path via platform_profile so the
+               governor is implicit. */}
+        {deviceInfo?.scalingDriver !== "amd-pstate-epp" && !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled) && (
           <PanelSectionRow>
             <SliderWithIcons
               label="CPU Governor"
@@ -2212,7 +2219,7 @@ const Content: React.FC = () => {
           </PanelSectionRow>
         )}
         {/* Governor description - show when governor is visible */}
-        {deviceInfo?.scalingDriver !== "amd-pstate-epp" && (
+        {deviceInfo?.scalingDriver !== "amd-pstate-epp" && !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled) && (
           <PanelSectionRow>
             <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
               <span style={{ color: '#00d4ff', fontSize: '1em' }}>
