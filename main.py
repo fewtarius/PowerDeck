@@ -3943,18 +3943,26 @@ class Plugin:
             
             # Apply PCIe ASPM setting
             if "pcieAspm" in profile_data:
-                total_operations += 1
-                try:
-                    pcie_enabled = profile_data.get("pcieAspm", False)
-                    pcie_policy = "powersave" if pcie_enabled else "default"
-                    pcie_success = await self.set_pcie_aspm_policy(pcie_policy)
-                    if pcie_success:
-                        success_count += 1
-                        decky.logger.info(f"Applied PCIe ASPM: {pcie_policy} policy")
-                    else:
-                        decky.logger.warning(f"Failed to apply PCIe ASPM: {pcie_policy}")
-                except Exception as e:
-                    decky.logger.error(f"Error applying PCIe ASPM: {e}")
+                # Skip if set_pcie_aspm_policy already cached the BIOS lock.
+                # On ROG Ally X / JELOS the kernel hard-locks pcie_aspm
+                # policy to 'default' because the ACPI FADT table reports
+                # ASPM as unsupported; the first call detects this and
+                # sets supports_pcie_aspm=False so we don't keep
+                # counting it as a per-apply failure or spamming the
+                # log with no-op warnings on every game launch.
+                if self.device_info.get("supports_pcie_aspm"):
+                    total_operations += 1
+                    try:
+                        pcie_enabled = profile_data.get("pcieAspm", False)
+                        pcie_policy = "powersave" if pcie_enabled else "default"
+                        pcie_success = await self.set_pcie_aspm_policy(pcie_policy)
+                        if pcie_success:
+                            success_count += 1
+                            decky.logger.info(f"Applied PCIe ASPM: {pcie_policy} policy")
+                        else:
+                            decky.logger.warning(f"Failed to apply PCIe ASPM: {pcie_policy}")
+                    except Exception as e:
+                        decky.logger.error(f"Error applying PCIe ASPM: {e}")
 
             # Apply PCI runtime PM setting
             if "pciRuntimePm" in profile_data:
@@ -4903,17 +4911,65 @@ class Plugin:
         try:
             if not self.device_info.get("supports_pcie_aspm"):
                 return False
-            
+
             valid_policies = ["default", "performance", "powersave", "powersupersave"]
             if policy not in valid_policies:
                 return False
-                
-            with open("/sys/module/pcie_aspm/parameters/policy", "w") as f:
-                f.write(policy)
+
+            # Read current first. If we're already at the target, skip
+            # the write - some kernels return EPERM on writes even when
+            # the value is unchanged, and we don't want to spam the
+            # kernel with no-op sysfs writes on every apply_profile.
+            try:
+                current = await self.get_pcie_aspm_policy()
+            except Exception:
+                current = None
+            if current == policy:
+                return True
+
+            try:
+                with open("/sys/module/pcie_aspm/parameters/policy", "w") as f:
+                    f.write(policy)
+            except PermissionError:
+                # ACPI FADT reports ASPM as unsupported on this BIOS
+                # (verified on ROG Ally X / JELOS: dmesg shows
+                # 'ACPI FADT declares the system doesn't support PCIe
+                # ASPM, so disable it'). The kernel honours the BIOS
+                # and makes the policy parameter read-only for the
+                # rest of the boot. There is nothing PowerDeck can do
+                # about it - the user has to either patch their BIOS
+                # ACPI table or live with the default policy.
+                # Cache this so we don't keep retrying on every apply.
+                self.device_info["supports_pcie_aspm"] = False
+                self.log_warning_once(
+                    f"PCIe ASPM policy is locked by the BIOS "
+                    f"(ACPI FADT reports ASPM unsupported). "
+                    f"profile.pcieAspm={policy!r} is being ignored; "
+                    f"current policy stays at {current or 'default'!r}."
+                )
+                return False
+            except OSError as e:
+                decky.logger.warning(f"Failed to set PCIe ASPM policy: {e}")
+                return False
+
+            # Verify the write took. Some kernels accept the write but
+            # report a different value back (rounded, normalised, or
+            # silently snapped to a default).
+            try:
+                actual = await self.get_pcie_aspm_policy()
+            except Exception:
+                actual = None
+            if actual is not None and actual != policy:
+                decky.logger.warning(
+                    f"PCIe ASPM write appeared to succeed but sysfs "
+                    f"reports {actual!r} (requested {policy!r})"
+                )
+                return False
+
             decky.logger.info(f"Set PCIe ASPM policy to: {policy}")
             return True
         except Exception as e:
-            decky.logger.error(f"Failed to set PCIe ASMP policy: {e}")
+            decky.logger.warning(f"Unexpected error setting PCIe ASPM policy: {e}")
             return False
 
     async def get_pcie_power_management(self) -> bool:
