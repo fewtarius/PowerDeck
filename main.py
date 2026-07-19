@@ -231,7 +231,20 @@ class Plugin:
         # Passive: Scheduler-driven, all governors available, standard cpufreq
         # Guided: Hybrid, EPP as hint for scheduler, performance/powersave only
         self.pstate_mode = "passive"  # Default to passive so scaling_max_freq is honored (active ignores it)
-        
+
+        # State contract for self-healing.
+        # _desired_state is the promise we make to the user after every
+        # apply: "sysfs should look like this". The game_monitor tick
+        # re-reads sysfs every 5s; if anything has drifted (amd_pmf
+        # reload, jelos-manager, kernel mode flip, a daemon race, etc.)
+        # we re-apply the contract. This is what closes the "performance
+        # randomly regressed and only a game relaunch fixed it" class
+        # of bug that has been showing up across sessions.
+        self._desired_state: Optional[Dict[str, Any]] = None
+        self._self_heal_last_check: float = 0.0
+        self._self_heal_last_reapply: float = 0.0
+        self._self_heal_recent_discrepancies: List[str] = []
+
     def log_warning_once(self, message: str):
         """Log a warning message only once to prevent spam"""
         if message not in self.warning_cache:
@@ -519,22 +532,27 @@ class Plugin:
         to the SMU every second via amd_pmf, so a successful write
         sticks in every platform profile.
 
-        The previous version force-wrote ACPI=performance to sysfs
-        before the TDP call. That workaround was a hack for the old
-        jelos-manager behaviour where SetTdpLimit was a no-op unless
-        the platform profile was performance. The jelos-manager TOML
-        gate has been removed, so the workaround is no longer needed
-        and is harmful here: it races with set_performance_profile_*
-        running later in apply_profile, and the platform profile write
-        always wins, so the user TDP is silently ignored.
+        On Steam Deck / Legion we call SetPerformanceProfile(performance)
+        first as a coordination hint so the firmware is in the right
+        state to accept the SMU write. On ROG Ally with jelos-manager,
+        SetPerformanceProfile is not registered and the call always
+        fails; the TDP write still succeeds. Skipping the prefatory
+        call on ROG Ally avoids the misleading "TDP limiting may not
+        be active" warning that previously appeared on every apply.
         """
         try:
-            # Force jelos-manager into performance only as a
-            # coordination hint (already a no-op when the power
-            # subsystem is claimed). The real write is SetTdpLimit.
-            profile_success = self._steamos_manager_call("SetPerformanceProfile", "performance")
-            if not profile_success:
-                decky.logger.warning("SteamOS Manager: Failed to set performance profile, TDP limiting may not be active")
+            # ROG Ally (jelos-manager) doesn't register SetPerformanceProfile.
+            # Skip the prefatory call on ROG Ally so the user doesn't see
+            # a misleading warning when TDP is actually being applied.
+            if getattr(self, 'device_type', None) != "rog_ally":
+                profile_success = self._steamos_manager_call(
+                    "SetPerformanceProfile", "performance"
+                )
+                if not profile_success:
+                    decky.logger.warning(
+                        "SteamOS Manager: SetPerformanceProfile failed; "
+                        "TDP write may not stick on this firmware"
+                    )
 
             success = self._steamos_manager_call("SetTdpLimit", tdp)
 
@@ -2374,17 +2392,34 @@ class Plugin:
             return False
 
     async def set_cpu_boost(self, enabled: bool) -> bool:
-        """Set CPU boost enable/disable using CPU manager"""
+        """Set CPU boost enable/disable using CPU manager.
+
+        On ROG Ally with native TDP enabled, pstate is locked to passive
+        by set_rog_ally_native_tdp_enabled / apply_profile. cpu_manager's
+        default behaviour on amd-pstate-epp is to flip pstate to active
+        when boost=True, which would silently undo the native lock from
+        a profile apply or UI slider. We pass respect_pstate_lock=True
+        in that case so the boost sysfs write still happens but pstate
+        stays put.
+        """
         try:
+            respect_pstate_lock = (
+                getattr(self, 'device_type', None) == "rog_ally"
+                and getattr(self, 'rog_ally_native_tdp_enabled', False)
+            )
             # Use CPU manager for boost control to avoid conflicts
             if hasattr(self, 'cpu_manager') and self.cpu_manager:
-                success = self.cpu_manager.set_cpu_boost(enabled)
+                success = self.cpu_manager.set_cpu_boost(
+                    enabled, respect_pstate_lock=respect_pstate_lock
+                )
             else:
                 # Fallback if CPU manager not available
                 from cpu_manager import get_cpu_manager
                 cpu_manager = get_cpu_manager()
-                success = cpu_manager.set_cpu_boost(enabled)
-            
+                success = cpu_manager.set_cpu_boost(
+                    enabled, respect_pstate_lock=respect_pstate_lock
+                )
+
             if success:
                 # Only update current_profile for hardware state tracking
                 # DO NOT save settings here as it overwrites user customizations
@@ -2473,17 +2508,28 @@ class Plugin:
                     
                     # After SMT change, reinitialize CPU topology to update sibling mappings
                     if hasattr(self, 'cpu_manager') and self.cpu_manager:
+                        # SMT change calls reapply_cpu_settings which
+                        # calls set_cpu_boost. In ROG Ally native TDP
+                        # mode set_cpu_boost must NOT flip amd_pstate,
+                        # so thread the lock through.
+                        respect_pstate_lock = (
+                            getattr(self, 'device_type', None) == "rog_ally"
+                            and getattr(self, 'rog_ally_native_tdp_enabled', False)
+                        )
                         info_log("Reinitializing CPU topology after SMT change...")
                         self.cpu_manager._topology_initialized = False
                         self.cpu_manager.initialize_cpu_topology()
-                        
+
                         # Reconfigure CPU cores to maintain the same physical core count
                         info_log(f"Reconfiguring CPU cores to {current_cores} after SMT change...")
                         await self.set_cpu_cores(current_cores)
-                        
+
                         # Reapply CPU settings to new topology
                         info_log("Reapplying CPU settings after SMT topology change...")
-                        self.cpu_manager.reapply_cpu_settings(current_boost, current_governor, current_epp)
+                        self.cpu_manager.reapply_cpu_settings(
+                            current_boost, current_governor, current_epp,
+                            respect_pstate_lock=respect_pstate_lock,
+                        )
                     
                     return True
                 except Exception as e:
@@ -3607,6 +3653,20 @@ class Plugin:
                 # than the powersave the profile may have carried.
                 self.current_profile["governor"] = "performance"
                 self.current_profile["pstateMode"] = "passive"
+                # Actually write sysfs. The sanitizer strips 'governor'
+                # from profile_data so the governor branch below in
+                # apply_profile never fires in native mode; without this
+                # write the sysfs governor could drift (e.g. jelos-manager
+                # on JELOS, or a SteamOS Manager call from elsewhere) and
+                # stay at powersave forever, capping CPU at min_freq.
+                try:
+                    if self.cpu_manager and self.cpu_manager.get_current_governor() != "performance":
+                        decky.logger.info(
+                            "Native TDP active: forcing governor -> performance"
+                        )
+                        await self.set_power_governor("performance")
+                except Exception as e:
+                    decky.logger.warning(f"Native TDP governor pre-check failed (non-fatal): {e}")
 
             success_count = 0
             total_operations = 0
@@ -3966,39 +4026,378 @@ class Plugin:
             elif "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally" and not self.rog_ally_native_tdp_enabled:
                 decky.logger.info(f"Skipping platform profile '{profile_data['platformProfile']}' - native TDP disabled, ryzenadj manages power limits directly")
 
-            # Re-apply TDP after platform profile change.
-            # When the platform profile changes, the OEM EC re-asserts
-            # its own STAPM/PPT defaults (and the amd_pmf platform-profile
-            # driver rewrites them within 1 second). The user-chosen TDP
-            # is lost in that transition, so we set it again to win the
-            # final write. This is a no-op when the platform profile did
-            # not change.
-            if "tdp" in profile_data and "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally" and self.rog_ally_native_tdp_enabled:
-                try:
-                    decky.logger.info(
-                        f"Re-applying TDP {profile_data['tdp']}W after platform profile "
-                        f"change to {profile_data['platformProfile']}"
-                    )
-                    tdp_reapply = await self.set_tdp(profile_data["tdp"])
-                    if tdp_reapply:
-                        decky.logger.info(f"TDP re-applied: {profile_data['tdp']}W (after platform profile change)")
-                    else:
-                        decky.logger.warning(f"TDP re-apply failed: {profile_data['tdp']}W")
-                except Exception as e:
-                    decky.logger.error(f"Error re-applying TDP after platform profile: {e}")
+            # Re-apply TDP after platform profile change (ROG Ally native
+            # only). The earlier code read TDP from profile_data, but
+            # the native-mode sanitizer at the top of apply_profile strips
+            # 'tdp' from profile_data - so that branch was dead code. The
+            # user-chosen TDP value lives in self.current_profile["tdp"]
+            # (mirrored there by set_tdp). When the platform profile flips,
+            # amd_pmf reasserts OEM STAPM/PPT defaults from in-memory state
+            # within its 1-second loop; we set TDP again here so the user's
+            # value wins the final write. Skip when native TDP is off -
+            # set_tdp_via_steamos_manager / set_amd_tdp drive TDP directly
+            # and are not subject to the amd_pmf reassert race.
+            if (getattr(self, 'device_type', None) == "rog_ally"
+                    and getattr(self, 'rog_ally_native_tdp_enabled', False)
+                    and "platformProfile" in profile_data):
+                current_tdp = self.current_profile.get("tdp")
+                if current_tdp is not None:
+                    try:
+                        decky.logger.info(
+                            f"Re-applying TDP {current_tdp}W after platform profile "
+                            f"change to {profile_data['platformProfile']}"
+                        )
+                        tdp_reapply = await self.set_tdp(current_tdp)
+                        if tdp_reapply:
+                            decky.logger.info(f"TDP re-applied: {current_tdp}W (after platform profile change)")
+                        else:
+                            decky.logger.warning(f"TDP re-apply failed: {current_tdp}W")
+                    except Exception as e:
+                        decky.logger.error(f"Error re-applying TDP after platform profile: {e}")
 
             # Calculate success rate
             if total_operations > 0:
                 success_rate = success_count / total_operations
                 decky.logger.info(f"Profile application completed: {success_count}/{total_operations} operations successful ({success_rate:.1%})")
-                return success_count == total_operations  # Require ALL operations to succeed
+                all_ok = success_count == total_operations
+                # Snapshot the contract for self-healing. The verify loop
+                # (called by game_monitor every tick) reads sysfs back
+                # and re-applies if anything has drifted. Without this,
+                # a slider that looks correct in the UI can silently leave
+                # the system in a worse state and the user only finds out
+                # when their game runs slow.
+                try:
+                    self._desired_state = self._snapshot_verify_contract(profile_data)
+                except Exception as contract_err:
+                    decky.logger.warning(
+                        f"apply_profile: contract snapshot failed (non-fatal): {contract_err}"
+                    )
+                # Post-apply verification: read back the sysfs values we
+                # just wrote and log any discrepancies. If we find drift
+                # (race, denied write, kernel still applying, etc.), retry
+                # the affected setters once before returning success.
+                discrepancies = self._verify_state()
+                if discrepancies:
+                    decky.logger.warning(
+                        f"apply_profile: post-apply drift detected: "
+                        f"{discrepancies}; retrying affected setters once"
+                    )
+                    retry_ok = await self._retry_discrepancies(discrepancies, profile_data)
+                    if retry_ok:
+                        decky.logger.info("apply_profile: retry resolved drift")
+                    else:
+                        decky.logger.error(
+                            f"apply_profile: drift not fully resolved: "
+                            f"{self._verify_state()}"
+                        )
+                return all_ok
             else:
                 decky.logger.warning("No profile operations to apply")
                 return False
-                
+
         except Exception as e:
             decky.logger.error(f"Failed to apply profile: {e}")
             return False
+
+    # ── State contract: snapshot, verify, retry, self-heal ──────────
+    #
+    # apply_profile sets self._desired_state to a snapshot of what we
+    # just told the hardware to look like. _verify_state reads back
+    # sysfs and compares. The game_monitor loop calls _verify_state
+    # every tick; if drift is found it re-applies the contract. Together
+    # this is what guarantees we cannot silently lose performance
+    # between profile applies. The architectural pattern is: setter
+    # writes sysfs, contract snapshot captures intent, verify reads
+    # sysfs back, retry loop fixes drift, self-heal loop keeps
+    # catching drift over time.
+
+    def _snapshot_verify_contract(self, profile_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Capture the sysfs state apply_profile just asked for.
+
+        The contract is deliberately narrow - only fields we know how
+        to read back end-to-end are included. current_profile is the
+        source of truth for what the user asked for; this method
+        projects that down to the subset the verify loop can check.
+        Anything not in the contract simply isn't self-heal-protected.
+        """
+        contract: Dict[str, Any] = {}
+        cp = dict(self.current_profile or {})
+
+        # CPU boost - the actual sysfs, not the higher-level pstate flip.
+        if "cpuBoost" in cp and cp["cpuBoost"] is not None:
+            try:
+                if os.path.exists("/sys/devices/system/cpu/cpufreq/boost"):
+                    contract["boost"] = "1" if cp["cpuBoost"] else "0"
+            except OSError:
+                pass
+
+        # Governor - cpu0 is representative; per-core writes go through
+        # the same path so a discrepancy here is a real regression.
+        if "governor" in cp and cp["governor"]:
+            contract["governor"] = cp["governor"]
+
+        # EPP - only meaningful in active/guided modes. Passive has no
+        # EPP sysfs; including an EPP contract in passive mode would
+        # always look drifted because there's nothing to read. We check
+        # amd_pstate/status first and only include the contract if
+        # the kernel isn't in passive.
+        if "epp" in cp and cp["epp"]:
+            try:
+                status_path = "/sys/devices/system/cpu/amd_pstate/status"
+                if os.path.exists(status_path):
+                    with open(status_path) as f:
+                        status = f.read().strip()
+                    if status != "passive":
+                        contract["epp"] = cp["epp"]
+            except OSError:
+                pass
+
+        # pstate_mode - the mode we asked for. ROG Ally native TDP
+        # locks this to passive; the contract reflects that.
+        if "pstateMode" in cp and cp["pstateMode"]:
+            contract["pstate_mode"] = cp["pstateMode"]
+
+        # SMT - read smt/control (user-requested state, not smt/active
+        # which is the current-online state and racy mid-topology-change).
+        if "smt" in cp and cp["smt"] is not None:
+            contract["smt"] = "on" if cp["smt"] else "off"
+
+        # TDP - device-specific. ROG Ally native mode keeps the value
+        # pinned via Armoury; non-native mode uses SteamOS Manager /
+        # ryzenadj. We snapshot whichever sysfs path the active code
+        # is expected to have written.
+        # All values stored as strings - sysfs reads come back as strings
+        # and string==string is the only comparison the verify loop runs,
+        # so int vs string mismatches would otherwise false-alarm every
+        # tick and force a re-apply spiral.
+        if "tdp" in cp and cp["tdp"] is not None:
+            tdp = int(cp["tdp"])
+            is_ally = getattr(self, 'device_type', None) == "rog_ally"
+            if is_ally and self.device_controller and getattr(self.device_controller, 'armoury_available', False):
+                contract["tdp_armoury_stapm"] = str(tdp)
+            elif is_ally:
+                contract["tdp_wmi_stapm_w"] = str(tdp)
+            else:
+                contract["tdp_value"] = str(tdp)
+
+        # Platform profile - ACPI; only meaningful on devices that
+        # expose it. ROG Ally native TDP uses it as the TDP knob.
+        #
+        # On ROG Ally native TDP, the user-chosen platform profile
+        # (e.g. "performance") only sticks in ACPI until the next
+        # Armoury write; the kernel then flips it to "custom" to
+        # signal "user firmware-attribute values". We re-apply TDP via
+        # Armoury *after* the platform profile write (see the
+        # Re-apply TDP after platform profile change block), so the
+        # steady state is "custom" - not the user's chosen name.
+        # Treating "custom" as drift causes self-heal to re-apply every
+        # minute for no user-visible benefit, so skip the contract on
+        # the verify path and rely on Armoury/TDP for the truth.
+        # Non-native ROG Ally and other devices keep the contract
+        # because their platform_profile isn't auto-flipped by Armoury.
+        if (getattr(self, 'device_type', None) == "rog_ally"
+                and getattr(self, 'rog_ally_native_tdp_enabled', False)
+                and "platformProfile" in profile_data):
+            # Intentionally not added - see comment above.
+            pass
+
+        # GPU DPM mode (AMD). Frontend sends strings like "auto"/
+        # "performance"; sysfs write maps to DPM levels.
+        if "gpuMode" in cp and cp["gpuMode"]:
+            dpm_map = {
+                "battery": "low", "balanced": "auto", "performance": "high",
+                "range": "manual", "manual": "manual",
+                "low": "low", "high": "high", "auto": "auto",
+            }
+            if cp["gpuMode"] in dpm_map:
+                contract["gpu_dpm_mode"] = dpm_map[cp["gpuMode"]]
+
+        return contract
+
+    def _verify_state(self) -> List[str]:
+        """Read sysfs and return a list of human-readable discrepancies
+        against the current contract. Empty list means everything we
+        asked for is actually in place on the hardware.
+        """
+        contract = getattr(self, "_desired_state", None)
+        if not contract:
+            return []
+        discrepancies: List[str] = []
+        for key, expected in contract.items():
+            actual = self._read_contract_field(key)
+            if actual is None:
+                # sysfs path unavailable on this device - skip
+                continue
+            if actual != expected:
+                discrepancies.append(f"{key}={actual} (expected {expected})")
+        return discrepancies
+
+    def _read_contract_field(self, key: str) -> Optional[str]:
+        """Read a single contract field from sysfs. Returns the value as
+        a string (matching how the contract stores it), or None if the
+        path doesn't exist on this device. None is the "skip" signal.
+        """
+        try:
+            if key == "boost":
+                with open("/sys/devices/system/cpu/cpufreq/boost") as f:
+                    return f.read().strip()
+            if key == "governor":
+                with open("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor") as f:
+                    return f.read().strip()
+            if key == "epp":
+                path = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
+                if not os.path.exists(path):
+                    return None
+                with open(path) as f:
+                    return f.read().strip()
+            if key == "pstate_mode":
+                with open("/sys/devices/system/cpu/amd_pstate/status") as f:
+                    return f.read().strip()
+            if key == "smt":
+                with open("/sys/devices/system/cpu/smt/control") as f:
+                    return f.read().strip()
+            if key == "tdp_armoury_stapm":
+                dc = getattr(self, "device_controller", None)
+                if dc and getattr(dc, "armoury_available", False):
+                    path = "/sys/devices/virtual/firmware-attributes/asus-armoury/attributes/ppt_pl1_spl/current_value"
+                    if os.path.exists(path):
+                        with open(path) as f:
+                            return f.read().strip()
+                return None
+            if key == "tdp_wmi_stapm_w":
+                path = "/sys/devices/platform/asus-nb-wmi/ppt_pl1_spl"
+                if not os.path.exists(path):
+                    return None
+                with open(path) as f:
+                    return str(int(f.read().strip()) // 1000)
+            if key == "tdp_value":
+                dc = getattr(self, "device_controller", None)
+                if dc and hasattr(dc, "get_power_limits"):
+                    limits = dc.get_power_limits()
+                    if limits and limits.get("stapm_limit") is not None:
+                        return str(limits["stapm_limit"])
+                return None
+            if key == "platform_profile":
+                path = "/sys/firmware/acpi/platform_profile"
+                if not os.path.exists(path):
+                    return None
+                with open(path) as f:
+                    return f.read().strip()
+            if key == "gpu_dpm_mode":
+                for card in ("card0", "card1"):
+                    dpm_path = f"/sys/class/drm/{card}/device/power_dpm_force_performance_level"
+                    if os.path.exists(dpm_path):
+                        with open(dpm_path) as f:
+                            return f.read().strip()
+                return None
+        except OSError:
+            return None
+        except Exception as e:
+            decky.logger.debug(f"_read_contract_field({key}) failed: {e}")
+            return None
+        return None
+
+    async def _retry_discrepancies(
+        self, discrepancies: List[str], profile_data: Dict[str, Any]
+    ) -> bool:
+        """Retry the writes corresponding to each post-apply discrepancy
+        once. Returns True if everything stuck on the retry. Best-effort:
+        we don't retry platformProfile (would re-trigger the amd_pmf
+        reassert loop on ROG Ally) and we don't retry pstate_mode
+        (kernel can take a few hundred ms to commit a flip).
+        """
+        if not discrepancies:
+            return True
+        cp = dict(self.current_profile or {})
+        ok = True
+        for disc in discrepancies:
+            key = disc.split("=", 1)[0]
+            try:
+                if key == "boost" and "cpuBoost" in cp:
+                    await self.set_cpu_boost(cp["cpuBoost"])
+                elif key == "governor" and "governor" in cp:
+                    await self.set_power_governor(cp["governor"])
+                elif key == "epp" and "epp" in cp:
+                    await self.set_epp(cp["epp"])
+                elif key == "smt" and "smt" in cp:
+                    await self.set_smt(cp["smt"])
+                elif key == "gpu_dpm_mode" and "gpuMode" in cp:
+                    await self.set_gpu_mode(cp["gpuMode"])
+                elif key in ("tdp_armoury_stapm", "tdp_wmi_stapm_w", "tdp_value") and "tdp" in cp:
+                    await self.set_tdp(cp["tdp"])
+                # pstate_mode and platform_profile retries skipped
+                # deliberately - see comment above.
+            except Exception as e:
+                decky.logger.error(f"Retry of {key} failed: {e}")
+                ok = False
+        return ok
+
+    async def _self_heal_tick(self, cooldown_s: float) -> None:
+        """One iteration of the self-heal loop. Called from game_monitor
+        every 5s.
+
+        Reads the contract via _verify_state. If drift is found, logs
+        it and, when the reapply cooldown has elapsed, runs a full
+        apply_profile with the current profile data to put the system
+        back where the user wants it.
+
+        The cooldown prevents a persistent drift (e.g. some kernel
+        thread fighting us every second) from hammering the hardware
+        with 5-second re-applies. If drift is still present after the
+        cooldown elapses, we try again; if it's gone, the next drift
+        starts a new cooldown.
+        """
+        contract = getattr(self, "_desired_state", None)
+        if not contract:
+            # No contract yet (plugin just started, no profile applied).
+            # Nothing to heal.
+            return
+        discrepancies = self._verify_state()
+        if not discrepancies:
+            # Healthy. Clear the recent-discrepancy memory so a future
+            # drift starts a clean log window.
+            if self._self_heal_recent_discrepancies:
+                decky.logger.info(
+                    "self_heal: state is now consistent with the contract"
+                )
+                self._self_heal_recent_discrepancies = []
+            return
+        now = time.time()
+        # Log only when the discrepancy set has changed, to avoid
+        # spamming the same drift every tick when the cooldown
+        # suppresses re-apply.
+        if discrepancies != self._self_heal_recent_discrepancies:
+            decky.logger.warning(
+                f"self_heal: drift detected against contract: {discrepancies}"
+            )
+            self._self_heal_recent_discrepancies = list(discrepancies)
+        if now - self._self_heal_last_reapply < cooldown_s:
+            # Still inside cooldown; log-only mode.
+            return
+        # Re-apply from the last-known-good profile. current_profile is
+        # the in-memory tracker that every setter mirrors to, so it
+        # reflects what the user asked for right now. If we don't have
+        # one (very early boot), skip the re-apply and wait for the
+        # next normal apply_profile to seed it.
+        cp = dict(self.current_profile or {})
+        if not cp:
+            return
+        if self._self_heal_last_reapply > 0:
+            since = int(now - self._self_heal_last_reapply)
+            decky.logger.info(
+                f"self_heal: re-applying profile to recover from drift "
+                f"({since}s since last reapply)"
+            )
+        else:
+            decky.logger.info(
+                "self_heal: re-applying profile to recover from drift "
+                "(first reapply since plugin start)"
+            )
+        try:
+            await self.apply_profile(cp)
+            self._self_heal_last_reapply = now
+        except Exception as e:
+            decky.logger.error(f"self_heal: re-apply raised: {e}")
 
     async def update_and_apply_settings(self, partial: Dict[str, Any]) -> bool:
         """Single UI control entry point. Merges partial into current_profile,
@@ -4060,6 +4459,18 @@ class Plugin:
             decky.logger.info(
                 f"update_and_apply_settings: applied={applied_keys} partial={ {k: v for k, v in partial.items() if v is not None} }"
             )
+            # Refresh the contract so the self-heal loop knows the new
+            # slider value is the target. Without this, a slider drag
+            # that changes cpuBoost/governor/etc. would leave the
+            # contract pointing at the old value, and the next drift
+            # detection would "correct" the user's new setting back to
+            # the old one.
+            try:
+                self._desired_state = self._snapshot_verify_contract(self.current_profile or {})
+            except Exception as contract_err:
+                decky.logger.debug(
+                    f"update_and_apply_settings: contract refresh failed (non-fatal): {contract_err}"
+                )
             return True
         except Exception as e:
             decky.logger.error(f"update_and_apply_settings failed: {e}")
@@ -5115,7 +5526,7 @@ class Plugin:
                     dict(self.current_profile)
                 )
                 self.current_profile.clear()
-                self.current_profile.update(sanitized)
+                self.current_profile.update(sanitised)
                 decky.logger.info(
                     f"Native TDP enabled: sanitised current_profile: {self.current_profile}"
                 )
@@ -6204,10 +6615,25 @@ class Plugin:
 
         """Poll Router for the running Steam game every 5s and apply its profile."""
         POLL_INTERVAL = 5  # seconds
+        # Self-heal re-apply throttle. Reading sysfs every tick is cheap;
+        # re-running apply_profile is not (it walks 13 setters). When
+        # drift is found, log it; only re-apply once every
+        # SELF_HEAL_REAPPLY_COOLDOWN_S seconds so a persistent drift
+        # doesn't burn CPU in a tight loop.
+        SELF_HEAL_REAPPLY_COOLDOWN_S = 60
         try:
             while True:
                 await asyncio.sleep(POLL_INTERVAL)
                 try:
+                    # Self-heal first: catch any drift introduced between
+                    # profile applies (amd_pmf reassert, jelos-manager
+                    # flip, kernel mode change from a set_cpu_boost call,
+                    # etc.). This runs every tick regardless of whether
+                    # the game/AC state changed - it is the safety net
+                    # that closes the "performance silently regressed and
+                    # only a game relaunch fixed it" class of bug.
+                    await self._self_heal_tick(SELF_HEAL_REAPPLY_COOLDOWN_S)
+
                     # Detect running Steam game via process list
                     result = subprocess.run(
                         ["ps", "aux"],

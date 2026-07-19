@@ -175,27 +175,27 @@ class CPUManager:
         self._online_cpus = self._get_online_cpus()
         decky_plugin.logger.debug(f"Updated online CPUs list: {self._online_cpus}")
     
-    def reapply_cpu_settings(self, current_boost: Optional[bool] = None, current_governor: Optional[str] = None, current_epp: Optional[str] = None):
+    def reapply_cpu_settings(self, current_boost: Optional[bool] = None, current_governor: Optional[str] = None, current_epp: Optional[str] = None, respect_pstate_lock: bool = False):
         """Reapply CPU settings after topology changes (SMT toggle, core changes)"""
         try:
             # Update online CPUs first
             self.update_online_cpus()
-            
+
             # Reapply boost setting if provided
             if current_boost is not None:
                 decky_plugin.logger.info(f"Reapplying CPU boost: {current_boost} after topology change")
-                self.set_cpu_boost(current_boost)
-            
+                self.set_cpu_boost(current_boost, respect_pstate_lock=respect_pstate_lock)
+
             # Reapply governor if provided
             if current_governor is not None:
                 decky_plugin.logger.info(f"Reapplying CPU governor: {current_governor} after topology change")
                 self.set_governor(current_governor)
-                
+
             # Reapply EPP if provided
             if current_epp is not None:
                 decky_plugin.logger.info(f"Reapplying EPP: {current_epp} after topology change")
                 self.set_epp(current_epp)
-                
+
         except Exception as e:
             decky_plugin.logger.error(f"Failed to reapply CPU settings after topology change: {e}")
     
@@ -403,18 +403,35 @@ class CPUManager:
         
         return None
     
-    def set_cpu_boost(self, enabled: bool) -> bool:
+    def set_cpu_boost(self, enabled: bool, respect_pstate_lock: bool = False) -> bool:
         """Set CPU boost enabled/disabled with proper AMD/Intel handling and frequency limits.
-        
+
     For amd-pstate-epp in active mode: boost=0 is not enforced by the hardware
-(kernel ignores scaling_max_freq in active mode). Switch to passive mode
-so the kernel actually honors the frequency cap. Without this the CPU
-runs at full clock speed regardless of the limit, burning 3-5W extra
-under any real workload (the EPP scheduler biases toward lower frequencies
-but does NOT enforce a hard cap)."""
+    (kernel ignores scaling_max_freq in active mode). Switch to passive mode
+    so the kernel actually honors the frequency cap. Without this the CPU
+    runs at full clock speed regardless of the limit, burning 3-5W extra
+    under any real workload (the EPP scheduler biases toward lower frequencies
+    but does NOT enforce a hard cap).
+
+    Parameters
+    ----------
+    enabled : bool
+        Whether boost should be on (True) or off (False).
+    respect_pstate_lock : bool, optional
+        When True, do NOT flip amd-pstate mode even on amd-pstate-epp
+        systems. ROG Ally native TDP mode locks pstate=passive so
+        that scaling_max_freq is a hard cap (active mode ignores it)
+        and so that the EPP/governor recovery flow in set_epp cannot
+        fire (passive mode has no EPP sysfs). A caller that holds that
+        lock passes respect_pstate_lock=True so cpuBoost cannot silently
+        undo the lock from a profile or UI slider. The boost sysfs
+        write below still runs - passive mode honours the cap
+        regardless of boost state. Default False (preserve historical
+        behaviour for non-native paths).
+        """
         try:
             boost_success = False
-            
+
             # amd-pstate-epp (active mode) ignores scaling_max_freq, so
             # capping the CPU at 1.1GHz requires switching to passive
             # mode where schedutil/powersave actually honour the limit.
@@ -422,8 +439,18 @@ but does NOT enforce a hard cap)."""
             # the kernel cmdline no longer forces amd_pstate=active, so
             # the system usually boots in passive already; this branch
             # is the safety net when it does not.
+            #
+            # ROG Ally native TDP mode locks pstate=passive (see
+            # main.py set_rog_ally_native_tdp_enabled). The lock is the
+            # source of truth in native mode; callers that hold it pass
+            # respect_pstate_lock=True so this branch is skipped.
             if self._scaling_driver == ScalingDriver.AMD_PSTATE_EPP:
-                if not enabled:
+                if respect_pstate_lock:
+                    decky_plugin.logger.info(
+                        "amd-pstate-epp: boost=%s but respect_pstate_lock=True; "
+                        "leaving pstate mode alone" % enabled
+                    )
+                elif not enabled:
                     self.set_pstate_mode("passive")
                     decky_plugin.logger.info(
                         "amd-pstate-epp: boost=0 -> switched to passive mode "
@@ -435,7 +462,7 @@ but does NOT enforce a hard cap)."""
                         "amd-pstate-epp: boost=1 -> switched to active mode "
                         "for full EPP-driven performance scaling"
                     )
-            
+
             # Intel: no_turbo (inverted logic)
             intel_path = "/sys/devices/system/cpu/intel_pstate/no_turbo"
             if os.path.exists(intel_path):
@@ -599,16 +626,42 @@ but does NOT enforce a hard cap)."""
         return None
     
     def set_pstate_mode(self, mode: str) -> bool:
-        """Set AMD/Intel P-State mode (active, passive, guided)"""
+        """Set AMD/Intel P-State mode (active, passive, guided).
+
+        Idempotent: reads the current status first and skips the sysfs
+        write if the kernel is already at the requested mode. The mode
+        flip itself takes a few milliseconds and can briefly stall
+        scheduling; calling apply_profile several times in a row (once
+        at top, once via set_cpu_boost, once via the pstateMode block)
+        should not pay that cost three times.
+        """
         try:
             # AMD P-State
             amd_path = "/sys/devices/system/cpu/amd_pstate/status"
             if os.path.exists(amd_path):
+                # Idempotency: read first, skip if already at target.
+                # The kernel accepts writes that match the current state
+                # but each write round-trips through cpufreq_policy and
+                # costs a few ms; on a fast-apply path we may write
+                # pstate 3+ times per apply_profile.
+                try:
+                    with open(amd_path, 'r') as f:
+                        current = f.read().strip()
+                    if current == mode:
+                        decky_plugin.logger.debug(
+                            f"amd_pstate already at {mode}, skipping write"
+                        )
+                        return True
+                except OSError:
+                    # Some kernels expose status as write-only or
+                    # intermittently unreadable during mode flips. Fall
+                    # through to the write and trust it.
+                    pass
                 with open(amd_path, 'w') as f:
                     f.write(mode)
                 decky_plugin.logger.info(f"Set amd_pstate mode to {mode}")
                 return True
-                
+
         except Exception as e:
             decky_plugin.logger.error(f"Failed to set P-State mode to {mode}: {e}")
         
