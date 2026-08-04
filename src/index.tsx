@@ -322,6 +322,7 @@ const getRogAllyNativeTdpEnabled = callable<[], boolean>("get_rog_ally_native_td
 const setRogAllyNativeTdpEnabled = callable<[enabled: boolean], boolean>("set_rog_ally_native_tdp_enabled");
 const isRogAllyDevice = callable<[], boolean>("is_rog_ally_device");
 const getTdpControlMode = callable<[], string>("get_tdp_control_mode");
+const getTdpControlAvailable = callable<[], { available: boolean; method: string; has_soft_control: boolean; reason: string }>("get_tdp_control_available");
 
 // InputPlumber Integration - Controller Emulation
 const getInputPlumberStatus = callable<[], any>("get_inputplumber_status");
@@ -619,6 +620,7 @@ const Content: React.FC = () => {
   const [availableGovernors, setAvailableGovernors] = useState<string[]>(['performance', 'powersave', 'ondemand', 'conservative', 'schedutil']);
   const [availableFanProfiles, setAvailableFanProfiles] = useState<string[]>(['auto', 'quiet', 'moderate', 'aggressive']);
   const [tdpLimits, setTdpLimits] = useState<{ min: number; max: number }>({ min: 4, max: 30 });
+  const [tdpControlAvailable, setTdpControlAvailable] = useState<{ available: boolean; method: string; has_soft_control: boolean; reason: string } | null>(null);
 
   // ROG Ally specific state
   const [isRogAlly, setIsRogAlly] = useState<boolean>(false);
@@ -1043,6 +1045,15 @@ const Content: React.FC = () => {
         setTdpLimits(limits);
         setCustomTdpMin(limits.min);
         setCustomTdpMax(limits.max);
+        
+        // Check if hardware TDP control is available
+        try {
+          const tdpControl = await getTdpControlAvailable();
+          setTdpControlAvailable(tdpControl);
+          debug.log(`TDP Control Available: ${tdpControl.available ? 'Yes' : 'No'} (${tdpControl.method}) - ${tdpControl.reason}`);
+        } catch (error) {
+          debug.error('Failed to check TDP control availability:', error);
+        }
         
         // Get default TDP from processor database (ctdp_min)
         const dbDefaultTdp = await getDefaultTdp();
@@ -1955,8 +1966,9 @@ const Content: React.FC = () => {
       
       {(() => {
         const shouldShow = !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled);
-        debug.log(`TDP Control visibility: isRogAllyDeviceDetected=${isRogAllyDeviceDetected}, rogAllyNativeTdpEnabled=${rogAllyNativeTdpEnabled}, shouldShow=${shouldShow}`);
-        return shouldShow;
+        const tdpAvailable = tdpControlAvailable?.available ?? true; // Default to showing if not checked yet
+        debug.log(`TDP Control visibility: isRogAllyDeviceDetected=${isRogAllyDeviceDetected}, rogAllyNativeTdpEnabled=${rogAllyNativeTdpEnabled}, tdpAvailable=${tdpAvailable}, shouldShow=${shouldShow && tdpAvailable}`);
+        return shouldShow && tdpAvailable;
       })() && (
         <PanelSection title="TDP Control">
         <DebouncedSlider
@@ -2009,6 +2021,45 @@ const Content: React.FC = () => {
           </>
         )}
       </PanelSection>
+      )}
+
+      {/* TDP Fallback Info - shown when hardware TDP control is unavailable but soft control is */}
+      {(() => {
+        const showFallback = !tdpControlAvailable?.available && tdpControlAvailable?.has_soft_control;
+        debug.log(`TDP Fallback visibility: available=${tdpControlAvailable?.available}, has_soft_control=${tdpControlAvailable?.has_soft_control}, showFallback=${showFallback}`);
+        return showFallback;
+      })() && (
+        <PanelSection title="TDP Control (Soft - Governor/EPP Mapping)">
+          <PanelSectionRow>
+            <div style={{ padding: '8px 0', fontSize: '12px', color: 'var(--text-secondary)' }}>
+              Hardware TDP control is unavailable (likely Secure Boot blocking ryzenadj).
+              <br />
+              The TDP slider below maps to CPU governor/EPP profiles instead of actual watts:
+            </div>
+          </PanelSectionRow>
+          <PanelSectionRow>
+            <div style={{ padding: '8px 0', fontSize: '11px', color: 'var(--text-tertiary)' }}>
+              • <b>Battery Saver</b> (Low TDP): powersave governor + power EPP<br />
+              • <b>Balanced</b> (Medium TDP): schedutil governor + balance_power EPP<br />
+              • <b>Performance</b> (High TDP): performance governor + performance EPP
+            </div>
+          </PanelSectionRow>
+          <DebouncedSlider
+            label="Power Profile"
+            value={currentProfile.tdp}
+            min={tdpLimits.min}
+            max={tdpLimits.max}
+            step={1}
+            onChange={() => {}}
+            onChangeEnd={handleTdpChange}
+            suffix="W"
+          />
+          <PanelSectionRow>
+            <div style={{ padding: '4px 0', fontSize: '11px', color: 'var(--text-tertiary)' }}>
+              Method: {tdpControlAvailable?.method || 'unknown'} — {tdpControlAvailable?.reason || ''}
+            </div>
+          </PanelSectionRow>
+        </PanelSection>
       )}
 
       {/* ROG Ally Platform Profile Section - High priority placement */}

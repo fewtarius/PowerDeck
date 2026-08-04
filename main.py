@@ -2224,6 +2224,15 @@ class Plugin:
                     success = await self.set_intel_tdp(tdp)
                 else:
                     success = await self.set_amd_tdp(tdp)
+                
+                # ── Priority 3: AMD pstate fallback for Secure Boot / ryzenadj failure ──────
+                # On systems with Secure Boot (ryzenadj blocked) and no amd_pmf platform_profile
+                # or kernel power_profile interface, use amd-pstate-epp governor/EPP mapping
+                # to provide TDP-like control. This doesn't set actual watts but maps the
+                # slider position to power/performance profiles.
+                if not success and self.device_info["cpu_vendor"] == "AMD":
+                    decky.logger.info("ryzenadj failed (likely Secure Boot), falling back to amd-pstate-epp governor/EPP mapping")
+                    success = await self.set_amd_tdp_via_pstate(tdp)
             
             if success:
                 # Track in current_profile for state reporting.
@@ -2268,6 +2277,83 @@ class Plugin:
             return False
         except Exception as e:
             decky.logger.error(f"Intel TDP set failed: {e}")
+            return False
+
+    async def set_amd_tdp_via_pstate(self, tdp: int) -> bool:
+        """Set AMD TDP via amd-pstate-epp governor/EPP mapping when ryzenadj is unavailable.
+        
+        This provides "soft" TDP control by mapping the TDP slider position to
+        governor/EPP combinations. Does not set actual watts but provides
+        power/performance behavior control.
+        
+        TDP ranges mapped to governor/EPP:
+        - Low (min - 33%): powersave + power EPP (max battery)
+        - Medium (33% - 66%): schedutil + balance_power EPP (balanced)
+        - High (66% - max): performance + performance EPP (max performance)
+        """
+        try:
+            # Check if we have amd-pstate-epp available
+            pstate_mode = await self.get_pstate_mode()
+            if pstate_mode not in ["active", "passive", "guided"]:
+                decky.logger.warning(f"amd-pstate mode '{pstate_mode}' not suitable for TDP mapping")
+                return False
+            
+            # Check EPP availability
+            epp_path = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
+            has_epp = os.path.exists(epp_path)
+            
+            # Get TDP range for percentage calculation
+            min_tdp = self.tdp_limits["min"]
+            max_tdp = self.tdp_limits["max"]
+            tdp_range = max_tdp - min_tdp
+            
+            if tdp_range <= 0:
+                decky.logger.warning("Invalid TDP range for pstate mapping")
+                return False
+            
+            # Calculate percentage position in range
+            tdp_pct = (tdp - min_tdp) / tdp_range
+            
+            # Map to governor/EPP profiles
+            if tdp_pct <= 0.33:
+                # Low power / battery saver
+                governor = "powersave"
+                epp = "power" if has_epp else None
+                profile_name = "battery_saver"
+            elif tdp_pct <= 0.66:
+                # Balanced
+                governor = "schedutil"
+                epp = "balance_power" if has_epp else None
+                profile_name = "balanced"
+            else:
+                # Performance
+                governor = "performance"
+                epp = "performance" if has_epp else None
+                profile_name = "performance"
+            
+            # Apply governor
+            gov_success = await self.set_power_governor(governor)
+            if not gov_success:
+                decky.logger.error(f"Failed to set governor '{governor}' for pstate TDP mapping")
+                return False
+            
+            # Apply EPP if available
+            if has_epp and epp:
+                epp_success = await self.set_epp(epp)
+                if not epp_success:
+                    decky.logger.warning(f"Failed to set EPP '{epp}' for pstate TDP mapping (governor succeeded)")
+            
+            decky.logger.info(
+                f"AMD TDP via pstate ({profile_name}): governor={governor}"
+                f"{', EPP=' + epp if epp else ''} (tdp={tdp}W, {tdp_pct*100:.0f}% of range)"
+            )
+            
+            # Track in current_profile
+            self.current_profile["tdp"] = tdp
+            return True
+            
+        except Exception as e:
+            decky.logger.error(f"AMD TDP via pstate failed: {e}")
             return False
 
     async def set_amd_tdp(self, tdp: int) -> bool:
@@ -5863,6 +5949,129 @@ class Plugin:
         else:
             return {"min": 4, "max": 25}  # Conservative fallback
 
+    async def get_tdp_control_available(self) -> Dict[str, Any]:
+        """Check if hardware TDP control is available on this device.
+        
+        Returns dict with:
+        - available: True if real watt-level TDP control works
+        - method: What method provides TDP control ('ryzenadj', 'amd_pmf', 'steamos_manager', 'pstate_fallback', 'none')
+        - has_soft_control: True if pstate governor/EPP fallback is available
+        - reason: Human-readable explanation
+        """
+        try:
+            device_name = await self.get_device_name()
+            device_lower = device_name.lower() if device_name else ""
+            cpu_vendor = self.device_info.get("cpu_vendor", "Unknown")
+            
+            # Check SteamOS Manager first
+            if self.steamos_manager_available and not hasattr(self, '_external_manager_token'):
+                return {
+                    "available": True,
+                    "method": "steamos_manager",
+                    "has_soft_control": False,
+                    "reason": "SteamOS Manager provides TDP control"
+                }
+            
+            # Check device-specific native controllers
+            if self.device_controller:
+                if self.device_type == "rog_ally" and self.rog_ally_native_tdp_enabled:
+                    return {
+                        "available": True,
+                        "method": "amd_pmf",
+                        "has_soft_control": False,
+                        "reason": "ROG Ally native TDP (amd_pmf) enabled"
+                    }
+                elif self.device_type in ["legion", "steam_deck"]:
+                    return {
+                        "available": True,
+                        "method": "native_controller",
+                        "has_soft_control": False,
+                        "reason": f"{self.device_type} native controller provides TDP control"
+                    }
+            
+            # Check ryzenadj availability
+            if self.ryzenadj_path:
+                # Test if ryzenadj actually works (not blocked by Secure Boot)
+                try:
+                    clean_env = dict(os.environ)
+                    clean_env.pop("LD_LIBRARY_PATH", None)
+                    result = subprocess.run(
+                        [self.ryzenadj_path, '-i'],
+                        capture_output=True, text=True, timeout=5,
+                        env=clean_env
+                    )
+                    if result.returncode == 0:
+                        return {
+                            "available": True,
+                            "method": "ryzenadj",
+                            "has_soft_control": False,
+                            "reason": "ryzenadj provides direct SMU TDP control"
+                        }
+                except Exception:
+                    pass
+            
+            # Check AMD RAPL for power limit control
+            if cpu_vendor == "AMD":
+                # Check if RAPL has constraint_*_power_limit_uw files (actual control)
+                rapl_constraints = glob.glob("/sys/class/powercap/intel-rapl:0/constraint_*_power_limit_uw")
+                if rapl_constraints:
+                    return {
+                        "available": True,
+                        "method": "amd_rapl",
+                        "has_soft_control": False,
+                        "reason": "AMD RAPL provides power limit control"
+                    }
+            
+            # Check for amd_pmf platform_profile (ACPI interface)
+            if cpu_vendor == "AMD":
+                if os.path.exists("/sys/firmware/acpi/platform_profile"):
+                    choices_path = "/sys/firmware/acpi/platform_profile_choices"
+                    if os.path.exists(choices_path):
+                        return {
+                            "available": True,
+                            "method": "amd_pmf_platform_profile",
+                            "has_soft_control": False,
+                            "reason": "AMD PMF platform_profile provides TDP control"
+                        }
+            
+            # Check kernel power_profile (amdgpu sysfs patch)
+            if cpu_vendor == "AMD" and self.has_kernel_power_profile:
+                return {
+                    "available": True,
+                    "method": "kernel_power_profile",
+                    "has_soft_control": False,
+                    "reason": "Kernel power_profile sysfs provides TDP control"
+                }
+            
+            # Check if amd-pstate-epp soft control is available
+            pstate_mode = await self.get_pstate_mode()
+            if cpu_vendor == "AMD" and pstate_mode in ["active", "passive", "guided"]:
+                epp_path = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
+                has_epp = os.path.exists(epp_path)
+                return {
+                    "available": False,
+                    "method": "pstate_fallback",
+                    "has_soft_control": True,
+                    "reason": f"Hardware TDP control unavailable (Secure Boot?). amd-pstate-epp governor/EPP fallback available ({pstate_mode} mode{' + EPP' if has_epp else ', no EPP'})"
+                }
+            
+            # No TDP control available
+            return {
+                "available": False,
+                "method": "none",
+                "has_soft_control": False,
+                "reason": "No TDP control method available"
+            }
+            
+        except Exception as e:
+            decky.logger.error(f"Failed to check TDP control availability: {e}")
+            return {
+                "available": False,
+                "method": "error",
+                "has_soft_control": False,
+                "reason": f"Error checking TDP control: {e}"
+            }
+
     async def get_device_classification(self) -> str:
         """Get device classification (Handheld, Portable, Desktop) for profile naming"""
         try:
@@ -7767,6 +7976,10 @@ async def get_default_tdp():
     """Global function called by frontend - get default TDP from processor database"""
     device_info = await plugin.get_device_info()
     return device_info.get("tdp_default", 15)  # Database default (ctdp_min)
+
+async def get_tdp_control_available():
+    """Global function called by frontend - check if hardware TDP control is available"""
+    return await plugin.get_tdp_control_available()
 
 async def set_gpu_mode(mode: str):
     """Global function called by frontend"""
