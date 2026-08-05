@@ -182,8 +182,19 @@ class Plugin:
         # TDP limits will be set from processor database or sysfs during initialization
         self.tdp_limits = {"min": 4, "max": None}  # Min is hard-coded 4W, max from database
         self.enable_per_game_profiles = True  # Per-game profiles setting - enabled by default
-        self.rog_ally_native_tdp_enabled = False  # ROG Ally native TDP support - disabled by default
-        self._rog_ally_native_tdp_explicitly_set = False  # Track if user explicitly set this
+        # Power-control path is auto-selected at init from
+        # _detect_power_control_capabilities(): "platform_profile",
+        # "native_tdp", or "none". The frontend reads the capabilities
+        # blob from device_info and renders the matching UI.
+        self.power_control_capabilities = {
+            "platform_profile_available": False,
+            "platform_profile_choices": [],
+            "native_tdp_available": False,
+            "secure_boot_enabled": False,
+            "dev_mem_available": False,
+            "active_method": "none",
+            "reason": "not yet detected",
+        }
         self.device_info = {
             "device_name": "Unknown Device",
             "cpu_vendor": "unknown",
@@ -262,7 +273,292 @@ class Plugin:
     #   4. It avoids the WMI sysfs showing garbage values (5mW bug)
     #
     # We still fall back to ryzenadj for live application when
-    # steamos-manager is not available or when the DBus call fails.
+# steamos-manager is not available or when the DBus call fails.
+
+    async def _detect_secure_boot(self) -> bool:
+        """Return True if UEFI Secure Boot is enabled.
+
+        Reads the EFI 'SecureBoot' variable. The value is a single
+        byte (0x00 disabled, 0x01 enabled) after the EFI variable
+        attributes header. Returns False if the variable is absent
+        (BIOS/legacy boot) or unreadable. When Secure Boot is on,
+        ryzenadj's /dev/mem MMIO path is blocked by the kernel, so
+        native AMD TDP control cannot work.
+        """
+        try:
+            path = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+            if not os.path.exists(path):
+                return False
+            with open(path, "rb") as f:
+                data = f.read()
+            if len(data) < 5:
+                return False
+            return data[4] == 1
+        except Exception as e:
+            decky.logger.debug(f"Secure Boot detection failed: {e}")
+            return False
+
+    def _detect_dev_mem(self) -> bool:
+        """Return True if /dev/mem is usable for ryzenadj MMIO access.
+
+        Even when the node exists, the kernel may restrict it (Secure
+        Boot, CONFIG_STRICT_DEVMEM, containerised plugin loader).
+        Open it read-only and immediately close to confirm reachability.
+        """
+        try:
+            path = "/dev/mem"
+            if not os.path.exists(path):
+                return False
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                os.close(fd)
+            except Exception as e:
+                decky.logger.debug(f"/dev/mem close failed: {e}")
+            return True
+        except Exception as e:
+            decky.logger.debug(f"/dev/mem not usable: {e}")
+            return False
+
+    def _detect_acpi_platform_profile_available(self) -> Tuple[bool, List[str]]:
+        """Detect ACPI platform_profile sysfs handles.
+
+        Returns (available, choices). choices is the list of valid
+        profile strings read from platform_profile_choices; empty
+        when unavailable.
+        """
+        path = "/sys/firmware/acpi/platform_profile"
+        choices_path = "/sys/firmware/acpi/platform_profile_choices"
+        try:
+            if not os.path.exists(path) or not os.path.exists(choices_path):
+                return False, []
+            with open(choices_path, "r") as f:
+                choices = [c for c in f.read().strip().split() if c]
+            return bool(choices), choices
+        except Exception as e:
+            decky.logger.debug(f"ACPI platform_profile detection failed: {e}")
+            return False, []
+
+    async def _detect_power_control_capabilities(self) -> Dict[str, Any]:
+        """Pick the active power-control method from the available hardware.
+
+        Priority order:
+          1. ACPI platform_profile + platform_profile_choices
+             (Nimo Axis, upcoming JELOS, ROG Ally amd_pmf, etc.) - the
+             kernel/EC handles TDP, so PowerDeck just writes a profile
+             string. Always wins when present.
+          2. Native TDP via ryzenadj + /dev/mem. Requires Secure Boot
+             disabled and /dev/mem readable. Used when the ACPI
+             interface is missing (Steam Deck, AYANEO, most Strix
+             Point/Halo handhelds and mini-PCs).
+          3. None - only amd-pstate-epp governor/EPP available. UI
+             sliders stay but no watt-level control.
+        """
+        acpi_available, acpi_choices = self._detect_acpi_platform_profile_available()
+        if acpi_available:
+            return {
+                "platform_profile_available": True,
+                "platform_profile_choices": acpi_choices,
+                "native_tdp_available": False,
+                "secure_boot_enabled": self._detect_secure_boot(),
+                "dev_mem_available": self._detect_dev_mem(),
+                "active_method": "platform_profile",
+                "reason": "ACPI platform_profile provides TDP control",
+            }
+
+        secure_boot = self._detect_secure_boot()
+        dev_mem = self._detect_dev_mem()
+        if not secure_boot and dev_mem:
+            return {
+                "platform_profile_available": False,
+                "platform_profile_choices": [],
+                "native_tdp_available": True,
+                "secure_boot_enabled": False,
+                "dev_mem_available": True,
+                "active_method": "native_tdp",
+                "reason": "ryzenadj + /dev/mem provides native TDP control",
+            }
+
+        reasons = []
+        if secure_boot:
+            reasons.append("Secure Boot blocks /dev/mem")
+        if not dev_mem:
+            reasons.append("/dev/mem is not usable")
+        return {
+            "platform_profile_available": False,
+            "platform_profile_choices": [],
+            "native_tdp_available": False,
+            "secure_boot_enabled": secure_boot,
+            "dev_mem_available": dev_mem,
+            "active_method": "none",
+            "reason": "Native TDP unavailable (" + ", ".join(reasons) + "); using amd-pstate governor/EPP fallback",
+        }
+
+    async def _apply_power_control_method(self) -> None:
+        """Apply the detected power-control method after init.
+
+        Mirrors the legacy set_rog_ally_native_tdp_enabled(enabled=True)
+        flow for whichever path won selection: lock pstate=passive,
+        set governor=performance, sanitise the current profile so
+        PowerDeck-owned fields (tdp, governor, epp, pstateMode) don't
+        fight amd_pmf's 1s SMU refresh loop. Called once during _main
+        after hardware detection completes.
+        """
+        method = self.power_control_capabilities["active_method"]
+        if method == "none":
+            return
+        try:
+            current_pstate = await self.get_pstate_mode()
+            if current_pstate != "passive":
+                decky.logger.info(
+                    f"Power control native: forcing pstate {current_pstate} -> passive"
+                )
+                await self.set_pstate_mode("passive")
+            current_governor = (
+                self.cpu_manager.get_current_governor()
+                if hasattr(self, "cpu_manager") and self.cpu_manager
+                else None
+            )
+            if current_governor != "performance":
+                decky.logger.info(
+                    f"Power control native: setting governor {current_governor} -> performance"
+                )
+                await self.set_power_governor("performance")
+            self.current_profile["pstateMode"] = "passive"
+            self.current_profile["governor"] = "performance"
+            sanitised = self._sanitize_profile_for_native_mode(dict(self.current_profile))
+            self.current_profile.clear()
+            self.current_profile.update(sanitised)
+            await self.save_settings()
+            decky.logger.info(
+                f"Power control method locked: {method}"
+            )
+        except Exception as e:
+            decky.logger.error(f"Failed to apply power control method: {e}")
+
+    async def get_power_control_capabilities(self) -> Dict[str, Any]:
+        """Return the capabilities blob for the frontend."""
+        if hasattr(self, "power_control_capabilities"):
+            return self.power_control_capabilities
+        self.power_control_capabilities = await self._detect_power_control_capabilities()
+        return self.power_control_capabilities
+
+    def power_control_native_active(self) -> bool:
+        """True when PowerDeck owns the CPU performance path.
+
+        Both the ACPI platform_profile path and the native ryzenadj
+        /dev/mem path force pstate=passive + governor=performance so
+        amd_pmf (or the kernel) can drive TDP without a three-way
+        fight. This helper is the single source of truth for "should
+        the UI hide governor/EPP/boost/SMT sliders".
+        """
+        return (
+            hasattr(self, "power_control_capabilities")
+            and self.power_control_capabilities.get("active_method") != "none"
+        )
+
+    @property
+    def rog_ally_native_tdp_enabled(self) -> bool:
+        """Compatibility shim for legacy call sites.
+
+        Returns True only when native mode is actually running on a
+        ROG Ally (i.e. Armoury Crate is in use). New code should use
+        power_control_native_active() or check active_method directly.
+        """
+        return (
+            self.power_control_native_active()
+            and getattr(self, "device_type", None) == "rog_ally"
+        )
+
+    def _tdp_watts_to_platform_profile(self, tdp_watts: int) -> str:
+        """Map a watt value to the closest ACPI platform profile.
+
+        The platform profile slider is the user-facing knob when
+        active_method='platform_profile', but legacy callers may still
+        hand us a watt value (per-game profiles saved before the
+        migration). Pick the profile whose midpoint is closest so a
+        15W profile from a handheld template still lands on "balanced"
+        instead of clamping to "low-power".
+        """
+        choices = self.power_control_capabilities.get(
+            "platform_profile_choices", []
+        )
+        # Normalise the canonical three options if the device only
+        # exposes a longer list - the legacy UI only knew about
+        # power-saver/balanced/performance.
+        canonical = {
+            "low-power": "power-saver",
+            "balanced": "balanced",
+            "performance": "performance",
+        }
+        ordered = [
+            "power-saver",
+            "low-power",
+            "balanced",
+            "performance",
+        ]
+        # Build a sorted list of (label, midpoint_watts) from the
+        # device database or processor defaults; fall back to a
+        # reasonable 8/15/25W spread if no data is available.
+        midpoints = {
+            "power-saver": 8,
+            "low-power": 8,
+            "balanced": 15,
+            "performance": 25,
+        }
+        try:
+            tdp_min = self.tdp_limits.get("min", 4)
+            tdp_max = self.tdp_limits.get("max") or 25
+            midpoints["performance"] = int(tdp_max * 0.95)
+            midpoints["balanced"] = int((tdp_min + tdp_max) / 2)
+            midpoints["low-power"] = int(tdp_min + 2)
+            midpoints["power-saver"] = tdp_min
+        except Exception:
+            pass
+        # Pick from the intersection of device choices and our ordered list.
+        candidates = [c for c in ordered if not choices or c in choices or canonical.get(c) in choices]
+        if not candidates:
+            return "balanced"
+        # Closest by absolute wattage distance.
+        best = min(candidates, key=lambda c: abs(midpoints.get(c, 15) - tdp_watts))
+        # Map device-specific names back to the canonical labels.
+        return canonical.get(best, best)
+
+    def _write_platform_profile_sysfs(self, profile: str) -> bool:
+        """Write directly to /sys/firmware/acpi/platform_profile.
+
+        Used as the final fallback for devices that expose the ACPI
+        sysfs but don't have a dedicated device controller (Nimo Axis,
+        JELOS pre-update). Validates the profile string against the
+        live choices list to avoid EINVAL on the kernel write.
+        """
+        path = "/sys/firmware/acpi/platform_profile"
+        try:
+            if not os.path.exists(path):
+                return False
+            # The platform_profile_choices list may use vendor-specific
+            # names ("low-power") while the UI sends the canonical
+            # names ("power-saver"); accept either.
+            with open(
+                "/sys/firmware/acpi/platform_profile_choices", "r"
+            ) as f:
+                choices = f.read().strip().split()
+            canonical_to_vendor = {
+                "power-saver": "low-power",
+            }
+            vendor = canonical_to_vendor.get(profile, profile)
+            if profile not in choices and vendor not in choices:
+                decky.logger.error(
+                    f"Invalid platform profile {profile}; choices={choices}"
+                )
+                return False
+            target = vendor if vendor in choices else profile
+            with open(path, "w") as f:
+                f.write(target)
+            decky.logger.info(f"platform_profile sysfs set to {target}")
+            return True
+        except Exception as e:
+            decky.logger.error(f"Failed to write platform_profile sysfs: {e}")
+            return False
 
     def _detect_steamos_manager(self) -> bool:
         """Check if steamos-manager DBus service is available on the system bus."""
@@ -673,6 +969,15 @@ class Plugin:
         self.is_jelos = self._detect_jelos()
         decky.logger.info(f"JELOS distribution detected: {self.is_jelos}")
 
+        # Pick the active power-control method (ACPI platform_profile,
+        # native TDP via /dev/mem, or amd-pstate fallback) before any
+        # settings get loaded - the result feeds the rest of init and
+        # is surfaced to the frontend via get_device_info.
+        self.power_control_capabilities = await self._detect_power_control_capabilities()
+        decky.logger.info(
+            f"Power control capabilities: {self.power_control_capabilities}"
+        )
+
         # Acquire power subsystem from jelos-manager via ExternalManager1
         # This tells jelos-manager to stop managing CPU/GPU so PowerDeck can take over
         if self.steamos_manager_available:
@@ -723,6 +1028,14 @@ class Plugin:
                 
                 # Load unified profiles instead of old settings format
                 await self.load_unified_profiles()
+
+                # Lock the CPU performance path (pstate=passive,
+                # governor=performance, sanitised profile) when
+                # platform_profile or native TDP owns TDP control.
+                # Mirrors the legacy ROG Ally native mode setup, but
+                # applies to any device where the chosen method is
+                # native.
+                await self._apply_power_control_method()
                 
                 # Initialize enhanced sleep/wake management
                 if device_support_available:
@@ -1531,15 +1844,6 @@ class Plugin:
                 if "enablePerGameProfiles" in saved_settings:
                     self.enable_per_game_profiles = saved_settings["enablePerGameProfiles"]
                     decky.logger.info(f"LOAD_SETTINGS: Set enablePerGameProfiles to {self.enable_per_game_profiles}")
-                    
-                if "rogAllyNativeTdpEnabled" in saved_settings:
-                    self.rog_ally_native_tdp_enabled = saved_settings["rogAllyNativeTdpEnabled"]
-                    decky.logger.info(f"LOAD_SETTINGS: Set rogAllyNativeTdpEnabled to {self.rog_ally_native_tdp_enabled}")
-                else:
-                    # Default to True for ROG Ally devices, False for others if not found in settings
-                    # Keep last known value or default to False to prevent unexpected UI changes
-                    self.rog_ally_native_tdp_enabled = False
-                    decky.logger.info(f"LOAD_SETTINGS: Set default rogAllyNativeTdpEnabled to {self.rog_ally_native_tdp_enabled} (ROG Ally device: {await self.is_rog_ally_device()})")
             else:
                 decky.logger.error(f"LOAD_SETTINGS: self.settings is None!")
         except Exception as e:
@@ -1556,7 +1860,6 @@ class Plugin:
                     "currentProfile": self.current_profile,
                     "tdpLimits": self.tdp_limits,
                     "enablePerGameProfiles": self.enable_per_game_profiles,
-                    "rogAllyNativeTdpEnabled": self.rog_ally_native_tdp_enabled
                 }
                 decky.logger.info(f"SAVE_SETTINGS: Saving settings data: {settings_data}")
                 self.settings.set("powerDeckSettings", settings_data)
@@ -1830,8 +2133,11 @@ class Plugin:
                 except Exception as e:
                     decky.logger.error(f"Failed to apply original hardware default profile during initialization: {e}")
                 
-            # ROG Ally native TDP support - this is loaded from saved settings, not reset here
-            debug_log(f"ROG Ally native TDP support loaded from settings: {self.rog_ally_native_tdp_enabled}")
+            # ROG Ally native TDP support - now derived from the
+            # auto-detected power_control_capabilities (see
+            # _detect_power_control_capabilities); the previous
+            # settings persistence has been removed.
+            debug_log(f"ROG Ally native TDP support auto-detected: {self.rog_ally_native_tdp_enabled}")
             
             # Migrate from old settings format if they exist
             
@@ -1921,6 +2227,15 @@ class Plugin:
             # JELOS exposes additional GPU mode options (DPM "high" is safe on JELOS)
             self.device_info["isJELOS"] = self.is_jelos
             self.device_info["tdpControlMode"] = await self.get_tdp_control_mode()
+            # Power-control capability blob: tells the UI which slider
+            # to render (watt vs platform profile) and whether the
+            # device owns the CPU performance path (which hides the
+            # governor/EPP/boost/SMT sliders).
+            self.device_info["powerControl"] = self.power_control_capabilities
+            self.device_info["platformProfileChoices"] = self.power_control_capabilities.get(
+                "platform_profile_choices", []
+            )
+            self.device_info["powerControlActive"] = self.power_control_native_active()
 
             return self.device_info
         except Exception as e:
@@ -2033,9 +2348,9 @@ class Plugin:
             # cpuBoost, governor, etc.). Strip the hardware-managed
             # fields so a stale Handheld-cloned profile doesn't keep
             # coming back. The apply-side sanitizer covers existing
-            # files; this covers new writes.
-            if (getattr(self, 'device_type', None) == "rog_ally"
-                    and getattr(self, 'rog_ally_native_tdp_enabled', False)):
+            # files; this covers new writes. Applies on any device
+            # whose active method owns the CPU performance path.
+            if self.power_control_native_active():
                 profile_copy = self._sanitize_profile_for_native_mode(profile_copy)
 
             # CRITICAL DEBUGGING: Full call context
@@ -2152,12 +2467,53 @@ class Plugin:
             # Validate TDP range
             min_tdp = self.tdp_limits["min"]
             max_tdp = self.tdp_limits["max"]
-            
+
             if tdp < min_tdp:
                 tdp = min_tdp
             elif tdp > max_tdp:
                 tdp = max_tdp
-            
+
+            # When the active method is the ACPI platform_profile sysfs
+            # (Nimo Axis, JELOS post-next-release, ROG Ally amd_pmf),
+            # watt values aren't a control surface - the platform
+            # profile string owns TDP and the UI hides the watt slider.
+            # Map watt to the closest profile, write that, and report
+            # success so apply_profile's success counters stay accurate.
+            if (
+                hasattr(self, "power_control_capabilities")
+                and self.power_control_capabilities.get("active_method")
+                == "platform_profile"
+            ):
+                profile = self._tdp_watts_to_platform_profile(tdp)
+                decky.logger.info(
+                    f"set_tdp({tdp}W) -> platform_profile={profile} "
+                    f"(active_method=platform_profile)"
+                )
+                if self.steamos_manager_available and not hasattr(
+                    self, "_external_manager_token"
+                ):
+                    ok = await self.set_performance_profile_via_steamos_manager(profile)
+                else:
+                    # Generic ACPI platform_profile write for non-Ally
+                    # devices (Nimo Axis, JELOS). Falls through to the
+                    # ROG Ally controller when on Ally since it exposes
+                    # the same sysfs path.
+                    if self.device_controller and hasattr(
+                        self.device_controller, "set_platform_profile"
+                    ):
+                        ok = self.device_controller.set_platform_profile(profile)
+                    else:
+                        ok = self._write_platform_profile_sysfs(profile)
+                if ok:
+                    self.current_profile["tdp"] = tdp
+                    if "platformProfile" not in self.current_profile:
+                        self.current_profile["platformProfile"] = profile
+                    return True
+                decky.logger.error(
+                    "Failed to apply platform profile; watt value not applied"
+                )
+                return False
+
             success = False
             
             # ── Priority 1: SteamOS Manager DBus ──────────────────────
@@ -2487,11 +2843,13 @@ class Plugin:
         a profile apply or UI slider. We pass respect_pstate_lock=True
         in that case so the boost sysfs write still happens but pstate
         stays put.
+        The same lock is required for any device whose active method
+        owns the CPU performance path (platform_profile or native
+        TDP) - amd_pmf's 1s refresh loop races the same way.
         """
         try:
             respect_pstate_lock = (
-                getattr(self, 'device_type', None) == "rog_ally"
-                and getattr(self, 'rog_ally_native_tdp_enabled', False)
+                self.power_control_native_active()
             )
             # Use CPU manager for boost control to avoid conflicts
             if hasattr(self, 'cpu_manager') and self.cpu_manager:
@@ -2595,13 +2953,11 @@ class Plugin:
                     # After SMT change, reinitialize CPU topology to update sibling mappings
                     if hasattr(self, 'cpu_manager') and self.cpu_manager:
                         # SMT change calls reapply_cpu_settings which
-                        # calls set_cpu_boost. In ROG Ally native TDP
-                        # mode set_cpu_boost must NOT flip amd_pstate,
-                        # so thread the lock through.
-                        respect_pstate_lock = (
-                            getattr(self, 'device_type', None) == "rog_ally"
-                            and getattr(self, 'rog_ally_native_tdp_enabled', False)
-                        )
+                        # calls set_cpu_boost. When the active method
+                        # owns the CPU performance path (platform_profile
+                        # or native TDP), set_cpu_boost must NOT flip
+                        # amd_pstate, so thread the lock through.
+                        respect_pstate_lock = self.power_control_native_active()
                         info_log("Reinitializing CPU topology after SMT change...")
                         self.cpu_manager._topology_initialized = False
                         self.cpu_manager.initialize_cpu_topology()
@@ -3719,15 +4075,14 @@ class Plugin:
             # smt=false / cpuCores=4 from a Handheld-cloned profile would
             # already be applied by the time the governor override ran.
             # Sanitising once at the top keeps the per-field branches
-            # below simple and consistent.
-            if (getattr(self, 'device_type', None) == "rog_ally"
-                    and getattr(self, 'rog_ally_native_tdp_enabled', False)):
+            # below simple and consistent. Any device whose active
+            # method owns the CPU performance path (platform_profile or
+            # native TDP) gets sanitised; the platform_profile path
+            # additionally needs pstate=passive so amd_pmf's register
+            # refresh loop doesn't fight PowerDeck's writes.
+            if self.power_control_native_active():
                 profile_data = self._sanitize_profile_for_native_mode(dict(profile_data))
                 decky.logger.info(f"Native TDP active: sanitised profile for apply: {profile_data}")
-                # Also enforce pstate=passive once at the top so every
-                # downstream branch sees passive mode (notably set_tdp's
-                # ROG Ally native path which sets Armoury limits and
-                # reloads amd_pmf — that flow assumes passive mode).
                 try:
                     if await self.get_pstate_mode() != "passive":
                         decky.logger.info("Native TDP active: forcing pstate -> passive")
@@ -4101,39 +4456,54 @@ class Plugin:
             # amd_pmf's platform profile would conflict with ryzenadj's power limits.
             # amd_pmf enforces its own STAPM/PPT limits based on platform profile,
             # which would override ryzenadj values within 1 second.
-            if "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally" and self.rog_ally_native_tdp_enabled:
+            # Apply platform profile LAST (any device whose
+            # active_method is platform_profile). Setting the profile
+            # AFTER thermal policy overrides any reverts caused by the
+            # thermal policy write. On ROG Ally with native TDP via
+            # Armoury (no ACPI platform_profile sysfs), the platform
+            # profile write would race with amd_pmf's STAPM/PPT
+            # reassert loop, so we skip it there.
+            if (
+                "platformProfile" in profile_data
+                and self.power_control_capabilities.get("active_method") == "platform_profile"
+            ):
                 total_operations += 1
                 try:
-                    # Prefer SteamOS Manager for platform profile on supported
-                    # systems, but skip it when we hold the power claim.
+                    # Prefer SteamOS Manager when available (it
+                    # coordinates with amd_pmf cleanly); fall back to
+                    # the ROG Ally controller or generic ACPI sysfs
+                    # write depending on what the device exposes.
                     if self.steamos_manager_available and not hasattr(self, '_external_manager_token'):
                         pp_success = await self.set_performance_profile_via_steamos_manager(profile_data["platformProfile"])
+                    elif self.device_controller and hasattr(self.device_controller, "set_platform_profile"):
+                        pp_success = self.device_controller.set_platform_profile(profile_data["platformProfile"])
                     else:
-                        pp_success = await self.set_rog_ally_platform_profile(profile_data["platformProfile"])
+                        pp_success = self._write_platform_profile_sysfs(profile_data["platformProfile"])
                     if pp_success:
                         success_count += 1
-                        decky.logger.info(f"Applied ROG Ally platform profile: {profile_data['platformProfile']}")
+                        decky.logger.info(f"Applied platform profile: {profile_data['platformProfile']}")
                     else:
-                        decky.logger.warning(f"Failed to apply ROG Ally platform profile: {profile_data['platformProfile']}")
+                        decky.logger.warning(f"Failed to apply platform profile: {profile_data['platformProfile']}")
                 except Exception as e:
-                    decky.logger.error(f"Error applying ROG Ally platform profile: {e}")
-            elif "platformProfile" in profile_data and getattr(self, 'device_type', None) == "rog_ally" and not self.rog_ally_native_tdp_enabled:
-                decky.logger.info(f"Skipping platform profile '{profile_data['platformProfile']}' - native TDP disabled, ryzenadj manages power limits directly")
+                    decky.logger.error(f"Error applying platform profile: {e}")
 
-            # Re-apply TDP after platform profile change (ROG Ally native
-            # only). The earlier code read TDP from profile_data, but
-            # the native-mode sanitizer at the top of apply_profile strips
-            # 'tdp' from profile_data - so that branch was dead code. The
-            # user-chosen TDP value lives in self.current_profile["tdp"]
-            # (mirrored there by set_tdp). When the platform profile flips,
-            # amd_pmf reasserts OEM STAPM/PPT defaults from in-memory state
-            # within its 1-second loop; we set TDP again here so the user's
-            # value wins the final write. Skip when native TDP is off -
-            # set_tdp_via_steamos_manager / set_amd_tdp drive TDP directly
-            # and are not subject to the amd_pmf reassert race.
-            if (getattr(self, 'device_type', None) == "rog_ally"
-                    and getattr(self, 'rog_ally_native_tdp_enabled', False)
-                    and "platformProfile" in profile_data):
+            # Re-apply TDP after platform profile change (active_method
+            # is platform_profile only). The earlier code read TDP from
+            # profile_data, but the native-mode sanitizer at the top of
+            # apply_profile strips 'tdp' from profile_data - so that
+            # branch was dead code. The user-chosen TDP value lives in
+            # self.current_profile["tdp"] (mirrored there by set_tdp).
+            # When the platform profile flips, amd_pmf reasserts OEM
+            # STAPM/PPT defaults from in-memory state within its
+            # 1-second loop; we set TDP again here so the user's value
+            # wins the final write. Skip when active_method is not
+            # platform_profile - set_tdp_via_steamos_manager /
+            # set_amd_tdp drive TDP directly and are not subject to
+            # the amd_pmf reassert race.
+            if (
+                self.power_control_capabilities.get("active_method") == "platform_profile"
+                and "platformProfile" in profile_data
+            ):
                 current_tdp = self.current_profile.get("tdp")
                 if current_tdp is not None:
                     try:
@@ -4277,21 +4647,21 @@ class Plugin:
         # Platform profile - ACPI; only meaningful on devices that
         # expose it. ROG Ally native TDP uses it as the TDP knob.
         #
-        # On ROG Ally native TDP, the user-chosen platform profile
-        # (e.g. "performance") only sticks in ACPI until the next
-        # Armoury write; the kernel then flips it to "custom" to
-        # signal "user firmware-attribute values". We re-apply TDP via
-        # Armoury *after* the platform profile write (see the
-        # Re-apply TDP after platform profile change block), so the
-        # steady state is "custom" - not the user's chosen name.
-        # Treating "custom" as drift causes self-heal to re-apply every
-        # minute for no user-visible benefit, so skip the contract on
-        # the verify path and rely on Armoury/TDP for the truth.
-        # Non-native ROG Ally and other devices keep the contract
-        # because their platform_profile isn't auto-flipped by Armoury.
-        if (getattr(self, 'device_type', None) == "rog_ally"
-                and getattr(self, 'rog_ally_native_tdp_enabled', False)
-                and "platformProfile" in profile_data):
+        # On ROG Ally native TDP (active_method=platform_profile with
+        # Armoury), the user-chosen platform profile (e.g.
+        # "performance") only sticks in ACPI until the next Armoury
+        # write; the kernel then flips it to "custom" to signal "user
+        # firmware-attribute values". We re-apply TDP via Armoury
+        # *after* the platform profile write (see the Re-apply TDP
+        # after platform profile change block), so the steady state
+        # is "custom" - not the user's chosen name. Treating "custom"
+        # as drift causes self-heal to re-apply every minute for no
+        # user-visible benefit, so skip the contract on the verify
+        # path and rely on Armoury/TDP for the truth.
+        if (
+            self.power_control_capabilities.get("active_method") == "platform_profile"
+            and "platformProfile" in profile_data
+        ):
             # Intentionally not added - see comment above.
             pass
 
@@ -5610,82 +5980,31 @@ class Plugin:
             return False
 
     async def get_rog_ally_native_tdp_enabled(self) -> bool:
-        """Get ROG Ally native TDP support setting"""
+        """Legacy alias for the auto-detected ROG Ally native state.
+
+        Returns True when the active power-control method is
+        platform_profile or native_tdp on a ROG Ally (i.e. PowerDeck
+        is driving the CPU performance path via Armoury/ACPI). The
+        value is computed from power_control_capabilities and the
+        device type - there is no longer a user-facing toggle.
+        """
         return self.rog_ally_native_tdp_enabled
 
     async def set_rog_ally_native_tdp_enabled(self, enabled: bool) -> bool:
+        """Deprecated: power-control method is auto-detected at init.
 
-        """Toggling modes re-applies the current TDP using the new controller."""
-        try:
-            # Only allow this setting on ROG Ally devices
-            if not await self.is_rog_ally_device():
-                decky.logger.warning("ROG Ally native TDP setting only available on ROG Ally devices")
-                return False
-
-            old_mode = self.rog_ally_native_tdp_enabled
-            self.rog_ally_native_tdp_enabled = enabled
-            self._rog_ally_native_tdp_explicitly_set = True  # Mark as explicitly set by user
-            await self.save_settings()
-            decky.logger.info(f"ROG Ally native TDP support changed to: {enabled} (explicitly set by user)")
-
-            # When native mode is enabled, force pstate=passive and lock
-            # governor=performance. Native mode owns the CPU power path
-            # via platform_profile (which sets BIOS-level EC behaviour);
-            # letting the user keep pstate=active invites a three-way race
-            # between PowerDeck sysfs writes, amd_pmf's 1s SMU refresh
-            # loop, and the EC reasserting OEM defaults on platform
-            # profile transitions. Passive mode has no EPP sysfs so the
-            # EPP/governor recovery flip-flop in set_epp cannot fire here.
-            if enabled and old_mode != enabled:
-                current_pstate = await self.get_pstate_mode()
-                if current_pstate != "passive":
-                    decky.logger.info(
-                        f"Native TDP enabled: forcing pstate {current_pstate} -> passive"
-                    )
-                    await self.set_pstate_mode("passive")
-                # Governor=performance matches the platform_profile=performance
-                # intent and gives PowerDeck a single source of truth for
-                # CPU performance on this device.
-                current_governor = self.cpu_manager.get_current_governor() if hasattr(self, 'cpu_manager') and self.cpu_manager else None
-                if current_governor != "performance":
-                    decky.logger.info(
-                        f"Native TDP enabled: setting governor {current_governor} -> performance"
-                    )
-                    await self.set_power_governor("performance")
-                # Persist so apply_profile doesn't fight us on next reload.
-                self.current_profile["pstateMode"] = "passive"
-                self.current_profile["governor"] = "performance"
-
-                # Sanitise the in-memory profile so any leftover Handheld
-                # values (tdp=8, smt=false, cpuCores=4, etc.) are gone
-                # before the next apply_profile runs. Also persist the
-                # sanitised version to disk so a plugin restart doesn't
-                # re-introduce them via settings.json's currentProfile.
-                # Existing per-game profiles will be sanitised on their
-                # next apply via the apply_profile sanitizer; no need to
-                # rewrite every file on disk here.
-                sanitised = self._sanitize_profile_for_native_mode(
-                    dict(self.current_profile)
-                )
-                self.current_profile.clear()
-                self.current_profile.update(sanitised)
-                decky.logger.info(
-                    f"Native TDP enabled: sanitised current_profile: {self.current_profile}"
-                )
-                await self.save_settings()
-
-            # Re-apply current TDP using the new control method
-            # This ensures the active TDP controller matches the selected mode
-            if old_mode != enabled:
-                current_tdp = self.current_profile.get("tdp")
-                if current_tdp:
-                    decky.logger.info(f"Re-applying TDP {current_tdp}W using new control mode (native={enabled})")
-                    await self.set_tdp(current_tdp)
-
-            return True
-        except Exception as e:
-            decky.logger.error(f"Failed to set ROG Ally native TDP setting: {e}")
-            return False
+        Logs a warning and returns True without making changes; the
+        capability detection in _detect_power_control_capabilities()
+        already picked the right path. Kept as a callable so old
+        frontends don't break; new code should not call this.
+        """
+        decky.logger.warning(
+            "set_rog_ally_native_tdp_enabled is deprecated - power "
+            "control method is auto-detected from ACPI platform_profile, "
+            "Secure Boot, and /dev/mem availability. The setting has no "
+            "effect; remove the call site."
+        )
+        return True
 
     async def is_rog_ally_device(self) -> bool:
         """Check if current device is a ROG Ally or ROG Ally X"""
@@ -5697,21 +6016,32 @@ class Plugin:
             return False
 
     async def get_tdp_control_mode(self) -> str:
-        """Get current TDP control mode (steamos_manager, rog_ally_native, powerdeck, etc.)"""
+        """Get current TDP control mode.
+
+        Returns one of:
+          - "platform_profile" - ACPI platform_profile sysfs owns TDP
+            (Nimo Axis, upcoming JELOS, ROG Ally with amd_pmf)
+          - "steamos_manager" - SteamOS Manager / jelos-manager DBus
+          - "rog_ally_native" - ROG Ally Armoury Crate (native TDP
+            fallback when ACPI unavailable, e.g. early Ally firmware)
+          - "legion_native" / "steam_deck_native" - device WMI/SYSFS
+          - "powerdeck" - ryzenadj or generic AMD/Intel path
+          - "none" - no watt-level TDP control available; only
+            amd-pstate governor/EPP fallback
+        """
         try:
-            # When PowerDeck holds the power subsystem claim, it drives the
-            # hardware directly - report "powerdeck" as the active controller.
+            method = self.power_control_capabilities.get("active_method", "none")
+            if method == "platform_profile":
+                return "platform_profile"
+            if method == "none":
+                return "none"
             if self.steamos_manager_available and not hasattr(self, '_external_manager_token'):
                 return "steamos_manager"
-            if self.device_type == "rog_ally":
-                if self.rog_ally_native_tdp_enabled:
-                    return "rog_ally_native"
-                else:
-                    return "powerdeck"
-            elif self.device_type in ["legion", "steam_deck"]:
+            if self.device_type == "rog_ally" and self.rog_ally_native_tdp_enabled:
+                return "rog_ally_native"
+            if self.device_type in ["legion", "steam_deck"]:
                 return f"{self.device_type}_native"
-            else:
-                return "powerdeck"
+            return "powerdeck"
         except Exception as e:
             decky.logger.error(f"Failed to get TDP control mode: {e}")
             return "powerdeck"
@@ -5951,117 +6281,126 @@ class Plugin:
 
     async def get_tdp_control_available(self) -> Dict[str, Any]:
         """Check if hardware TDP control is available on this device.
-        
+
         Returns dict with:
         - available: True if real watt-level TDP control works
-        - method: What method provides TDP control ('ryzenadj', 'amd_pmf', 'steamos_manager', 'pstate_fallback', 'none')
-        - has_soft_control: True if pstate governor/EPP fallback is available
+        - method: What method provides TDP control ('platform_profile',
+          'ryzenadj', 'amd_pmf', 'steamos_manager', 'pstate_fallback',
+          'none')
+        - has_soft_control: True if pstate governor/EPP fallback is
+          available
         - reason: Human-readable explanation
+
+        Preference order mirrors _detect_power_control_capabilities:
+        the auto-detected active_method wins, then device-specific
+        native controllers, then ryzenadj, then pstate fallback.
         """
         try:
             device_name = await self.get_device_name()
             device_lower = device_name.lower() if device_name else ""
             cpu_vendor = self.device_info.get("cpu_vendor", "Unknown")
-            
-            # Check SteamOS Manager first
-            if self.steamos_manager_available and not hasattr(self, '_external_manager_token'):
+
+            method = self.power_control_capabilities.get("active_method", "none")
+            if method == "platform_profile":
                 return {
                     "available": True,
-                    "method": "steamos_manager",
+                    "method": "platform_profile",
                     "has_soft_control": False,
-                    "reason": "SteamOS Manager provides TDP control"
+                    "reason": "ACPI platform_profile provides TDP control",
                 }
-            
-            # Check device-specific native controllers
-            if self.device_controller:
-                if self.device_type == "rog_ally" and self.rog_ally_native_tdp_enabled:
+            if method == "none":
+                # Fall through to ryzenadj / pstate checks below so the
+                # returned reason reflects the actual probe rather than
+                # the capability blob's static message.
+
+                # Check SteamOS Manager first
+                if self.steamos_manager_available and not hasattr(self, '_external_manager_token'):
                     return {
                         "available": True,
-                        "method": "amd_pmf",
+                        "method": "steamos_manager",
                         "has_soft_control": False,
-                        "reason": "ROG Ally native TDP (amd_pmf) enabled"
+                        "reason": "SteamOS Manager provides TDP control",
                     }
-                elif self.device_type in ["legion", "steam_deck"]:
-                    return {
-                        "available": True,
-                        "method": "native_controller",
-                        "has_soft_control": False,
-                        "reason": f"{self.device_type} native controller provides TDP control"
-                    }
-            
-            # Check ryzenadj availability
-            if self.ryzenadj_path:
-                # Test if ryzenadj actually works (not blocked by Secure Boot)
-                try:
-                    clean_env = dict(os.environ)
-                    clean_env.pop("LD_LIBRARY_PATH", None)
-                    result = subprocess.run(
-                        [self.ryzenadj_path, '-i'],
-                        capture_output=True, text=True, timeout=5,
-                        env=clean_env
+
+                # Check device-specific native controllers
+                if self.device_controller:
+                    if self.device_type == "rog_ally" and self.rog_ally_native_tdp_enabled:
+                        return {
+                            "available": True,
+                            "method": "amd_pmf",
+                            "has_soft_control": False,
+                            "reason": "ROG Ally native TDP (amd_pmf) enabled",
+                        }
+                    elif self.device_type in ["legion", "steam_deck"]:
+                        return {
+                            "available": True,
+                            "method": "native_controller",
+                            "has_soft_control": False,
+                            "reason": f"{self.device_type} native controller provides TDP control",
+                        }
+
+                # Check ryzenadj availability
+                if self.ryzenadj_path:
+                    # Test if ryzenadj actually works (not blocked by Secure Boot)
+                    try:
+                        clean_env = dict(os.environ)
+                        clean_env.pop("LD_LIBRARY_PATH", None)
+                        result = subprocess.run(
+                            [self.ryzenadj_path, '-i'],
+                            capture_output=True, text=True, timeout=5,
+                            env=clean_env,
+                        )
+                        if result.returncode == 0:
+                            return {
+                                "available": True,
+                                "method": "ryzenadj",
+                                "has_soft_control": False,
+                                "reason": "ryzenadj provides direct SMU TDP control",
+                            }
+                    except Exception:
+                        pass
+
+                # Check AMD RAPL for power limit control
+                if cpu_vendor == "AMD":
+                    rapl_constraints = glob.glob(
+                        "/sys/class/powercap/intel-rapl:0/constraint_*_power_limit_uw"
                     )
-                    if result.returncode == 0:
+                    if rapl_constraints:
                         return {
                             "available": True,
-                            "method": "ryzenadj",
+                            "method": "amd_rapl",
                             "has_soft_control": False,
-                            "reason": "ryzenadj provides direct SMU TDP control"
+                            "reason": "AMD RAPL provides power limit control",
                         }
-                except Exception:
-                    pass
-            
-            # Check AMD RAPL for power limit control
-            if cpu_vendor == "AMD":
-                # Check if RAPL has constraint_*_power_limit_uw files (actual control)
-                rapl_constraints = glob.glob("/sys/class/powercap/intel-rapl:0/constraint_*_power_limit_uw")
-                if rapl_constraints:
+
+                # Check kernel power_profile (amdgpu sysfs patch)
+                if cpu_vendor == "AMD" and self.has_kernel_power_profile:
                     return {
                         "available": True,
-                        "method": "amd_rapl",
+                        "method": "kernel_power_profile",
                         "has_soft_control": False,
-                        "reason": "AMD RAPL provides power limit control"
+                        "reason": "Kernel power_profile sysfs provides TDP control",
                     }
-            
-            # Check for amd_pmf platform_profile (ACPI interface)
-            if cpu_vendor == "AMD":
-                if os.path.exists("/sys/firmware/acpi/platform_profile"):
-                    choices_path = "/sys/firmware/acpi/platform_profile_choices"
-                    if os.path.exists(choices_path):
-                        return {
-                            "available": True,
-                            "method": "amd_pmf_platform_profile",
-                            "has_soft_control": False,
-                            "reason": "AMD PMF platform_profile provides TDP control"
-                        }
-            
-            # Check kernel power_profile (amdgpu sysfs patch)
-            if cpu_vendor == "AMD" and self.has_kernel_power_profile:
-                return {
-                    "available": True,
-                    "method": "kernel_power_profile",
-                    "has_soft_control": False,
-                    "reason": "Kernel power_profile sysfs provides TDP control"
-                }
-            
-            # Check if amd-pstate-epp soft control is available
-            pstate_mode = await self.get_pstate_mode()
-            if cpu_vendor == "AMD" and pstate_mode in ["active", "passive", "guided"]:
-                epp_path = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
-                has_epp = os.path.exists(epp_path)
+
+                # Check if amd-pstate-epp soft control is available
+                pstate_mode = await self.get_pstate_mode()
+                if cpu_vendor == "AMD" and pstate_mode in ["active", "passive", "guided"]:
+                    epp_path = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
+                    has_epp = os.path.exists(epp_path)
+                    return {
+                        "available": False,
+                        "method": "pstate_fallback",
+                        "has_soft_control": True,
+                        "reason": f"Hardware TDP control unavailable (Secure Boot?). amd-pstate-epp governor/EPP fallback available ({pstate_mode} mode{' + EPP' if has_epp else ', no EPP'})",
+                    }
+
+                # No TDP control available
                 return {
                     "available": False,
-                    "method": "pstate_fallback",
-                    "has_soft_control": True,
-                    "reason": f"Hardware TDP control unavailable (Secure Boot?). amd-pstate-epp governor/EPP fallback available ({pstate_mode} mode{' + EPP' if has_epp else ', no EPP'})"
+                    "method": "none",
+                    "has_soft_control": False,
+                    "reason": "No TDP control method available",
                 }
-            
-            # No TDP control available
-            return {
-                "available": False,
-                "method": "none",
-                "has_soft_control": False,
-                "reason": "No TDP control method available"
-            }
             
         except Exception as e:
             decky.logger.error(f"Failed to check TDP control availability: {e}")

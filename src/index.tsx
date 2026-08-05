@@ -318,9 +318,13 @@ const stageUpdate = callable<[downloadUrl: string, version: string], any>("stage
 const installStagedUpdate = callable<[], any>("install_staged_update");
 
 // ROG Ally native TDP toggle functions
-const getRogAllyNativeTdpEnabled = callable<[], boolean>("get_rog_ally_native_tdp_enabled");
-const setRogAllyNativeTdpEnabled = callable<[enabled: boolean], boolean>("set_rog_ally_native_tdp_enabled");
-const isRogAllyDevice = callable<[], boolean>("is_rog_ally_device");
+// Native TDP toggle was removed when power-control moved to
+// auto-detection. The legacy callables still exist in the backend
+// for backward compatibility but are no longer wired into the UI.
+// isRogAllyDevice was only consumed by the removed native-TDP
+// toggle. The capability-driven detection in main.py
+// _detect_power_control_capabilities handles device-specific
+// behaviour; the frontend reads it via deviceInfo.powerControl.
 const getTdpControlMode = callable<[], string>("get_tdp_control_mode");
 const getTdpControlAvailable = callable<[], { available: boolean; method: string; has_soft_control: boolean; reason: string }>("get_tdp_control_available");
 
@@ -725,43 +729,14 @@ const Content: React.FC = () => {
   const [updateInfo, setUpdateInfo] = useState<{currentVersion?: string, latestVersion?: string, downloadUrl?: string} | null>(null);
   const [isCheckingForUpdates, setIsCheckingForUpdates] = useState<boolean>(false);
 
-  // ROG Ally native TDP toggle state with persistence
-  const [isRogAllyDeviceDetected, setIsRogAllyDeviceDetected] = useState<boolean>(false);
-  const [rogAllyNativeTdpEnabled, setRogAllyNativeTdpEnabledState] = useState<boolean>(() => {
-    // Initialize from localStorage as fallback
-    const saved = localStorage.getItem('powerdeck_rog_ally_native_tdp');
-    return saved ? JSON.parse(saved) : false;
-  });
-  const [tdpControlMode, setTdpControlMode] = useState<string>("powerdeck");
+  // Power-control capabilities come from deviceInfo.powerControl.
+  // The active method (platform_profile / native_tdp / none) is
+  // detected at backend init from /sys/firmware/acpi/platform_profile,
+  // Secure Boot, and /dev/mem. The frontend renders the matching
+  // sliders; users no longer pick a control method.
+  const [powerControlActive, setPowerControlActive] = useState<boolean>(false);
 
-  // Helper function to update ROG Ally native TDP state with persistence
-  const updateRogAllyNativeTdpState = useCallback(async (enabled: boolean, source: string = 'user') => {
-    try {
-      debug.log(`Updating ROG Ally native TDP state to ${enabled} (source: ${source})`);
-      
-      // Update local state
-      setRogAllyNativeTdpEnabledState(enabled);
-      
-      // Persist to localStorage
-      localStorage.setItem('powerdeck_rog_ally_native_tdp', JSON.stringify(enabled));
-      
-      // Save to backend
-      const success = await setRogAllyNativeTdpEnabled(enabled);
-      if (!success) {
-        debug.error("Failed to save ROG Ally native TDP state to backend");
-      }
-      
-      // Update TDP control mode
-      const newControlMode = await getTdpControlMode();
-      setTdpControlMode(newControlMode);
-      
-      debug.log(`ROG Ally native TDP ${enabled ? 'enabled' : 'disabled'}, control mode: ${newControlMode}`);
-      return success;
-    } catch (error) {
-      debug.error("Error updating ROG Ally native TDP state:", error);
-      return false;
-    }
-  }, []);
+  const [tdpControlMode, setTdpControlMode] = useState<string>("powerdeck");
 
   // Universal function to update current profile - UNIFIED SYSTEM
   const updateCurrentProfile = useCallback((updates: Partial<PowerProfile>) => {
@@ -908,71 +883,48 @@ const Content: React.FC = () => {
     const initializePlugin = async () => {
       try {
         setLoading(true);
-        
+
         // Load device info
         const deviceData = await getDeviceInfo();
         setDeviceInfo(deviceData);
         debug.log(`DeviceInfo loaded:`, deviceData);
         debug.log(`GPU limits from deviceInfo: min=${deviceData?.min_gpu_freq}, max=${deviceData?.max_gpu_freq}`);
-        
+
+        // Power-control capabilities are surfaced via deviceInfo.powerControl
+        // (see main.py _detect_power_control_capabilities). The frontend
+        // just reflects the backend's auto-detection: which slider to
+        // render (watt vs platform profile) and which secondary controls
+        // (governor, EPP, boost, SMT) to hide. The legacy ROG Ally
+        // native-TDP toggle is gone; the toggle's localStorage key is
+        // removed too so users with a stale localStorage value don't
+        // see phantom UI state.
+        const powerControl = deviceData?.powerControl as
+          | { active_method?: string; platform_profile_available?: boolean; native_tdp_available?: boolean; reason?: string }
+          | undefined;
+        const active = !!(
+          powerControl && powerControl.active_method && powerControl.active_method !== "none"
+        );
+        setPowerControlActive(active);
+        debug.log(`Power control: active=${active}, method=${powerControl?.active_method}, reason=${powerControl?.reason}`);
+
+        // Clean up the legacy toggle's localStorage key now that the
+        // toggle is gone. Idempotent; safe to call on every load.
+        if (typeof localStorage !== 'undefined') {
+          localStorage.removeItem('powerdeck_rog_ally_native_tdp');
+        }
+
+        try {
+          const controlMode = await getTdpControlMode();
+          setTdpControlMode(controlMode);
+          debug.log(`TDP control mode: ${controlMode}`);
+        } catch (modeError) {
+          debug.error('Failed to get TDP control mode:', modeError);
+          setTdpControlMode("powerdeck"); // Safe fallback
+        }
+
         // Check if this is a ROG Ally device and load ROG Ally specific info
         if (deviceData?.device_name && (deviceData.device_name.includes('ROG Ally') || deviceData.device_name.includes('RC71L') || deviceData.device_name.includes('RC72L'))) {
           setIsRogAlly(true);
-          
-          // Check if device is ROG Ally for native TDP toggle
-          try {
-            debug.log('Calling isRogAllyDevice() function...');
-            const isRogAllyCheck = await isRogAllyDevice();
-            debug.log(`ROG Ally device check result: ${isRogAllyCheck}`);
-            setIsRogAllyDeviceDetected(isRogAllyCheck);
-            debug.log(`ROG Ally device detected state set to: ${isRogAllyCheck}`);
-            
-            if (isRogAllyCheck) {
-              // Load ROG Ally native TDP setting with robust error handling and persistence
-              debug.log('Loading ROG Ally native TDP setting...');
-              try {
-                const nativeTdpEnabled = await getRogAllyNativeTdpEnabled();
-                debug.log(`Backend ROG Ally native TDP state: ${nativeTdpEnabled}`);
-                
-                // Check if this differs from localStorage and sync if needed
-                const localStorageValue = localStorage.getItem('powerdeck_rog_ally_native_tdp');
-                const localState = localStorageValue ? JSON.parse(localStorageValue) : false;
-                
-                if (nativeTdpEnabled !== localState) {
-                  debug.log(`Syncing state mismatch: backend=${nativeTdpEnabled}, localStorage=${localState}`);
-                  // Use backend value as source of truth but update localStorage
-                  localStorage.setItem('powerdeck_rog_ally_native_tdp', JSON.stringify(nativeTdpEnabled));
-                }
-                
-                setRogAllyNativeTdpEnabledState(nativeTdpEnabled);
-                debug.log(`ROG Ally native TDP enabled set to: ${nativeTdpEnabled}`);
-                
-              } catch (stateError) {
-                debug.error('Failed to load ROG Ally native TDP state from backend, using localStorage fallback:', stateError);
-                // Fallback to localStorage value if backend fails
-                const localStorageValue = localStorage.getItem('powerdeck_rog_ally_native_tdp');
-                const fallbackState = localStorageValue ? JSON.parse(localStorageValue) : false;
-                setRogAllyNativeTdpEnabledState(fallbackState);
-                debug.log(`Using localStorage fallback state: ${fallbackState}`);
-              }
-              
-              // Get current TDP control mode
-              try {
-                debug.log('Getting TDP control mode...');
-                const controlMode = await getTdpControlMode();
-                setTdpControlMode(controlMode);
-                debug.log(`TDP control mode: ${controlMode}`);
-              } catch (modeError) {
-                debug.error('Failed to get TDP control mode:', modeError);
-                setTdpControlMode("powerdeck"); // Safe fallback
-              }
-            } else {
-              debug.log('Device is not detected as ROG Ally, skipping native TDP setup');
-            }
-          } catch (error) {
-            debug.error('Error in ROG Ally device detection and setup:', error);
-            setIsRogAllyDeviceDetected(false);
-          }
           try {
             const rogAllyInfo = await getRogAllyDeviceInfo();
             setRogAllyDeviceInfo(rogAllyInfo);
@@ -1890,7 +1842,7 @@ const Content: React.FC = () => {
           slider would let users put the system into pstate=active, which
           races with amd_pmf and creates the EPP/governor flip-flop
           documented in main.py set_epp. */}
-      {pstateAvailable && !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled) && (
+      {pstateAvailable && !powerControlActive && (
         <PanelSection title="CPU Driver Mode">
           <PanelSectionRow>
             <SliderWithIcons
@@ -1965,10 +1917,16 @@ const Content: React.FC = () => {
       )}
       
       {(() => {
-        const shouldShow = !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled);
+        // Hide TDP watts control when the active method is
+        // platform_profile (Nimo Axis, upcoming JELOS, ROG Ally
+        // amd_pmf): the kernel/EC owns TDP and the user picks a
+        // named profile, not watts. Hide when tdpControlAvailable
+        // reports no watt-level control (Secure Boot or no /dev/mem).
+        const platformProfileMode = !!deviceInfo?.powerControl?.platform_profile_available;
         const tdpAvailable = tdpControlAvailable?.available ?? true; // Default to showing if not checked yet
-        debug.log(`TDP Control visibility: isRogAllyDeviceDetected=${isRogAllyDeviceDetected}, rogAllyNativeTdpEnabled=${rogAllyNativeTdpEnabled}, tdpAvailable=${tdpAvailable}, shouldShow=${shouldShow && tdpAvailable}`);
-        return shouldShow && tdpAvailable;
+        const wattsAvailable = !platformProfileMode && tdpAvailable;
+        debug.log(`TDP Control visibility: platformProfile=${platformProfileMode}, tdpAvailable=${tdpAvailable}`);
+        return wattsAvailable;
       })() && (
         <PanelSection title="TDP Control">
         <DebouncedSlider
@@ -2063,60 +2021,94 @@ const Content: React.FC = () => {
       )}
 
       {/* ROG Ally Platform Profile Section - High priority placement */}
-      {isRogAlly && rogAllyDeviceInfo?.available_controls?.platform_profiles && (
+      {/* Platform Profile Section - shown whenever the ACPI
+          platform_profile sysfs is the active TDP control surface
+          (Nimo Axis, upcoming JELOS, ROG Ally amd_pmf). Decisions
+          live in main.py _detect_power_control_capabilities(). The
+          profile list and icons are derived from
+          deviceInfo.platformProfileChoices (live kernel values),
+          with the canonical power-saver/balanced/performance
+          three-position slider as a fallback. */}
+      {deviceInfo?.powerControl?.platform_profile_available && (
         <PanelSection title="Platform Profile">
           <PanelSectionRow>
-            <SliderWithIcons
-              label=""
-              value={(() => {
-                const profiles = ["power-saver", "balanced", "performance"];
-                const active = currentProfile.platformProfile ?? rogAllyPlatformProfile;
-                return profiles.indexOf(active) >= 0 ? profiles.indexOf(active) : 1;
-              })()}
-              min={0}
-              max={2}
-              step={1}
-              icons={[<FaBatteryFull />, <FaBalanceScale />, <FaRocket />]}
-              onChange={async (value) => {
-                const profiles = ["power-saver", "balanced", "performance"];
-                const selectedProfile = profiles[value] || "balanced";
-                setRogAllyPlatformProfile(selectedProfile);
-                try {
-                  await setRogAllyPlatformProfileBackend(selectedProfile);
-                  debug.log(`ROG Ally platform profile set to: ${selectedProfile}`);
-                  updateCurrentProfile({ platformProfile: selectedProfile });
-                } catch (error) {
-                  debug.error("Failed to set ROG Ally platform profile:", error);
-                }
-              }}
-            />
+            {(() => {
+              // Build the slider from the kernel's actual choices; if
+              // the kernel reports something other than the canonical
+              // three (e.g. Nimo Axis might expose custom), fall back
+              // to a three-position default.
+              const kernelChoices = (deviceInfo.platformProfileChoices as string[]) || [];
+              const canonical = ["power-saver", "balanced", "performance"];
+              const canonicalAliases: { [k: string]: string } = {
+                "low-power": "power-saver",
+              };
+              const profiles = kernelChoices.length
+                ? kernelChoices
+                : canonical;
+              const activeRaw = currentProfile.platformProfile ?? rogAllyPlatformProfile ?? "balanced";
+              const active = canonicalAliases[activeRaw] ?? activeRaw;
+              const activeIndex = profiles.indexOf(active);
+              const iconFor = (p: string) => {
+                if (p === "power-saver" || p === "low-power") return <FaBatteryFull />;
+                if (p === "performance") return <FaRocket />;
+                return <FaBalanceScale />;
+              };
+              const descriptions: { [k: string]: string } = {
+                "power-saver": "Maximum Power Saving",
+                "low-power": "Maximum Power Saving",
+                "balanced": "Balanced",
+                "performance": "Max Performance",
+              };
+              return (
+                <SliderWithIcons
+                  label=""
+                  value={activeIndex >= 0 ? activeIndex : 0}
+                  min={0}
+                  max={profiles.length - 1}
+                  step={1}
+                  icons={profiles.map(iconFor)}
+                  onChange={async (value) => {
+                    const selectedProfile = profiles[value] || "balanced";
+                    setRogAllyPlatformProfile(selectedProfile);
+                    try {
+                      await setRogAllyPlatformProfileBackend(selectedProfile);
+                      debug.log(`Platform profile set to: ${selectedProfile}`);
+                      updateCurrentProfile({ platformProfile: selectedProfile });
+                    } catch (error) {
+                      debug.error("Failed to set platform profile:", error);
+                    }
+                  }}
+                />
+              );
+            })()}
           </PanelSectionRow>
           <PanelSectionRow>
             <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
               <span style={{ color: '#00d4ff', fontSize: '1em' }}>
                 {(() => {
-                  const profile = currentProfile.platformProfile ?? rogAllyPlatformProfile;
-                  switch (profile) {
-                    case 'power-saver': return <FaBatteryFull />;
-                    case 'balanced': return <FaBalanceScale />;
-                    case 'performance': return <FaRocket />;
-                    default: return <FaBalanceScale />;
-                  }
+                  const profile = currentProfile.platformProfile ?? rogAllyPlatformProfile ?? "balanced";
+                  if (profile === "power-saver" || profile === "low-power") return <FaBatteryFull />;
+                  if (profile === "performance") return <FaRocket />;
+                  return <FaBalanceScale />;
                 })()}
               </span>
               <span>
                 {(() => {
-                  const profile = currentProfile.platformProfile ?? rogAllyPlatformProfile;
-                  const descriptions: { [key: string]: string } = {
-                    "power-saver": "Maximum Power Saving",
-                    "balanced": "Balanced",
-                    "performance": "Max Performance"
-                  };
-                  return descriptions[profile] || "Balanced performance and efficiency";
+                  const profile = currentProfile.platformProfile ?? rogAllyPlatformProfile ?? "balanced";
+                  if (profile === "power-saver" || profile === "low-power") return "Maximum Power Saving";
+                  if (profile === "performance") return "Max Performance";
+                  return "Balanced";
                 })()}
               </span>
             </div>
           </PanelSectionRow>
+          {deviceInfo?.powerControl?.reason && (
+            <PanelSectionRow>
+              <div style={{ padding: '4px 0', fontSize: '11px', color: 'var(--text-tertiary)' }}>
+                {deviceInfo.powerControl.reason}
+              </div>
+            </PanelSectionRow>
+          )}
         </PanelSection>
       )}
 
@@ -2222,7 +2214,7 @@ const Content: React.FC = () => {
                governor that gets clobbered on the next apply_profile). Native mode
                owns the CPU performance path via platform_profile so the
                governor is implicit. */}
-        {deviceInfo?.scalingDriver !== "amd-pstate-epp" && !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled) && (
+        {deviceInfo?.scalingDriver !== "amd-pstate-epp" && !powerControlActive && (
           <PanelSectionRow>
             <SliderWithIcons
               label="CPU Governor"
@@ -2270,7 +2262,7 @@ const Content: React.FC = () => {
           </PanelSectionRow>
         )}
         {/* Governor description - show when governor is visible */}
-        {deviceInfo?.scalingDriver !== "amd-pstate-epp" && !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled) && (
+        {deviceInfo?.scalingDriver !== "amd-pstate-epp" && !powerControlActive && (
           <PanelSectionRow>
             <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
               <span style={{ color: '#00d4ff', fontSize: '1em' }}>
@@ -2299,7 +2291,7 @@ const Content: React.FC = () => {
             never functional in that mode, but showing it lets users
             send set_epp calls that would fail silently or be rejected
             by the kernel. Hidden alongside the pstate slider above. */}
-        {deviceInfo?.scalingDriver === "amd-pstate-epp" && !(isRogAllyDeviceDetected && rogAllyNativeTdpEnabled) && (
+        {deviceInfo?.scalingDriver === "amd-pstate-epp" && !powerControlActive && (
           <>
             <PanelSectionRow>
               <SliderWithIcons
@@ -2556,24 +2548,14 @@ const Content: React.FC = () => {
         
         {showAdvancedMenu && (
           <>
-            {/* ROG Ally Native TDP Toggle - Only show on ROG Ally devices */}
-            {(() => {
-              debug.log(`Checking ROG Ally toggle visibility: isRogAllyDeviceDetected=${isRogAllyDeviceDetected}`);
-              return isRogAllyDeviceDetected;
-            })() && (
-              <>
-                <PanelSectionRow>
-                  <ToggleField
-                    label="ROG Ally Native TDP Support"
-                    checked={rogAllyNativeTdpEnabled}
-                    onChange={async (enabled) => {
-                      debug.log(`ROG Ally Native TDP toggle changed to: ${enabled}`);
-                      await updateRogAllyNativeTdpState(enabled);
-                    }}
-                  />
-                </PanelSectionRow>
-              </>
-            )}
+            {/* The legacy "ROG Ally Native TDP Support" toggle was
+                removed when power control moved to auto-detection
+                (platform_profile / native_tdp / none). The active
+                method is surfaced in the TDP Control / Platform
+                Profile section headers and the
+                deviceInfo.powerControl.reason line. Adding a toggle
+                here would only produce override paths that the
+                backend now ignores. */}
             
             {/* ROG Ally MCU Power Save - Moved to Advanced Power Management */}
             {isRogAlly && rogAllyDeviceInfo?.available_controls?.mcu_powersave && (
