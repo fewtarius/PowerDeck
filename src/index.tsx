@@ -2053,12 +2053,6 @@ const Content: React.FC = () => {
                 if (p === "performance") return <FaRocket />;
                 return <FaBalanceScale />;
               };
-              const descriptions: { [k: string]: string } = {
-                "power-saver": "Maximum Power Saving",
-                "low-power": "Maximum Power Saving",
-                "balanced": "Balanced",
-                "performance": "Max Performance",
-              };
               return (
                 <SliderWithIcons
                   label=""
@@ -2102,13 +2096,6 @@ const Content: React.FC = () => {
               </span>
             </div>
           </PanelSectionRow>
-          {deviceInfo?.powerControl?.reason && (
-            <PanelSectionRow>
-              <div style={{ padding: '4px 0', fontSize: '11px', color: 'var(--text-tertiary)' }}>
-                {deviceInfo.powerControl.reason}
-              </div>
-            </PanelSectionRow>
-          )}
         </PanelSection>
       )}
 
@@ -2200,7 +2187,7 @@ const Content: React.FC = () => {
           <PanelSectionRow>
             <ToggleField
               label="CPU Boost"
-              description="Allow CPU to exceed base clock (better FPS, more heat)"
+              description="Allow CPU to exceed base clock"
               checked={currentProfile.cpuBoost}
               onChange={handleCpuBoostChange}
             />

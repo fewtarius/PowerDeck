@@ -275,7 +275,7 @@ class Plugin:
     # We still fall back to ryzenadj for live application when
 # steamos-manager is not available or when the DBus call fails.
 
-    async def _detect_secure_boot(self) -> bool:
+    def _detect_secure_boot(self) -> bool:
         """Return True if UEFI Secure Boot is enabled.
 
         Reads the EFI 'SecureBoot' variable. The value is a single
@@ -284,6 +284,15 @@ class Plugin:
         (BIOS/legacy boot) or unreadable. When Secure Boot is on,
         ryzenadj's /dev/mem MMIO path is blocked by the kernel, so
         native AMD TDP control cannot work.
+
+        Synchronous on purpose: callers (e.g. capability detection
+        during Plugin init and get_device_info) build a dict that
+        gets handed straight to JSON. An async coroutine here would
+        be serialised as a <coroutine ...> blob and explode the
+        frontend's get_device_info call (see dfbcd2e regression:
+        PowerDeck "loading forever" because every device_info
+        round-trip raised Object of type coroutine is not JSON
+        serializable).
         """
         try:
             path = "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
@@ -7855,22 +7864,64 @@ class Plugin:
     # ROG Ally setters (callable from frontend)
 
     async def set_rog_ally_platform_profile(self, profile: str) -> bool:
-        """Set ROG Ally platform profile - Plugin class method"""
-        decky.logger.info(f"PLUGIN METHOD: set_rog_ally_platform_profile({profile})")
+        """Set platform profile via the active method.
+
+        Three paths converge here:
+          1. Mobile/Legacy ROG Ally path: device_controller with
+             set_platform_profile (no ACPI sysfs, or Armoury Crate
+             controller).
+          2. ACPI platform_profile sysfs path (Nimo Axis, JELOS
+             post-update, ROG Ally with amd_pmf writing the same
+             sysfs). Writes /sys/firmware/acpi/platform_profile.
+          3. SteamOS Manager DBus path on hosts that expose the
+             ExternalManager1.SetPerformanceProfile method.
+
+        Profiles are validated against the live choices list and
+        translated to vendor names (power-saver -> low-power) before
+        the sysfs write so the kernel doesn't reject with EINVAL.
+        """
         try:
-            if not (hasattr(self, 'device_controller') and self.device_controller):
-                decky.logger.warning("set_rog_ally_platform_profile: No device_controller")
-                return False
-            if not hasattr(self.device_controller, 'set_platform_profile'):
-                decky.logger.warning("set_rog_ally_platform_profile: device_controller has no set_platform_profile")
-                return False
-            # Frontend sends 'power-saver'; sysfs expects 'low-power'
+            decky.logger.info(f"PLUGIN METHOD: set_rog_ally_platform_profile({profile})")
+
+            # Translate canonical names to the kernel's naming.
             translated = "low-power" if profile == "power-saver" else profile
             if translated != profile:
-                decky.logger.info(f"set_rog_ally_platform_profile: translated '{profile}' -> '{translated}'")
-            result = self.device_controller.set_platform_profile(translated)
-            decky.logger.info(f"Plugin.set_rog_ally_platform_profile({translated}): {result}")
-            return result
+                decky.logger.info(
+                    f"set_rog_ally_platform_profile: translated '{profile}' -> '{translated}'"
+                )
+
+            # 1. Legacy device-controller path (ROG Ally Armoury Crate,
+            #    Legion, Steam Deck). Uses vendor-specific drivers
+            #    rather than the generic ACPI sysfs.
+            if (
+                hasattr(self, "device_controller")
+                and self.device_controller
+                and hasattr(self.device_controller, "set_platform_profile")
+            ):
+                ok = self.device_controller.set_platform_profile(translated)
+                decky.logger.info(
+                    f"Plugin.set_rog_ally_platform_profile({translated}) via device_controller: {ok}"
+                )
+                if ok:
+                    self.current_profile["platformProfile"] = translated
+                return ok
+
+            # 2. SteamOS Manager DBus path (only when no
+            #    device_controller is providing the same write).
+            if (
+                self.steamos_manager_available
+                and not hasattr(self, "_external_manager_token")
+            ):
+                ok = await self.set_performance_profile_via_steamos_manager(translated)
+                if ok:
+                    self.current_profile["platformProfile"] = translated
+                return ok
+
+            # 3. Generic ACPI platform_profile sysfs path.
+            ok = self._write_platform_profile_sysfs(translated)
+            if ok:
+                self.current_profile["platformProfile"] = translated
+            return ok
         except Exception as e:
             decky.logger.error(f"Plugin.set_rog_ally_platform_profile failed: {e}")
             return False
