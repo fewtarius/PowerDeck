@@ -44,6 +44,9 @@ PowerDeck running on the AYANEO Flip:
 
 ### CPU and Thermal Control
 - Thermal Design Power (TDP) adjustment within safe hardware limits
+- ACPI `platform_profile` auto-detected when available (Nimo Axis, ROG Ally with amd_pmf, upcoming JELOS); PowerDeck shows a profile picker instead of a watts slider and lets the kernel/EC own TDP
+- Native TDP via `ryzenadj` only exposed when ACPI platform profiles are absent, Secure Boot is off, and `/dev/mem` is usable
+- Watts-to-profile band mapping (`power-saver` / `balanced` / `performance`) so existing watt-level profiles still apply cleanly on ACPI devices
 - CPU boost enable/disable for performance versus battery optimization
 - CPU core count management for power efficiency
 - CPU frequency governor selection
@@ -169,7 +172,8 @@ This project is licensed under the GNU General Public License v3.0. See the LICE
 - `amd-pstate-epp` driver recommended for full EPP control on Zen 2+
 
 ### Security Requirements
-- Secure Boot must be disabled in BIOS/UEFI for TDP control (or `iomem=relaxed` kernel parameter set, as JELOS does by default)
+- Secure Boot must be disabled in BIOS/UEFI for native (ryzenadj) TDP control. When Secure Boot is enabled and ACPI `platform_profile` is unavailable, PowerDeck falls back to `amd-pstate-epp` governor/EPP only (no watt-level control).
+- Devices exposing ACPI `platform_profile` (Nimo Axis, ROG Ally with amd_pmf, upcoming JELOS) get full TDP control regardless of Secure Boot because the kernel/EC handle it.
 - Root access required (plugin operates with elevated privileges; runs as root via Decky Loader)
 - `/dev/mem` MMIO access for `ryzenadj` (configured automatically on JELOS)
 
