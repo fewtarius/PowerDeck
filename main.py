@@ -115,6 +115,11 @@ try:
     from steamfork_fan_control import steamfork_fan_controller
     from sleep_wake_manager import get_sleep_wake_manager
     from inputplumber_manager import get_inputplumber_manager, ControllerMode
+    # Generic battery charge-threshold control. Replaces the prior
+    # ROG-Ally-specific charge limit code so Nimo Axis, Legion Go,
+    # Framework laptops, ThinkPads and any other system exposing the
+    # standard kernel power_supply sysfs interface can be controlled.
+    from battery_manager import get_battery_manager
     device_support_available = True
 except ImportError as e:
     error_log(f"Device support modules not available: {e}")
@@ -203,6 +208,11 @@ class Plugin:
             "supports_smt": True,
             "supports_gpu_control": True,
             "has_fan_control": False,  # Will be set during initialization
+            # Generic battery charge limit capability. Detected at init
+            # time against the kernel power_supply sysfs; True on any
+            # device exposing a writable
+            # /sys/class/power_supply/BAT*/charge_control_end_threshold.
+            "battery_charge_limit_available": False,
             # TDP values will be set from processor database during initialization
             "min_tdp": 4,  # Hard-coded minimum for underclocking
             "max_tdp": None,  # Will be set from processor database
@@ -1034,6 +1044,68 @@ class Plugin:
                 except Exception as e:
                     error_log(f"Failed to detect fan control availability: {e}")
                     self.device_info["has_fan_control"] = False
+
+                # Detect generic battery charge limit support against the standard
+                # kernel power_supply sysfs interface. Available on ROG Ally,
+                # Nimo Axis, Legion Go, Framework, ThinkPad, Galaxy Book and
+                # many other devices - not gated to any single device type.
+                try:
+                    battery_mgr = get_battery_manager()
+                    self.device_info["battery_charge_limit_available"] = battery_mgr.is_available()
+                    info_log(
+                        f"Battery charge limit detection: "
+                        f"available={self.device_info['battery_charge_limit_available']}"
+                    )
+
+                    # ── Restore or default the charge limit ──────────────
+                    # First run: write 100 (no limit) to sysfs and save
+                    # the choice to powerdeck_settings.json. On every
+                    # subsequent run, the saved value is authoritative -
+                    # if the firmware/EC reset the value between
+                    # sessions (firmware update, EC reset, battery
+                    # replacement) we restore the user's last choice.
+                    # Devices that don't expose the sysfs file (the
+                    # capability check above) are skipped entirely.
+                    if self.device_info["battery_charge_limit_available"]:
+                        try:
+                            current = battery_mgr.get_charge_limit()
+                            saved = (
+                                self.settings.get("battery_charge_limit")
+                                if self.settings else None
+                            )
+                            if saved is not None:
+                                # We have a remembered user value.
+                                if current is not None and current != saved:
+                                    info_log(
+                                        f"Battery charge limit: restoring saved "
+                                        f"{saved}% (sysfs reported {current}%)"
+                                    )
+                                    battery_mgr.set_charge_limit(saved)
+                            else:
+                                # First run. Default to 100% (no limit)
+                                # so the user starts from a sane state
+                                # rather than whatever firmware default
+                                # the OEM shipped (e.g. Emdoor Nimo Axis
+                                # boots with 80% out of the box).
+                                if current is not None and current != 100:
+                                    info_log(
+                                        f"Battery charge limit: forcing default "
+                                        f"100% (was {current}%)"
+                                    )
+                                    battery_mgr.set_charge_limit(100)
+                                if self.settings:
+                                    self.settings.set("battery_charge_limit", 100)
+                                    info_log(
+                                        "Battery charge limit: saved default "
+                                        "100% to settings"
+                                    )
+                        except Exception as restore_err:
+                            error_log(
+                                f"Battery charge limit restore failed: {restore_err}"
+                            )
+                except Exception as e:
+                    error_log(f"Failed to detect battery charge limit availability: {e}")
+                    self.device_info["battery_charge_limit_available"] = False
                 
                 # Load unified profiles instead of old settings format
                 await self.load_unified_profiles()
@@ -2256,9 +2328,9 @@ class Plugin:
 
         Native mode owns a narrow slice of the CPU performance path
         (pstate mode, governor, EPP, TDP band via platform_profile).
-        Everything else — smt, cpuCores, cpuBoost, gpuMode, platformProfile,
+        Everything else - smt, cpuCores, cpuBoost, gpuMode, platformProfile,
         thermalPolicy, wifiPowerSave, usbAutosuspend, pcieAspm,
-        pciRuntimePm — stays user-tunable. The earlier version of this
+        pciRuntimePm - stays user-tunable. The earlier version of this
         function stripped smt/cpuCores/cpuBoost too, which made the UI
         sliders stop persisting and the front end render their values as
         undefined. Keep these user-facing fields; only remove the four
@@ -2268,7 +2340,7 @@ class Plugin:
         # PowerDeck-owned in native mode: dropped before write so a stale
         # Handheld-cloned value can't sneak back in via save. pstateMode
         # and epp are gone (passive mode has no EPP sysfs). tdp and
-        # governor are ignored on apply — PowerDeck picks them up from
+        # governor are ignored on apply - PowerDeck picks them up from
         # platformProfile and the governor lock respectively.
         for field in ("tdp", "governor", "epp", "pstateMode"):
             sanitized.pop(field, None)
@@ -7272,7 +7344,7 @@ class Plugin:
                     game_changed = (game_id != self._last_detected_game_id)
 
                     if not game_changed and not ac_changed:
-                        continue  # No change — nothing to do
+                        continue  # No change - nothing to do
 
                     prev_game = self._last_detected_game_id
                     self._last_detected_game_id = game_id
@@ -7820,15 +7892,25 @@ class Plugin:
             }
 
     async def get_rog_ally_battery_charge_limit(self) -> Optional[int]:
-        """Get ROG Ally battery charge limit - Plugin class method"""
+        """Get current battery charge end threshold - Plugin class method.
+
+        Generic implementation that works on any device exposing the
+        standard kernel power_supply sysfs interface (ROG Ally, Nimo
+        Axis, Legion Go, Framework laptops, ThinkPads, etc.). Kept
+        under the legacy name for backward compatibility with existing
+        call sites and external integrations; the implementation now
+        delegates to BatteryManager rather than requiring a specific
+        device_controller.
+        """
         decky.logger.info(f"PLUGIN METHOD: get_rog_ally_battery_charge_limit()")
         try:
-            if hasattr(self, 'device_controller') and hasattr(self.device_controller, 'get_battery_charge_limit'):
-                limit = self.device_controller.get_battery_charge_limit()
-                decky.logger.info(f"Plugin.get_rog_ally_battery_charge_limit: {limit}")
-                return limit
-            else:
+            from battery_manager import get_battery_manager
+            mgr = get_battery_manager()
+            if not mgr.is_available():
                 return None
+            limit = mgr.get_charge_limit()
+            decky.logger.info(f"Plugin.get_rog_ally_battery_charge_limit: {limit}")
+            return limit
         except Exception as e:
             decky.logger.error(f"Plugin.get_rog_ally_battery_charge_limit failed: {e}")
             return None
@@ -7978,21 +8060,83 @@ class Plugin:
             return False
 
     async def set_rog_ally_battery_charge_limit(self, limit: int) -> bool:
-        """Set ROG Ally battery charge limit - Plugin class method"""
+        """Set battery charge end threshold - Plugin class method.
+
+        Generic implementation that works on any device exposing the
+        standard kernel power_supply sysfs interface (ROG Ally, Nimo
+        Axis, Legion Go, Framework laptops, ThinkPads, etc.). Kept
+        under the legacy name for backward compatibility with existing
+        call sites and external integrations; the implementation now
+        delegates to BatteryManager rather than requiring a specific
+        device_controller.
+        """
         decky.logger.info(f"PLUGIN METHOD: set_rog_ally_battery_charge_limit({limit})")
         try:
-            if not (hasattr(self, 'device_controller') and self.device_controller):
-                decky.logger.warning("set_rog_ally_battery_charge_limit: No device_controller")
+            from battery_manager import get_battery_manager
+            mgr = get_battery_manager()
+            if not mgr.is_available():
+                decky.logger.warning(
+                    "set_rog_ally_battery_charge_limit: battery charge "
+                    "limit not available on this device"
+                )
                 return False
-            if not hasattr(self.device_controller, 'set_battery_charge_limit'):
-                decky.logger.warning("set_rog_ally_battery_charge_limit: device_controller missing method")
-                return False
-            result = self.device_controller.set_battery_charge_limit(limit)
+            result = mgr.set_charge_limit(limit)
             decky.logger.info(f"Plugin.set_rog_ally_battery_charge_limit({limit}): {result}")
             return result
         except Exception as e:
             decky.logger.error(f"Plugin.set_rog_ally_battery_charge_limit failed: {e}")
             return False
+
+    # Canonical generic battery charge limit methods. The legacy
+    # `*_rog_ally_battery_charge_limit` methods above are kept for
+    # backward compatibility - new code should call the methods here
+    # directly. Both names delegate to the same BatteryManager and
+    # persist the chosen value to powerdeck_settings.json so the
+    # user's choice survives firmware/EC resets between sessions.
+    async def set_battery_charge_limit(self, limit: int) -> bool:
+        """Set battery charge end threshold - Plugin class method.
+
+        Generic implementation that works on any device exposing the
+        standard kernel power_supply sysfs interface (ROG Ally, Nimo
+        Axis, Legion Go, Framework laptops, ThinkPads, etc.). The
+        Decky loader dispatches RPC calls to `set_battery_charge_limit`
+        against the plugin instance, so the Plugin class must expose
+        this name even though the actual logic lives in BatteryManager.
+        On a successful write the value is also saved to
+        powerdeck_settings.json so we can restore it on next init if
+        the firmware/EC clears the sysfs value between sessions.
+        """
+        try:
+            from battery_manager import get_battery_manager
+            mgr = get_battery_manager()
+            if not mgr.is_available():
+                return False
+            result = mgr.set_charge_limit(limit)
+            if result and self.settings:
+                self.settings.set("battery_charge_limit", limit)
+            return result
+        except Exception as e:
+            decky.logger.error(f"Plugin.set_battery_charge_limit failed: {e}")
+            return False
+
+    async def get_battery_charge_limit(self) -> Optional[int]:
+        """Get battery charge end threshold - Plugin class method.
+
+        Generic implementation that works on any device exposing the
+        standard kernel power_supply sysfs interface (ROG Ally, Nimo
+        Axis, Legion Go, Framework laptops, ThinkPads, etc.). Reads
+        the live sysfs value, mapping the kernel's "0 = no limit"
+        sentinel to 100% so the UI always shows a real percentage.
+        """
+        try:
+            from battery_manager import get_battery_manager
+            mgr = get_battery_manager()
+            if not mgr.is_available():
+                return None
+            return mgr.get_charge_limit()
+        except Exception as e:
+            decky.logger.error(f"Plugin.get_battery_charge_limit failed: {e}")
+            return None
 
     # InputPlumber integration
 
@@ -8727,35 +8871,67 @@ async def get_rog_ally_fan_status() -> Dict[str, Any]:
         decky.logger.warning("Global get_rog_ally_fan_status: Not a ROG Ally device")
         return {'cpu_fan': {'speed': None, 'mode': None, 'label': None}, 'gpu_fan': {'speed': None, 'mode': None, 'label': None}}
 
-async def set_rog_ally_battery_charge_limit(limit: int) -> bool:
-    """Set ROG Ally battery charge limit (frontend callable)"""
-    decky.logger.debug(f" set_rog_ally_battery_charge_limit({limit})")
-    if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
-        try:
-            result = plugin.device_controller.set_battery_charge_limit(limit)
-            decky.logger.debug(f"Global set_rog_ally_battery_charge_limit: {result}")
-            return result
-        except Exception as e:
-            decky.logger.error(f"Global set_rog_ally_battery_charge_limit failed: {e}")
+async def set_battery_charge_limit(limit: int) -> bool:
+    """Set battery charge end threshold (frontend callable, generic).
+
+    Works on any device that exposes a writable
+    /sys/class/power_supply/BAT*/charge_control_end_threshold sysfs
+    file - ROG Ally, Nimo Axis, Legion Go, Framework laptops,
+    ThinkPads, Galaxy Books, etc. The capability check is performed
+    via BatteryManager.is_available() rather than a device_type match
+    so the same path covers every supported system. Persists the
+    chosen value to powerdeck_settings.json so it survives
+    firmware/EC resets between sessions.
+    """
+    decky.logger.debug(f" set_battery_charge_limit({limit})")
+    if not plugin:
+        return False
+    try:
+        from battery_manager import get_battery_manager
+        mgr = get_battery_manager()
+        if not mgr.is_available():
+            decky.logger.warning("set_battery_charge_limit: not available on this device")
             return False
-    else:
-        decky.logger.warning("Global set_rog_ally_battery_charge_limit: Not a ROG Ally device")
+        result = mgr.set_charge_limit(limit)
+        if result and plugin.settings:
+            plugin.settings.set("battery_charge_limit", limit)
+        decky.logger.debug(f"Global set_battery_charge_limit: {result}")
+        return result
+    except Exception as e:
+        decky.logger.error(f"Global set_battery_charge_limit failed: {e}")
         return False
 
-async def get_rog_ally_battery_charge_limit() -> Optional[int]:
-    """Get ROG Ally battery charge limit (frontend callable)"""
-    decky.logger.debug(" get_rog_ally_battery_charge_limit()")
-    if plugin and plugin.device_type == "rog_ally" and plugin.device_controller:
-        try:
-            limit = plugin.device_controller.get_battery_charge_limit()
-            decky.logger.debug(f"Global get_rog_ally_battery_charge_limit: {limit}")
-            return limit
-        except Exception as e:
-            decky.logger.error(f"Global get_rog_ally_battery_charge_limit failed: {e}")
-            return None
-    else:
-        decky.logger.warning("Global get_rog_ally_battery_charge_limit: Not a ROG Ally device")
+async def get_battery_charge_limit() -> Optional[int]:
+    """Get current battery charge end threshold (frontend callable, generic)."""
+    decky.logger.debug(" get_battery_charge_limit()")
+    if not plugin:
         return None
+    try:
+        from battery_manager import get_battery_manager
+        mgr = get_battery_manager()
+        if not mgr.is_available():
+            return None
+        return mgr.get_charge_limit()
+    except Exception as e:
+        decky.logger.error(f"Global get_battery_charge_limit failed: {e}")
+        return None
+
+# Backward-compatible aliases. The legacy rog_ally_battery_charge_limit
+# callables were tied to the ROG Ally device_type, which broke support
+# on every other device exposing the same kernel power_supply interface.
+# These thin aliases preserve the binding names so existing frontend
+# builds keep working while the canonical name moves to
+# set_battery_charge_limit / get_battery_charge_limit.
+
+async def set_rog_ally_battery_charge_limit(limit: int) -> bool:
+    """Deprecated alias for set_battery_charge_limit. Kept so external
+    integrations that hard-coded the legacy callable name continue to
+    work."""
+    return await set_battery_charge_limit(limit)
+
+async def get_rog_ally_battery_charge_limit() -> Optional[int]:
+    """Deprecated alias for get_battery_charge_limit."""
+    return await get_battery_charge_limit()
 
 async def set_rog_ally_performance_mode(mode: str) -> bool:
     """Set ROG Ally comprehensive performance mode (frontend callable)"""

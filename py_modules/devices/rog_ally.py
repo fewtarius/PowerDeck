@@ -28,7 +28,11 @@ from typing import Optional, Dict, Any, List
 # ROG Ally System Paths
 ACPI_PLATFORM_PROFILE = '/sys/firmware/acpi/platform_profile'
 ACPI_PLATFORM_PROFILE_CHOICES = '/sys/firmware/acpi/platform_profile_choices'
-BATTERY_CHARGE_LIMIT = '/sys/class/power_supply/BAT0/charge_control_end_threshold'
+# Battery charge threshold control moved to py_modules/battery_manager.py.
+# The ROG-Ally-specific setters/getters now delegate to that generic
+# module so the same code path covers Nimo Axis, Legion Go, Framework
+# laptops, ThinkPads, Galaxy Books, etc. - any system that exposes the
+# standard kernel power_supply charge_control_end_threshold file.
 
 # ASUS WMI Base Path
 WMI_BASE_PATH = '/sys/devices/platform/asus-nb-wmi'
@@ -91,6 +95,11 @@ class ROGAllyController:
         self.armoury_available = self._check_armoury_support()
         self.hwmon_path = self._find_hwmon_path()
         self.amd_gpu_available = self._check_amd_gpu_support()
+
+        # Battery charge threshold control moved to generic BatteryManager
+        # so the same code path works on any device that exposes the
+        # kernel power_supply sysfs interface. Initialised lazily.
+        self._battery_manager = None
         
         # Initialize with system defaults
         self.custom_curve_path = self._find_custom_curve_hwmon()
@@ -274,12 +283,12 @@ class ROGAllyController:
             success &= self._write_sysfs_value(ARMOURY_FAST_LIMIT, str(fast_limit))
             success &= self._write_sysfs_value(ARMOURY_SUSTAINED_LIMIT, str(sustained_limit))
             success &= self._write_sysfs_value(ARMOURY_STAPM_LIMIT, str(stapm_limit))
-            # Armoury writes are persistent (NVRAM) but NOT live — amd_pmf (AMD
+            # Armoury writes are persistent (NVRAM) but NOT live - amd_pmf (AMD
             # Platform Management Framework) runs a 1s loop that continuously
             # pushes OEM limits to the SMU.  Reloading amd_pmf forces it to
             # re-read the armoury values and then hold them indefinitely.
             # This avoids any polling.  When native TDP is enabled, ryzenadj
-            # is NOT used — amd_pmf manages all power limits exclusively.
+            # is NOT used - amd_pmf manages all power limits exclusively.
             if success:
                 self._reload_amd_pmf()
         elif self.wmi_available:
@@ -301,7 +310,7 @@ class ROGAllyController:
 
         amd_pmf reads armoury/firmware-attributes at module init and then holds
         those limits in its 1-second maintenance loop.  Writing to armoury sysfs
-        does NOT update the running PMF instance — a reload is required.
+        does NOT update the running PMF instance - a reload is required.
 
         This is safe: amd_pmf is a non-essential power-tuning module and
         reloads cleanly in <500ms with no observable side-effects.
@@ -323,9 +332,9 @@ class ROGAllyController:
                 env=clean_env
             )
             if modprobe.returncode == 0:
-                decky_plugin.logger.info("amd_pmf reloaded — PMF will now hold new armoury power limits")
+                decky_plugin.logger.info("amd_pmf reloaded - PMF will now hold new armoury power limits")
             else:
-                # Not fatal — the user may have native TDP disabled
+                # Not fatal - the user may have native TDP disabled
                 decky_plugin.logger.warning(f"amd_pmf reload failed (non-fatal): {modprobe.stderr.strip() or rmmod.stderr.strip()}")
         except Exception as e:
             decky_plugin.logger.warning(f"amd_pmf reload exception (non-fatal): {e}")
@@ -457,34 +466,38 @@ class ROGAllyController:
         return None
     
     def set_battery_charge_limit(self, limit: int) -> bool:
-        """Set battery charge limit (20-100%)"""
-        if not 20 <= limit <= 100:
-            decky_plugin.logger.error(f"Invalid charge limit: {limit}% (must be 20-100%)")
-            return False
-        
-        success = self._write_sysfs_value(BATTERY_CHARGE_LIMIT, str(limit))
-        if success:
-            decky_plugin.logger.info(f"ROG Ally battery charge limit set to: {limit}%")
-        
-        return success
-    
-    def get_battery_charge_limit(self) -> Optional[int]:
-        """Get current battery charge limit
-        
-        Note: The charge_control_end_threshold sysfs file may read as 0
-        if no explicit limit has been set since boot. In this case, the
-        actual hardware default is 100% (no limit). We return 100 for a
-        read value of 0 to reflect the true hardware state.
+        """Set battery charge end threshold (20-100%).
+
+        Backward-compatible wrapper. The actual implementation lives in
+        py_modules/battery_manager.py so the same code path covers ROG
+        Ally, Nimo Axis, Legion Go, Framework laptops, ThinkPads, Galaxy
+        Books, and any other device exposing the kernel
+        charge_control_end_threshold sysfs file.
         """
-        limit_str = self._read_sysfs_value(BATTERY_CHARGE_LIMIT)
-        if limit_str:
-            try:
-                val = int(limit_str)
-                # 0 means "not set" / "full charge" - return 100%
-                return 100 if val == 0 else val
-            except ValueError:
-                pass
-        return None
+        return self.battery_manager.set_charge_limit(limit)
+
+    def get_battery_charge_limit(self) -> Optional[int]:
+        """Get current battery charge end threshold (percent).
+
+        Backward-compatible wrapper. Some firmware returns 0 when "no
+        limit is set"; the generic BatteryManager maps that to 100 to
+        match the user-visible "full charge" semantics.
+        """
+        return self.battery_manager.get_charge_limit()
+
+    @property
+    def battery_manager(self):
+        """Lazy accessor for the generic BatteryManager singleton.
+
+        Importing the module eagerly at ROG Ally controller construction
+        would force every test/import path to resolve the full battery
+        stack even when ROG Ally support is unused. We pull it in the
+        first time something actually calls into the battery API.
+        """
+        if self._battery_manager is None:
+            from battery_manager import get_battery_manager
+            self._battery_manager = get_battery_manager()
+        return self._battery_manager
     
     def set_mcu_powersave(self, enabled: bool) -> bool:
         """Enable/disable MCU power saving mode"""

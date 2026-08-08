@@ -301,8 +301,17 @@ const setRogAllyThermalThrottlePolicyBackend = callable<[policy: number], boolea
 const getRogAllyThermalThrottlePolicy = callable<[], number | null>("get_rog_ally_thermal_throttle_policy");
 const setRogAllyFanModeBackend = callable<[fan_id: number, mode: number], boolean>("set_rog_ally_fan_mode");
 const getRogAllyFanStatus = callable<[], any>("get_rog_ally_fan_status");
+// ROG Ally-specific charge limit aliases - preserved for backward compat
+// with the legacy UI. The canonical generic callables are below.
 const setRogAllyBatteryChargeLimitBackend = callable<[limit: number], boolean>("set_rog_ally_battery_charge_limit");
 const getRogAllyBatteryChargeLimit = callable<[], number | null>("get_rog_ally_battery_charge_limit");
+// Generic battery charge limit callables. These work on any device
+// exposing the standard kernel power_supply sysfs interface (ROG Ally,
+// Nimo Axis, Legion Go, Framework laptops, ThinkPads, Galaxy Books,
+// etc.). The capability flag is surfaced via
+// deviceInfo.battery_charge_limit_available.
+const setBatteryChargeLimitBackend = callable<[limit: number], boolean>("set_battery_charge_limit");
+const getBatteryChargeLimit = callable<[], number | null>("get_battery_charge_limit");
 const setRogAllyPerformanceMode = callable<[mode: string], boolean>("set_rog_ally_performance_mode");
 const getRogAllyComprehensiveStatus = callable<[], any>("get_rog_ally_comprehensive_status");
 const setGameProfile = callable<[gameId: string, profile: any], boolean>("set_game_profile");
@@ -401,6 +410,7 @@ interface DeviceInfo {
   steamosManagerAvailable?: boolean;
   isJELOS?: boolean;
   tdpControlMode?: string;
+  battery_charge_limit_available?: boolean;
 }
 
 // Component for slider with React icon overlays
@@ -635,12 +645,18 @@ const Content: React.FC = () => {
   const [rogAllyPlatformProfile, setRogAllyPlatformProfile] = useState<string>('balanced');
   const [rogAllyMcuPowersave, setRogAllyMcuPowersave] = useState<boolean>(true);
   const [rogAllyThermalPolicy, setRogAllyThermalPolicy] = useState<number>(0);
-  const [rogAllyFanStatus, setRogAllyFanStatus] = useState<any>({ 
-    cpu_fan: { speed: null, mode: 2, label: 'cpu_fan' }, 
-    gpu_fan: { speed: null, mode: 0, label: 'gpu_fan' } 
+  const [rogAllyFanStatus, setRogAllyFanStatus] = useState<any>({
+    cpu_fan: { speed: null, mode: 2, label: 'cpu_fan' },
+    gpu_fan: { speed: null, mode: 0, label: 'gpu_fan' }
   });
   const [rogAllyBatteryChargeLimit, setRogAllyBatteryChargeLimit] = useState<number>(100);
   const [defaultTdp, setDefaultTdp] = useState<number>(15);  // Database default (ctdp_min)
+
+  // Generic battery charge limit state. The capability flag
+  // (deviceInfo.battery_charge_limit_available) replaces the previous
+  // `isRogAlly` gate so the UI renders on any device with a writable
+  // charge_control_end_threshold sysfs file.
+  const [batteryChargeLimit, setBatteryChargeLimit] = useState<number>(100);
 
   // AMD P-State Mode Control State
   const [pstateMode, setLocalPStateMode] = useState<string>("passive");
@@ -997,6 +1013,21 @@ const Content: React.FC = () => {
         setTdpLimits(limits);
         setCustomTdpMin(limits.min);
         setCustomTdpMax(limits.max);
+
+        // Generic battery charge limit - works on any device exposing the
+        // standard kernel power_supply sysfs interface (ROG Ally, Nimo
+        // Axis, Legion Go, Framework laptops, ThinkPads, Galaxy Books,
+        // etc.). Gated by the capability flag from deviceInfo, NOT by
+        // the device name.
+        if (deviceData?.battery_charge_limit_available) {
+          try {
+            const chargeLimit = await getBatteryChargeLimit();
+            setBatteryChargeLimit(chargeLimit ?? 100);
+            debug.log(`Battery charge limit loaded: ${chargeLimit}%`);
+          } catch (error) {
+            debug.error('Failed to load battery charge limit:', error);
+          }
+        }
         
         // Check if hardware TDP control is available
         try {
@@ -2014,7 +2045,7 @@ const Content: React.FC = () => {
           />
           <PanelSectionRow>
             <div style={{ padding: '4px 0', fontSize: '11px', color: 'var(--text-tertiary)' }}>
-              Method: {tdpControlAvailable?.method || 'unknown'} — {tdpControlAvailable?.reason || ''}
+              Method: {tdpControlAvailable?.method || 'unknown'} - {tdpControlAvailable?.reason || ''}
             </div>
           </PanelSectionRow>
         </PanelSection>
@@ -2426,37 +2457,51 @@ const Content: React.FC = () => {
       </PanelSection>
       )}
 
-      {/* ROG Ally Battery Management Section */}
-      {isRogAlly && rogAllyDeviceInfo?.available_controls?.battery_management && (
+      {/* Battery Management Section (generic) */}
+      {/* Renders on any device that exposes the standard kernel
+          power_supply charge_control_end_threshold sysfs interface.
+          Previously hard-gated to `isRogAlly` which left Nimo Axis,
+          Legion Go, Framework laptops, ThinkPads, and other devices
+          without charge-limit UI despite the kernel interface being
+          present. The capability flag is set during backend init by
+          probing the sysfs interface as root. On init the backend
+          also restores the saved value from powerdeck_settings.json
+          (or defaults to 100% on first run), so the slider always
+          reflects the live, persisted choice. */}
+      {deviceInfo?.battery_charge_limit_available && (
         <PanelSection title="Battery Management">
           <PanelSectionRow>
             <SliderWithIcons
               label="Charge Limit"
-              value={rogAllyBatteryChargeLimit}
+              value={batteryChargeLimit}
               min={20}
               max={100}
               step={5}
               icons={[<FaBatteryEmpty />, <FaBatteryHalf />, <FaBatteryFull />]}
               onChange={async (value) => {
-                setRogAllyBatteryChargeLimit(value);
+                setBatteryChargeLimit(value);
                 try {
-                  await setRogAllyBatteryChargeLimitBackend(value);
-                  debug.log(`ROG Ally battery charge limit set to: ${value}%`);
+                  // Prefer the generic callable; fall back to the
+                  // legacy ROG Ally binding for older frontends.
+                  if (deviceInfo?.battery_charge_limit_available) {
+                    await setBatteryChargeLimitBackend(value);
+                  } else {
+                    await setRogAllyBatteryChargeLimitBackend(value);
+                  }
+                  debug.log(`Battery charge limit set to: ${value}%`);
                 } catch (error) {
-                  debug.error("Failed to set ROG Ally battery charge limit:", error);
+                  debug.error("Failed to set battery charge limit:", error);
                 }
               }}
             />
           </PanelSectionRow>
           <PanelSectionRow>
-            <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.8em', color: '#888', paddingLeft: '12px', gap: '8px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', fontSize: '0.85em', color: '#ccc', paddingLeft: '12px', gap: '8px' }}>
               <span style={{ color: '#00d4ff', fontSize: '1em' }}>
-                {rogAllyBatteryChargeLimit <= 40 ? <FaBatteryEmpty /> : rogAllyBatteryChargeLimit <= 80 ? <FaBatteryHalf /> : <FaBatteryFull />}
+                {batteryChargeLimit <= 40 ? <FaBatteryEmpty /> : batteryChargeLimit <= 80 ? <FaBatteryHalf /> : <FaBatteryFull />}
               </span>
-              <span>
-                {rogAllyBatteryChargeLimit <= 40 ? "Extended battery lifespan" : 
-                 rogAllyBatteryChargeLimit <= 80 ? "Balanced battery lifespan" : 
-                 "Full charge capacity"}
+              <span style={{ fontWeight: '500' }}>
+                Current: {batteryChargeLimit}%
               </span>
             </div>
           </PanelSectionRow>
