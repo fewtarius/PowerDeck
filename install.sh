@@ -12,6 +12,25 @@ readonly GITHUB_API_URL="https://api.github.com/repos/${GITHUB_REPO}/releases/la
 readonly HOMEBREW_PLUGINS_DIR="${HOME}/homebrew/plugins"
 readonly PLUGIN_DIR="${HOMEBREW_PLUGINS_DIR}/${PACKAGE}"
 
+# Bundled CA bundle. Ship a Mozilla CA bundle in the plugin tarball
+# so curl works in Decky sandboxes / minimal images that don't expose
+# the system CA bundle at /etc/ssl/certs/ca-certificates.crt. The
+# updater inside the plugin uses the same file via ssl.create_default_context.
+# Source: https://curl.se/docs/caextract.html
+readonly CERT_NAME="ca-certificates.crt"
+readonly PLUGIN_CERT_PATH="${PLUGIN_DIR}/${CERT_NAME}"
+
+# pdcurl - curl wrapper that pins the bundled CA bundle when present.
+# Falls back to system trust store so the install script still works on
+# machines with a working /etc/ssl bundle.
+pdcurl() {
+    if [[ -f "$PLUGIN_CERT_PATH" ]]; then
+        curl -sS --cacert "$PLUGIN_CERT_PATH" "$@"
+    else
+        curl -sS "$@"
+    fi
+}
+
 # Global state tracking
 filesystem_was_unlocked=false
 
@@ -201,12 +220,14 @@ prepare_plugin_directory() {
 fetch_release_info() {
     log_info "Fetching latest release information from GitHub..." >&2
     log_debug "API URL: $GITHUB_API_URL" >&2
-    
+
     local release_data http_code
-    
-    # Fetch with HTTP status code
-    if ! release_data=$(curl -s -w "%{http_code}" "$GITHUB_API_URL"); then
+
+    # Fetch with HTTP status code. Use --cacert so we work even
+    # in Decky sandboxes that don't expose the system CA bundle.
+    if ! release_data=$(pdcurl -w "%{http_code}" "$GITHUB_API_URL"); then
         log_error "Failed to fetch release information from GitHub API"
+        log_error "Possible causes: no internet, DNS failure, or stale CA bundle"
         exit 1
     fi
     
@@ -313,9 +334,11 @@ download_and_install() {
     
     log_info "Downloading ${PACKAGE} ${release_version}..."
     log_info "Download URL: $release_url"
-    
-    if ! curl -L "$release_url" -o "$temp_file"; then
+
+    # Use --cacert so the download works in sandboxed environments
+    if ! pdcurl -L "$release_url" -o "$temp_file"; then
         log_error "Failed to download release archive"
+        log_error "If this is a TLS error, your system CA bundle may be stale"
         exit 1
     fi
     

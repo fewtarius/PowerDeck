@@ -78,6 +78,13 @@ PowerDeck running on the AYANEO Flip:
 - cTDP range 45-120W per AMD spec, up to 130W on some boards (Beelink GTR9 PRO, Framework Desktop)
 - Works on JELOS via `iomem=relaxed` kernel cmdline for direct SMU access
 
+## Development
+
+See [STYLE_GUIDE.md](STYLE_GUIDE.md) for frontend conventions
+(slider primitives, colour palette, section ordering, icon
+mapping) and [AGENTS.md](AGENTS.md) for backend module layout,
+build commands, and the per-feature commit checklist.
+
 ## License
 
 This project is licensed under the GNU General Public License v3.0. See the LICENSE file for complete terms.

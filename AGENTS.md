@@ -119,6 +119,7 @@ Decky Loader Overlay (Steam UI)
 | `py_modules/devices/` | Device-specific controllers (Steam Deck, ROG Ally, Lenovo Legion) |
 | `src/index.tsx` | Frontend entry point (React/TypeScript with Decky UI) |
 | `dist/` | Built frontend output (`index.js`, `index.js.map`) |
+| `STYLE_GUIDE.md` | Frontend visual / UX conventions for plugin sections |
 | `RyzenAdj/` | Git submodule - AMD SMU control utility (C, cmake build) |
 | `images/` | Screenshots for README |
 | `.github/workflows/release.yml` | CI/CD release pipeline |
