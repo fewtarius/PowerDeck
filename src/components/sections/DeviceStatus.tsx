@@ -3,7 +3,6 @@ import {
   FaMicrochip,
   FaPlug,
   FaGamepad,
-  FaTachometerAlt,
   FaShieldAlt,
 } from "react-icons/fa";
 
@@ -24,7 +23,6 @@ export function DeviceStatusSection() {
   const device = state.device_info;
   const perGame = state.per_game_profiles_enabled;
   const gameName = perGame ? currentGameName() : null;
-  const limits = state.capabilities.tdp_limits;
 
   return (
     <PanelSection title="Device Status">
@@ -46,12 +44,6 @@ export function DeviceStatusSection() {
             label="Profile"
             value={gameName ? `Active Game: ${gameName}` : "Handheld (default)"}
             valueColor={gameName ? COLORS.accent : "#aaa"}
-          />
-          <InfoRow
-            icon={<FaTachometerAlt />}
-            label="TDP Range"
-            value={`${limits.min}-${limits.max}W`}
-            valueColor={COLORS.accent}
           />
         </div>
       </PanelSectionRow>
