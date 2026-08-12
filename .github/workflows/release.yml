@@ -24,7 +24,7 @@ jobs:
       - name: Install system dependencies for RyzenAdj
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake build-essential libpci-dev
+          sudo apt-get install -m cmake build-essential libpci-dev p7zip-full
 
       - name: Build RyzenAdj for TDP control
         run: |
@@ -34,7 +34,7 @@ jobs:
             cd RyzenAdj/build
             cmake -DCMAKE_BUILD_TYPE=Release ..
             make -j$(nproc)
-            
+
             # Verify binary was created
             if [ -f "ryzenadj" ]; then
               echo "RyzenAdj built successfully!"
@@ -75,48 +75,111 @@ jobs:
           pnpm run build
         continue-on-error: true
 
-      - name: Download Decky Plugin CLI
+      # Build the plugin zip manually. Decy CLI's `decky plugin build`
+      # ships a hardcoded file list (LICENSE, main.py, package.json,
+      # plugin.json, README.md, dist/, bin/, py_modules/) and silently
+      # drops anything else. The powerdeck/ package, ca-certificates.crt,
+      # install.sh, and STYLE_GUIDE.md all fall outside that list and
+      # need to be packaged explicitly. v1.0.71 was released through
+      # the Decy CLI path and shipped without the powerdeck/ directory,
+      # which loads the plugin but fails to import any backend symbols.
+      #
+      # Zip shape:
+      #   PowerDeck.zip
+      #   ├── PowerDeck/        (the plugin directory contents)
+      #   │   ├── LICENSE
+      #   │   ├── main.py
+      #   │   ├── package.json
+      #   │   ├── plugin.json
+      #   │   ├── README.md
+      #   │   ├── VERSION
+      #   │   ├── ca-certificates.crt
+      #   │   ├── install.sh
+      #   │   ├── powerdeck/    (the backend)
+      #   │   ├── src/
+      #   │   ├── dist/
+      #   │   └── ... (everything else)
+      #   └── RyzenAdj/         (the SMU binary, installed to /opt/ryzenadj/bin)
+      #       └── build/
+      #           └── ryzenadj
+      - name: Build PowerDeck plugin package
         run: |
-          mkdir $(pwd)/cli
-          curl -L -o $(pwd)/cli/decky "https://github.com/SteamDeckHomebrew/cli/releases/latest/download/decky-linux-x86_64"
-          chmod +x $(pwd)/cli/decky
+          mkdir -p out
+          rm -rf out/PowerDeck
+          mkdir -p out/PowerDeck
 
-      - name: Build PowerDeck plugin
-        run: |
-          $(pwd)/cli/decky plugin build $(pwd)
-          
-          # Add RyzenAdj binary to the plugin package
+          # Copy the plugin files. Invert the .gitignore so we ship
+          # every tracked file plus the once-untracked-but-required
+          # ca-certificates.crt and install.sh.
+          rsync -a \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            --exclude='node_modules/' \
+            --exclude='__pycache__/' \
+            --exclude='*.pyc' \
+            --exclude='*.pyo' \
+            --exclude='.vscode/' \
+            --exclude='.idea/' \
+            --exclude='*.swp' \
+            --exclude='*.swo' \
+            --exclude='*~' \
+            --exclude='docs/' \
+            --exclude='PERFORMANCE_IMPROVEMENTS.md' \
+            --exclude='ai-assisted/' \
+            --exclude='scratch/' \
+            --exclude='.clio/' \
+            --exclude='reference/' \
+            --exclude='.DS_Store' \
+            --exclude='out/' \
+            --exclude='RyzenAdj/' \
+            --exclude='dist/' \
+            ./ out/PowerDeck/
+
+          # Add the built frontend. The Decky CLI flattens dist/ to root
+          # in some builds; Decky Loader v3+ expects it at dist/index.js
+          # for dynamic import(). Copy it both ways to be safe.
+          mkdir -p out/PowerDeck/dist
+          [ -f dist/index.js ]     && cp dist/index.js     out/PowerDeck/dist/index.js
+          [ -f dist/index.js.map ] && cp dist/index.js.map out/PowerDeck/dist/index.js.map
+
+          # Add the RyzenAdj binary at the expected path. The plugin
+          # calls it via /opt/ryzenadj/bin/ryzenadj (set during init);
+          # shipping it at RyzenAdj/build/ryzenadj inside the zip
+          # keeps the install script's path-detection logic stable.
           if [ -f "RyzenAdj/build/ryzenadj" ]; then
-            echo "Adding RyzenAdj binary to plugin package..."
-            unzip "out/PowerDeck.zip" -d "out/PowerDeck"
-            
-           # Create RyzenAdj directory structure in plugin
-           mkdir -p "out/PowerDeck/RyzenAdj/build"
-           cp "RyzenAdj/build/ryzenadj" "out/PowerDeck/RyzenAdj/build/"
-            
-            # Decky CLI may flatten dist/ to root. Decky Loader v3+ expects
-            # the frontend at dist/index.js for dynamic import(). Ensure it exists.
-            if [ ! -d "out/PowerDeck/dist" ]; then
-              echo "Preserving dist/ directory for Decky Loader v3+ compatibility..."
-              mkdir -p "out/PowerDeck/dist"
-              cp "out/PowerDeck/index.js" "out/PowerDeck/dist/index.js" 2>/dev/null || true
-              cp "out/PowerDeck/index.js.map" "out/PowerDeck/dist/index.js.map" 2>/dev/null || true
-            fi
-           
-           # Also copy install script
-            cp "install-ryzenadj.sh" "out/PowerDeck/" 2>/dev/null || echo "Warning: install-ryzenadj.sh not found"
-            
-            # Repack the plugin with RyzenAdj
-            cd out/PowerDeck && zip -r "../PowerDeck.zip" . && cd ../..
-            echo "RyzenAdj binary added to plugin package"
+            mkdir -p out/RyzenAdj/build
+            cp RyzenAdj/build/ryzenadj out/RyzenAdj/build/
           else
-            echo "Warning: RyzenAdj binary not found, creating package without TDP control"
+            echo "Warning: RyzenAdj binary not found, package will not include TDP control"
           fi
 
-      - name: Show PowerDeck build files
-        run: |
-          ls out/PowerDeck.zip
-          7z l out/PowerDeck.zip
+          # Sanity check: the package must contain the powerdeck/ directory
+          # because the entire plugin backend lives there. If it's missing,
+          # the plugin will load but every callable will fail with
+          # ModuleNotFoundError: powerdeck.
+          if [ ! -d "out/PowerDeck/powerdeck" ]; then
+            echo "ABORT: powerdeck/ directory missing from package - this would produce a broken release"
+            exit 1
+          fi
+
+          # Show what got packaged
+          echo "=== PowerDeck/ contents ==="
+          ( cd out/PowerDeck && find . -type f | sort )
+          echo "=== RyzenAdj/ contents ==="
+          ( cd out/RyzenAdj && find . -type f | sort ) 2>/dev/null || echo "(no RyzenAdj)"
+
+          # Build the zip. The PowerDeck/ directory is the prefix so
+          # the install script's
+          #   rsync -av "${temp_dir}/PowerDeck/" "$PLUGIN_DIR"
+          # hits the right files. RyzenAdj/ sits at the top of the zip
+          # so it can be installed to /opt/ryzenadj/bin separately.
+          ( cd out && zip -r PowerDeck.zip PowerDeck )
+          if [ -f "RyzenAdj/build/ryzenadj" ]; then
+            ( cd out && zip -r PowerDeck.zip RyzenAdj )
+          fi
+
+          echo "=== Zip contents ==="
+          unzip -l out/PowerDeck.zip
 
       - name: Publish PowerDeck Artifact
         uses: actions/upload-artifact@v4
@@ -157,26 +220,26 @@ jobs:
           name: "PowerDeck v${{ steps.get_version.outputs.version }}"
           body: |
             # PowerDeck v${{ steps.get_version.outputs.version }}
-            
+
             Advanced power management plugin for Steam Deck and handheld PCs.
-            
+
             ## Features
             - TDP (Thermal Design Power) control
-            - CPU boost management  
+            - CPU boost management
             - Performance profiles
             - AC/Battery power mode switching
             - Per-game profile support
-            
+
             ## Installation
             1. Download `PowerDeck.zip` below
             2. Extract to your Decky plugins directory
             3. Restart Decky Loader
-            
+
             ## Compatible Devices
             - AYANEO handheld devices
             - ROG Ally series
             - Most devices running SteamOS
-            
+
           draft: false
           generate_release_notes: false
           prerelease: contains(github.ref, 'pre')
