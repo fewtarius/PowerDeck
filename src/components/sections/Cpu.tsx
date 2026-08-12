@@ -39,7 +39,7 @@ export function CpuSection() {
           max={cpuCoresMax}
           step={1}
           icon={<FaMicrochip />}
-          displayValue={`${profile.cpuCores} (${device.cpu_name})`}
+          displayValue={`${profile.cpuCores} (Online)`}
           onChange={(value) => applySettings({ cpuCores: value })}
           description={`Range: 1-${cpuCoresMax}`}
         />
