@@ -86,6 +86,13 @@ def device_key() -> str:
         if "OLED" in product.upper():
             return "deck_oled"
         return "deck_lcd"
+    elif vendor.startswith("ASUS"):
+        # ROG Ally / Ally X — InputPlumber may report a non-gamepad
+        # "mouse" target as current; device_key() gives us the YAML
+        # suffix so default_target_for_device() can find the shipped
+        # default target.
+        if "RC71" in product or "RC72" in product or "ROG" in product.upper():
+            return "rog_ally"
     return ""
 
 
@@ -187,18 +194,28 @@ def _set_targets(targets: List[str]) -> bool:
 
 
 def _current_target() -> Optional[str]:
-    """Return the current target device id (or None if not set)."""
+    """Return the current target device id (or None if not set).
+
+    Filters the InputPlumber target list to only supported gamepad modes.
+    InputPlumber may list non-gamepad targets (e.g. "mouse" on ROG Ally)
+    that aren't valid controller modes — returning those would make the
+    slider display an unsupported value and prevent switching.
+    """
     targets = _list_targets()
-    return targets[0] if targets else None
+    for t in targets:
+        if t in SUPPORTED_MODES:
+            return t
+    return None
 
 
 def get_status() -> dict:
     """Return a small dict used by the frontend: {available, current_mode, dbus_mode, modes, default_target}."""
     actual = _current_target()
     if actual is None:
-        # inputplumber isn't managing our device or isn't running.
-        # Fall back to the device's shipped default so the UI doesn't
-        # lie about the active mode.
+        # inputplumber isn't managing our device, isn't running, or
+        # the active target is a non-gamepad mode (e.g. "mouse" on
+        # ROG Ally). Fall back to the device's shipped default so the
+        # UI doesn't lie about the active mode.
         actual = default_target_for_device()
     return {
         "available": True,

@@ -1,4 +1,4 @@
-import { ReactNode } from "react";
+import { ReactNode, useCallback, useEffect, useState } from "react";
 import { SliderField } from "@decky/ui";
 
 // Accent colors used across the UI. Keep these in sync with the
@@ -63,19 +63,41 @@ export function LabeledSlider({
   displayValue,
   icon,
 }: LabeledSliderProps) {
-  const inline = displayValue ?? `${value}${valueSuffix}`;
+  // Mirror value in local state so the slider thumb follows the user's
+  // drag immediately. Without this, the controlled SliderField snaps back
+  // to the prop value (which only updates after the async backend
+  // round-trip + refresh completes), making every slider feel stuck or
+  // sluggish. The prop is still the source of truth on external changes
+  // (profile switch, AC toggle) via the useEffect below.
+  const [internalValue, setInternalValue] = useState(value);
+
+  // Sync from prop when it changes externally. During an active drag
+  // the prop hasn't changed yet, so this doesn't fight the user's input.
+  useEffect(() => {
+    setInternalValue(value);
+  }, [value]);
+
+  const handleChange = useCallback(
+    (newValue: number) => {
+      setInternalValue(newValue);
+      onChange(newValue);
+    },
+    [onChange]
+  );
+
+  const inline = displayValue ?? `${internalValue}${valueSuffix}`;
   return (
     <>
       <SliderField
         label={`${label}: ${inline}`}
-        value={value}
+        value={internalValue}
         min={min}
         max={max}
         step={step}
         notchTicksVisible={!!notches}
         bottomSeparator="none"
         icon={icon}
-        onChange={onChange}
+        onChange={handleChange}
       />
       {description && (
         <div

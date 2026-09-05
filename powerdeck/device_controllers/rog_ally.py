@@ -42,9 +42,18 @@ def get_fan_status() -> Optional[dict]:
     except OSError:
         pass
     return {
-        "cpu_fan": {"speed": int(cpu_speed) if cpu_speed else None, "mode": 2, "label": "cpu_fan"},
-        "gpu_fan": {"speed": int(gpu_speed) if gpu_speed else None, "mode": 0, "label": "gpu_fan"},
+        "cpu_fan": {"speed": int(cpu_speed) if cpu_speed else None, "mode": _read_pwm_enable(base, 1), "label": "cpu_fan"},
+        "gpu_fan": {"speed": int(gpu_speed) if gpu_speed else None, "mode": _read_pwm_enable(base, 2), "label": "gpu_fan"},
     }
+
+def _read_pwm_enable(base: str, fan_id: int) -> int:
+    """Read the current PWM control mode for a fan (0=off, 2=full-speed)
+    from pwm{fan_id}_enable, matching what set_fan_mode writes."""
+    try:
+        with open(os.path.join(base, f"pwm{fan_id}_enable"), "r") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 2 if fan_id == 1 else 0
 
 
 def set_fan_mode(fan_id: int, mode: int) -> bool:
