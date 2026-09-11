@@ -20,7 +20,7 @@ type Phase =
   | "error";
 
 export function UpdatesSection() {
-  const { state, setPerGameEnabled } = useSettings();
+  const { state, setPerGameEnabled, refresh } = useSettings();
   const [phase, setPhase] = useState<Phase>("idle");
   const [message, setMessage] = useState<string>("");
   const [info, setInfo] = useState<{ latest?: string; downloadUrl?: string } | null>(null);
@@ -70,6 +70,9 @@ export function UpdatesSection() {
           setPhase("idle");
           setMessage("");
           setInfo(null);
+          // After restart, the plugin reload will provide the new version.
+          // Try refreshing state after a delay to pick up the updated version.
+          setTimeout(() => { refresh().catch(() => {}); }, 5000);
         }, 5000);
       } else {
         setPhase("error");

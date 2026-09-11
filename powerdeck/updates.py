@@ -23,9 +23,14 @@ import os
 import shutil
 import ssl
 import subprocess
+import tempfile
 import time
+import traceback
 import urllib.request
+import zipfile
 from typing import Optional
+
+import decky_plugin
 
 
 GITHUB_API = "https://api.github.com/repos/fewtarius/PowerDeck/releases/latest"
@@ -167,19 +172,113 @@ def stage_update(download_url: str, version: str) -> dict:
         return {"success": False, "error": str(e)}
 
 
+def _overlay_dir(src: str, dst: str, errors: list) -> None:
+    """Recursively copy all items from src into dst, overwriting files.
+
+    Uses dirs_exist_ok=True so existing directories are merged rather
+    than replaced, preserving any files in dst that aren't in src.
+    """
+    try:
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+    except OSError as e:
+        errors.append(f"{os.path.basename(src)}: {e}")
+
+
 def install_staged_update() -> dict:
-    """Unzip the staged zip into the plugin dir and restart plugin_loader."""
+    """Extract the staged zip into the plugin dir and restart plugin_loader.
+
+    The release zip has a top-level 'PowerDeck/' directory. We extract to a
+    temporary location, locate that directory, and overlay its contents onto
+    the actual plugin directory (which is already named 'PowerDeck/'). This
+    avoids creating a nested 'PowerDeck/PowerDeck/' structure.
+
+    After extraction, plugin_loader is restarted so the new code is loaded.
+    The restart uses a clean environment (LD_LIBRARY_PATH, PYTHONPATH, etc.
+    stripped) to avoid OpenSSL library conflicts caused by the Decky/Python
+    runtime's bundled libcrypto.so.3.
+    """
     try:
         files = sorted(glob.glob(os.path.join(STAGING_DIR, "PowerDeck-*.zip")), key=os.path.getmtime)
         if not files:
             return {"success": False, "error": "No staged zip found"}
         staged = files[-1]
-        plugin_dir = os.environ.get("DECKY_PLUGIN_DIR", os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-        subprocess.run(["unzip", "-o", staged, "-d", plugin_dir], check=True, timeout=30)
-        subprocess.run(["systemctl", "restart", "plugin_loader"], check=False, timeout=10)
+
+        # Determine the actual plugin directory (where main.py lives)
+        plugin_dir = os.environ.get("DECKY_PLUGIN_DIR")
+        if not plugin_dir:
+            # __file__ = .../powerdeck/updates.py -> plugin_dir = ../
+            plugin_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        # Extract to a temporary directory using Python's zipfile (no external deps)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with zipfile.ZipFile(staged, "r") as zf:
+                zf.extractall(tmpdir)
+
+            # The release zip has top-level entries like 'PowerDeck/' and
+            # 'RyzenAdj/'. We need to copy 'PowerDeck/' contents directly to
+            # plugin_dir (flatten, since plugin_dir is already named 'PowerDeck'),
+            # and copy other top-level dirs (like 'RyzenAdj/') as-is.
+            plugin_name = os.path.basename(plugin_dir)
+
+            copy_errors = []
+            for item in os.listdir(tmpdir):
+                src = os.path.join(tmpdir, item)
+                if not os.path.exists(src):
+                    continue
+                # Determine destination: if the top-level dir matches the plugin
+                # name, flatten it (copy contents into plugin_dir directly).
+                # Otherwise, preserve the directory name under plugin_dir.
+                if item == plugin_name:
+                    if os.path.isdir(src):
+                        _overlay_dir(src, plugin_dir, copy_errors)
+                    else:
+                        try:
+                            shutil.copy2(src, plugin_dir)
+                        except OSError as e:
+                            copy_errors.append(f"{item}: {e}")
+                else:
+                    dst = os.path.join(plugin_dir, item)
+                    try:
+                        if os.path.isdir(src):
+                            # Remove existing dir first to handle --delete semantics
+                            if os.path.exists(dst):
+                                shutil.rmtree(dst, ignore_errors=True)
+                            shutil.copytree(src, dst)
+                        else:
+                            shutil.copy2(src, dst)
+                    except OSError as e:
+                        copy_errors.append(f"{item}: {e}")
+
+            if copy_errors:
+                # Continue anyway - critical files like VERSION/plugin.json
+                # should have been copied. Report non-fatal copy errors.
+                decky_plugin.logger.warning(f"Non-fatal copy errors during update: {copy_errors}")
+
+        # Restart plugin_loader with a clean environment to avoid OpenSSL conflicts
+        # The Decky/Python runtime may set LD_LIBRARY_PATH to a PyInstaller temp
+        # dir containing an incompatible libcrypto.so.3, which breaks systemctl.
+        clean_env = os.environ.copy()
+        for var in ("LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD"):
+            clean_env.pop(var, None)
+
+        restart_result = subprocess.run(
+            ["systemctl", "restart", "plugin_loader"],
+            env=clean_env,
+            check=False,
+            timeout=15,
+            capture_output=True,
+        )
+
+        if restart_result.returncode != 0:
+            stderr = restart_result.stderr.decode(errors="replace").strip() if restart_result.stderr else ""
+            stdout = restart_result.stdout.decode(errors="replace").strip() if restart_result.stdout else ""
+            combined = stderr or stdout or "unknown error"
+            return {"success": False, "error": f"systemctl restart plugin_loader failed (rc={restart_result.returncode}): {combined}"}
+
         shutil.rmtree(STAGING_DIR, ignore_errors=True)
         return {"success": True}
     except Exception as e:
+        traceback.print_exc()
         return {"success": False, "error": str(e)}
 
 
