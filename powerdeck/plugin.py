@@ -9,6 +9,10 @@ profile merge path.
 
 from __future__ import annotations
 
+import re
+import signal
+import subprocess
+import threading
 import traceback
 from typing import Any, Dict, Optional
 
@@ -53,6 +57,16 @@ class Plugin:
         self.capabilities: Optional[capabilities.Capabilities] = None
         self.current_profile_id: str = f"{GAME_DEFAULT_ID}_ac"
         self.current_profile: PowerProfile = PowerProfile()
+
+        # Backend game monitor state
+        self._game_monitor_thread: Optional[threading.Thread] = None
+        self._game_monitor_stop = threading.Event()
+        self._last_detected_game_id: Optional[str] = None
+        self._last_ac_power_state: Optional[bool] = None
+        # Guard profile state against concurrent access from the monitor
+        # thread and the asyncio callable handlers (get_state, apply_settings).
+        # RLock allows re-entrant acquisition (e.g. apply_settings -> switch_active_profile).
+        self._profile_lock = threading.RLock()
 
     # ── lifecycle ────────────────────────────────────────────────────
 
@@ -103,15 +117,131 @@ class Plugin:
         # this call makes the hardware match.
         self._apply_profile_full(profile)
 
+        # Seed the last-known game/AC state so the monitor's first tick can
+        # detect a transition instead of immediately re-applying the current
+        # profile. Only seed the game id when per-game profiles are enabled.
+        self._last_ac_power_state = is_ac
+        if self.persistent.get("per_game_profiles_enabled", True):
+            self._last_detected_game_id = self.persistent.get(
+                "last_game_id", GAME_DEFAULT_ID
+            )
+        else:
+            self._last_detected_game_id = GAME_DEFAULT_ID
+
     def shutdown(self) -> None:
         pass
 
     # Decky lifecycle aliases - async wrappers around initialize/shutdown.
     async def _main(self) -> None:
         self.initialize()
+        # Start the backend game monitor so profiles are applied even
+        # when the Decky overlay is not open. The old monolith had this;
+        # the rewrite dropped it, causing profiles to never switch on
+        # game launch unless the user opened the settings UI.
+        # Uses a dedicated daemon thread (not asyncio) so the poll loop
+        # survives even if there are no RPC calls to keep the asyncio
+        # event loop active.
+        self._game_monitor_stop.clear()
+        self._game_monitor_thread = threading.Thread(
+            target=self._game_monitor, daemon=True, name="GameMonitor"
+        )
+        self._game_monitor_thread.start()
+        decky_plugin.logger.info("Backend game monitor thread started")
 
     async def _unload(self) -> None:
+        self._game_monitor_stop.set()
+        if self._game_monitor_thread is not None:
+            # Wait up to 3× the poll interval for a clean exit so
+            # Decky doesn't SIGKILL us on every shutdown.
+            self._game_monitor_thread.join(timeout=5)
+        self._game_monitor_thread = None
         self.shutdown()
+
+    # ── backend game monitor ────────────────────────────────────────────
+
+    GAME_POLL_INTERVAL_S = 5
+
+    def _detect_running_game_appid(self) -> str:
+        """Scan the process table for a launched Steam game.
+
+        Looks for ``SteamLaunch AppId=NNNNNN`` in ``ps aux`` output.
+        Returns ``"00000000"`` when no game is running or detection fails.
+        """
+        try:
+            result = subprocess.run(
+                ["ps", "aux"], capture_output=True, text=True, timeout=3
+            )
+        except Exception:
+            return GAME_DEFAULT_ID
+        match = re.search(r"SteamLaunch AppId=(\d+)", result.stdout)
+        if not match:
+            return GAME_DEFAULT_ID
+        raw = match.group(1)
+        # AppId 0/1 means desktop / system, treat as no game.
+        return GAME_DEFAULT_ID if raw in ("0", "1") else raw
+
+    def _game_monitor(self) -> None:
+        """Poll for running Steam games + AC power changes and apply
+        the matching profile.
+
+        This replaces the legacy ``game_monitor()`` coroutine that was
+        removed in the rewrite. Without it, per-game profiles are only
+        applied when the Decky overlay is open (the frontend polling
+        loop in SettingsProvider.tsx), so launching a game and playing
+        without opening the overlay leaves the hardware at whatever
+        default state it was in -- typically a much higher TDP, causing
+        excess power draw on battery.
+
+        Runs in a daemon thread so it survives even when the asyncio
+        event loop is idle (no RPC calls to keep it awake).
+        """
+        decky_plugin.logger.info("Backend game monitor thread running")
+        while not self._game_monitor_stop.is_set():
+            if self._game_monitor_stop.wait(timeout=self.GAME_POLL_INTERVAL_S):
+                break
+            try:
+                game_id = self._detect_running_game_appid()
+                ac = ac_mod.get_ac_power_status()
+                per_game = self.persistent.get("per_game_profiles_enabled", True)
+
+                effective_game_id = game_id if per_game else GAME_DEFAULT_ID
+
+                game_changed = effective_game_id != self._last_detected_game_id
+                ac_changed = (
+                    self._last_ac_power_state is not None
+                    and ac != self._last_ac_power_state
+                )
+
+                if not game_changed and not ac_changed:
+                    continue
+
+                if game_changed:
+                    decky_plugin.logger.info(
+                        f"Game monitor: game changed "
+                        f"{self._last_detected_game_id!r} -> {effective_game_id!r}"
+                    )
+                if ac_changed:
+                    prev = self._last_ac_power_state
+                    decky_plugin.logger.info(
+                        f"Game monitor: AC power changed "
+                        f"{'AC' if prev else 'Battery'} -> "
+                        f"{'AC' if ac else 'Battery'}"
+                    )
+
+                self._last_detected_game_id = effective_game_id
+                self._last_ac_power_state = ac
+
+                # Persist the last game id so initialize() can resume
+                # the right profile after a plugin restart.
+                self.persistent.set("last_game_id", effective_game_id)
+
+                profile_id = make_profile_id(effective_game_id, ac)
+                self.switch_active_profile(profile_id)
+            except Exception as exc:
+                decky_plugin.logger.warning(
+                    f"Game monitor poll error (non-fatal): {exc}"
+                )
+        decky_plugin.logger.info("Backend game monitor thread stopped")
 
     # ── profile switching ───────────────────────────────────────────
 
@@ -122,25 +252,29 @@ class Plugin:
         profile object) before switching, so an in-progress slider drag
         doesn't get clobbered by the load.
         """
-        if profile_id == self.current_profile_id:
-            return self.current_profile
+        with self._profile_lock:
+            if profile_id == self.current_profile_id:
+                return self.current_profile
 
-        # Save what we have before switching
-        self.profile_store.save(self.current_profile_id, self.current_profile)
+            # Save what we have before switching
+            self.profile_store.save(self.current_profile_id, self.current_profile)
 
-        loaded = self.profile_store.load(profile_id)
-        if loaded is None:
-            is_ac = profile_id.endswith("_ac")
-            game_id = profile_id[: -len("_ac" if is_ac else "_battery")]
-            loaded = default_profile(is_ac, self.capabilities.default_tdp if self.capabilities else 15,
-                                     self.capabilities.min_gpu_freq if self.capabilities else 400,
-                                     self.capabilities.max_gpu_freq if self.capabilities else 1600)
-            self.profile_store.save(profile_id, loaded)
+            loaded = self.profile_store.load(profile_id)
+            if loaded is None:
+                is_ac = profile_id.endswith("_ac")
+                game_id = profile_id[: -len("_ac" if is_ac else "_battery")]
+                loaded = default_profile(is_ac, self.capabilities.default_tdp if self.capabilities else 15,
+                                         self.capabilities.min_gpu_freq if self.capabilities else 400,
+                                         self.capabilities.max_gpu_freq if self.capabilities else 1600)
+                self.profile_store.save(profile_id, loaded)
 
-        self.current_profile_id = profile_id
-        self.current_profile = loaded
-        self._apply_profile_full(loaded)
-        return loaded
+            self.current_profile_id = profile_id
+            self.current_profile = loaded
+            profile_to_apply = loaded
+
+        # Apply outside the lock to avoid holding it during slow hardware I/O.
+        self._apply_profile_full(profile_to_apply)
+        return profile_to_apply
 
     def _apply_profile_full(self, profile: PowerProfile) -> bool:
         """Apply every field of a profile to hardware. Used by switch_active_profile."""
@@ -327,24 +461,29 @@ class Plugin:
         if not isinstance(partial, dict):
             return False
         target = partial.pop("target_profile_id", None) or self.current_profile_id
-        if isinstance(target, str) and target and target != self.current_profile_id:
-            self.switch_active_profile(target)
+        # Snapshot identity + profile reference under the lock to avoid
+        # races with the monitor thread's switch_active_profile.
+        with self._profile_lock:
+            if isinstance(target, str) and target and target != self.current_profile_id:
+                self.switch_active_profile(target)
+            profile_id = self.current_profile_id
+            profile_data = self.current_profile
 
         any_failure = False
         for key, value in partial.items():
             if value is None:
                 continue
-            setattr(self.current_profile, key, value)
+            setattr(profile_data, key, value)
             if key == "chargeLimit":
                 self.persistent.set("battery_charge_limit", int(value))
                 ok = battery_mod.set_limit(int(value))
                 if not ok:
                     any_failure = True
                 continue
-            if key in self.current_profile.to_dict():
+            if key in profile_data.to_dict():
                 if not self._apply_field(key, value):
                     any_failure = True
-        self.profile_store.save(self.current_profile_id, self.current_profile)
+        self.profile_store.save(profile_id, profile_data)
         if any_failure:
             decky_plugin.logger.warning("apply_settings: some fields had no backing sysfs")
         return True
@@ -355,6 +494,18 @@ class Plugin:
             state = await self.get_state()
             self.current_profile_id = make_profile_id(GAME_DEFAULT_ID, state["ac_power"])
             self.persistent.set("last_game_id", GAME_DEFAULT_ID)
+            # Apply the base profile so hardware immediately reflects
+            # the non-per-game setting without waiting for the monitor.
+            self.switch_active_profile(self.current_profile_id)
+            # Update monitor seed so it doesn't immediately re-switch.
+            self._last_detected_game_id = GAME_DEFAULT_ID
+        elif self._last_detected_game_id == GAME_DEFAULT_ID:
+            # Re-enabling per-game: seed from the persisted last game so
+            # the monitor applies the right profile on its next tick if one
+            # is running.
+            self._last_detected_game_id = self.persistent.get(
+                "last_game_id", GAME_DEFAULT_ID
+            )
         return True
 
     async def set_controller_mode(self, mode: str) -> bool:

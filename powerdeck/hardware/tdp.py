@@ -92,6 +92,7 @@ def set_tdp_native(
         f"--stapm-limit={stapm_limit}",
         f"--fast-limit={fast_limit}",
         f"--slow-limit={sustained_limit}",
+        f"--tctl-temp={int(os.environ.get('POWERDECK_TCTL_TEMP', 95))}",
     ]
     if not omit_skin_temp:
         # ryzenadj's flag is --apu-skin-temp and takes degrees C (not mW).
@@ -99,7 +100,7 @@ def set_tdp_native(
         # --apu-skin-temp-limit flag that the binary doesn't accept; the
         # result was a non-zero return code and the rest of the limits
         # silently failed to apply.
-        cmd.append(f"--apu-skin-temp={int(os.environ.get('POWERDECK_SKIN_TEMP', 70))}")
+        cmd.append(f"--apu-skin-temp={int(os.environ.get('POWERDECK_SKIN_TEMP', 95))}")
 
     try:
         result = subprocess.run(

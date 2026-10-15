@@ -15,7 +15,15 @@ export function CpuSection() {
     device.powerControl?.active_method && device.powerControl.active_method !== "none";
 
   const orderedGovernors = getOrderedGovernors(state.capabilities.governors);
-  const showGovernor = device.scalingDriver !== "amd-pstate-epp" && !activePowerControl;
+  // On amd-pstate (non-epp) in passive mode, the governor IS the main
+  // control surface for frequency behaviour: schedutil/powersave/
+  // conservative actually honour scaling_max_freq as a hard cap, while
+  // "performance" ignores it (CPU floats at boost clocks regardless of
+  // the TDP limit). So we always show the governor selector on plain
+  // amd-pstate devices, even when native TDP (ryzenadj) is the active
+  // power-control method.
+  const isPlainAmdPstate = device.scalingDriver === "amd-pstate";
+  const showGovernor = device.scalingDriver !== "amd-pstate-epp" && (!activePowerControl || isPlainAmdPstate);
   const showEpp = device.scalingDriver === "amd-pstate-epp" && !activePowerControl;
 
   const maxCores = device.max_cpu_cores || 16;

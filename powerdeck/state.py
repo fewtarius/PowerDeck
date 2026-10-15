@@ -139,6 +139,7 @@ class PersistentSettings:
 
     DEFAULTS: Dict[str, Any] = {
         "per_game_profiles_enabled": True,
+        "last_game_id": GAME_DEFAULT_ID,
         "rog_ally_native_tdp_enabled": False,
         "inputplumber_default_mode": "default",
         "battery_charge_limit": 100,
