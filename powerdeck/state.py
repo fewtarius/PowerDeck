@@ -91,6 +91,14 @@ def default_profile(is_ac: bool, default_tdp: int = 15, gpu_min: int = 400, gpu_
         pciRuntimePm=True,
         platformProfile="low-power",
         thermalPolicy=1,
+        # On amd-pstaten devices, "guided" mode makes the kernel ignore
+        # userspace governor/EPP writes — the CPU stays at BIOS-default
+        # frequencies, resulting in 2x idle power (e.g. 12W vs 4W).
+        # "active" mode exposes the EPP sysfs files and honors governor
+        # writes, so epp="power" + governor="powersave" actually take
+        # effect. AC profiles keep pstateMode=None (kernel default is fine
+        # when performance is the goal).
+        pstateMode="active",
     )
 
 

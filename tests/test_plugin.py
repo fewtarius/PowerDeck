@@ -197,6 +197,71 @@ class PStateCapsTests(unittest.TestCase):
         self.assertTrue(caps["epp_available"])
 
 
+class PStateModeMigrationTests(unittest.TestCase):
+    """P-State guided->active migration for power-saving profiles.
+
+    On amd-pstate, 'guided' mode makes the kernel ignore userspace
+    governor/EPP writes, so a battery profile with pstateMode='guided'
+    (powersave + epp='power') has zero effect — CPU idles at ~12W
+    instead of ~4W. These tests verify the migration path.
+    """
+
+    def test_default_battery_profile_sets_active_mode(self):
+        from powerdeck.state import default_profile
+        profile = default_profile(is_ac=False, default_tdp=15,
+                                  gpu_min=400, gpu_max=1600)
+        self.assertEqual(profile.pstateMode, "active",
+                         "battery default must use active mode for EPP/governor to work")
+
+    def test_default_ac_profile_does_not_force_active(self):
+        from powerdeck.state import default_profile
+        profile = default_profile(is_ac=True, default_tdp=15,
+                                  gpu_min=400, gpu_max=1600)
+        self.assertIsNone(profile.pstateMode,
+                          "AC default should not override kernel pstate mode")
+
+    def test_apply_profile_full_defaults_to_active_when_pstatemode_none(self):
+        """When a loaded profile has pstateMode=None on amd-pstate,
+        _apply_profile_full must default to 'active' so the governor
+        and EPP writes actually take effect."""
+        self.p = plugin_module.Plugin()
+        self.p.__dict__.pop("capabilities", None)
+        self.p.capabilities = _caps(active_method="none", native=False, plat_profile=False, vendor="amd")
+        self.p.capabilities.pstate.available = True
+        self.p.capabilities.pstate.mode_switch_supported = True
+        written = {}
+        def fake_set_mode(mode):
+            written["mode"] = mode
+            return True
+        self.p._applier = lambda key: {"pstateMode": fake_set_mode}.get(key, lambda _v: True)
+        profile = PowerProfile()
+        profile.pstateMode = None  # not set in profile
+        with mock.patch.object(pstate_mod, "is_available", return_value=True):
+            self.p._apply_profile_full(profile)
+        self.assertEqual(written.get("mode"), "active",
+                         "must default to active mode when pstateMode is None on amd-pstate")
+
+    def test_apply_profile_full_does_not_override_explicit_mode(self):
+        """When a profile explicitly sets pstateMode='passive', that
+        choice must be respected (not overwritten with 'active')."""
+        self.p = plugin_module.Plugin()
+        self.p.__dict__.pop("capabilities", None)
+        self.p.capabilities = _caps(active_method="none", native=False, plat_profile=False, vendor="amd")
+        self.p.capabilities.pstate.available = True
+        self.p.capabilities.pstate.mode_switch_supported = True
+        written = {}
+        def fake_set_mode(mode):
+            written["mode"] = mode
+            return True
+        self.p._applier = lambda key: {"pstateMode": fake_set_mode}.get(key, lambda _v: True)
+        profile = PowerProfile()
+        profile.pstateMode = "passive"
+        with mock.patch.object(pstate_mod, "is_available", return_value=True):
+            self.p._apply_profile_full(profile)
+        self.assertEqual(written.get("mode"), "passive",
+                         "explicit pstateMode must be respected, not overwritten")
+
+
 class ApplySettingsTests(unittest.TestCase):
     """D1: apply_settings must (a) return False when a write fails, and
     (b) NOT persist the rejected value to disk."""

@@ -94,6 +94,18 @@ class Plugin:
             self.profile_store.save(self.current_profile_id, profile)
         self.current_profile = profile
 
+        # Migration: profiles created before pstateMode existed (or set
+        # to "guided") silently ignore governor/EPP writes on amd-pstate,
+        # causing power-saving profiles (powersave + epp=power) to have
+        # zero effect (~12W idle instead of ~4W). Upgrade guided->active
+        # so userspace CPU controls are actually honored.
+        if (profile.pstateMode == "guided"
+                and self.capabilities.pstate.available
+                and self.capabilities.pstate.mode_switch_supported):
+            profile.pstateMode = "active"
+            self.current_profile = profile
+            self.profile_store.save(self.current_profile_id, profile)
+
         # Apply persisted advanced settings that aren't a profile field.
         charge = self.persistent.get("battery_charge_limit")
         if self.capabilities.battery_charge_limit_available and charge:
@@ -283,6 +295,15 @@ class Plugin:
         # the mode switch causes the EPP write to silently fail.
         if profile.pstateMode:
             self._apply_field("pstateMode", profile.pstateMode)
+        elif pstate_mod.is_available():
+            # pstateMode not set in this profile. On amd-pstate devices,
+            # "guided" is the kernel default and ignores userspace
+            # governor/EPP writes — causing power-saving profiles
+            # (governor=powersave, epp=power) to have no effect. Default
+            # to "active" so EPP + governor are honored. AC profiles that
+            # don't specify pstateMode will also get "active" (harmless —
+            # the governor defaults to schedutil which is fine for perf).
+            self._apply_field("pstateMode", "active")
         # TDP / native path
         self._apply_field("tdp", profile.tdp)
         # CPU
