@@ -198,12 +198,23 @@ class PStateCapsTests(unittest.TestCase):
 
 
 class PStateModeMigrationTests(unittest.TestCase):
-    """P-State guided->active migration for power-saving profiles.
+    """P-State mode handling for power-saving profiles.
 
     On amd-pstate, 'guided' mode makes the kernel ignore userspace
     governor/EPP writes, so a battery profile with pstateMode='guided'
     (powersave + epp='power') has zero effect — CPU idles at ~12W
-    instead of ~4W. These tests verify the migration path.
+    instead of ~4W.
+
+    These tests verify the contract:
+    1. New battery default profiles use pstateMode="active" so EPP and
+       governor are honored (EPP files only exist in active mode on
+       classic amd-pstate).
+    2. New AC default profiles leave pstateMode=None (don't override
+       kernel default — performance profiles don't need active mode).
+    3. _apply_profile_full NEVER overrides a user-set pstateMode
+       (respects active/passive/guided/explicit choices).
+    4. _apply_profile_full does NOT write to amd_pstate/status when
+       pstateMode is None (leaves kernel default untouched).
     """
 
     def test_default_battery_profile_sets_active_mode(self):
@@ -220,28 +231,7 @@ class PStateModeMigrationTests(unittest.TestCase):
         self.assertIsNone(profile.pstateMode,
                           "AC default should not override kernel pstate mode")
 
-    def test_apply_profile_full_defaults_to_active_when_pstatemode_none(self):
-        """When a loaded profile has pstateMode=None on amd-pstate,
-        _apply_profile_full must default to 'active' so the governor
-        and EPP writes actually take effect."""
-        self.p = plugin_module.Plugin()
-        self.p.__dict__.pop("capabilities", None)
-        self.p.capabilities = _caps(active_method="none", native=False, plat_profile=False, vendor="amd")
-        self.p.capabilities.pstate.available = True
-        self.p.capabilities.pstate.mode_switch_supported = True
-        written = {}
-        def fake_set_mode(mode):
-            written["mode"] = mode
-            return True
-        self.p._applier = lambda key: {"pstateMode": fake_set_mode}.get(key, lambda _v: True)
-        profile = PowerProfile()
-        profile.pstateMode = None  # not set in profile
-        with mock.patch.object(pstate_mod, "is_available", return_value=True):
-            self.p._apply_profile_full(profile)
-        self.assertEqual(written.get("mode"), "active",
-                         "must default to active mode when pstateMode is None on amd-pstate")
-
-    def test_apply_profile_full_does_not_override_explicit_mode(self):
+    def test_apply_profile_full_respects_explicit_passive_mode(self):
         """When a profile explicitly sets pstateMode='passive', that
         choice must be respected (not overwritten with 'active')."""
         self.p = plugin_module.Plugin()
@@ -260,6 +250,28 @@ class PStateModeMigrationTests(unittest.TestCase):
             self.p._apply_profile_full(profile)
         self.assertEqual(written.get("mode"), "passive",
                          "explicit pstateMode must be respected, not overwritten")
+
+    def test_apply_profile_full_does_not_override_none_mode(self):
+        """When a profile has pstateMode=None (not set), _apply_profile_full
+        must NOT write anything to amd_pstate/status — the kernel's current
+        mode should be left untouched. Never override state the user hasn't
+        explicitly chosen."""
+        self.p = plugin_module.Plugin()
+        self.p.__dict__.pop("capabilities", None)
+        self.p.capabilities = _caps(active_method="none", native=False, plat_profile=False, vendor="amd")
+        self.p.capabilities.pstate.available = True
+        self.p.capabilities.pstate.mode_switch_supported = True
+        written = {}
+        def fake_set_mode(mode):
+            written["mode"] = mode
+            return True
+        self.p._applier = lambda key: {"pstateMode": fake_set_mode}.get(key, lambda _v: True)
+        profile = PowerProfile()
+        profile.pstateMode = None  # not set in profile
+        with mock.patch.object(pstate_mod, "is_available", return_value=True):
+            self.p._apply_profile_full(profile)
+        self.assertIsNone(written.get("mode"),
+                         "must NOT write pstateMode when profile has pstateMode=None")
 
 
 class ApplySettingsTests(unittest.TestCase):
