@@ -1,6 +1,6 @@
 import { ReactNode, useCallback, useEffect, useState } from "react";
 import { SliderField } from "@decky/ui";
-import { FaBatteryThreeQuarters, FaBullseye, FaCog, FaChartBar, FaFire,
+import { FaBatteryEmpty, FaBatteryThreeQuarters, FaBullseye, FaCog, FaChartBar, FaFire,
   FaBatteryFull, FaBatteryHalf, FaRocket, FaSyncAlt, FaMicrochip,
   FaLightbulb, FaThermometerHalf, FaGamepad, FaPause, FaSlidersH,
   FaVolumeOff, FaBalanceScale, FaXbox, FaPlaystation } from "react-icons/fa";
@@ -37,7 +37,7 @@ export function governorIcon(governor: string): ReactNode {
 
 export function eppIcon(epp: string): ReactNode {
   switch (epp) {
-    case "power": return <FaBatteryFull />;
+    case "power": return <FaBatteryEmpty />;
     case "balance_power": return <FaBatteryHalf />;
     case "balance_performance": return <FaChartBar />;
     case "performance": return <FaRocket />;

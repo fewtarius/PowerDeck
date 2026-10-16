@@ -20,11 +20,16 @@ export function CpuSection() {
   // Governor is relevant on all drivers when not platform-managed:
   // on amd-pstate-epp it gates the EPP hint set (performance governor
   // silently restricts EPP to 'performance'), and on classic amd-pstate
-  // it's the primary control surface in passive mode.
+  // it's the primary control surface in passive/guided mode. Show the
+  // governor selector whenever the kernel exposes more than one option;
+  // a single governor (e.g. only 'performance') offers nothing to choose.
   const showGovernor = !isPlatformManaged && orderedGovernors.length > 1;
   // Show EPP controls whenever the backend reports EPP as available —
   // this covers both amd-pstate-epp (always, in active mode) and
   // classic amd-pstate (active mode exposes per-CPU EPP sysfs files).
+  // EPP is only honored in active mode, so the backend gates
+  // epp_available on current_mode=="active"; the slider therefore
+  // appears/disappears with the mode automatically.
   const showEpp = (pstateCaps?.epp_available ?? false) && !isPlatformManaged;
 
   const maxCores = device.max_cpu_cores || 16;

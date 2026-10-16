@@ -24,7 +24,7 @@ import tests.conftest  # noqa: F401
 
 from powerdeck import capabilities
 from powerdeck import plugin as plugin_module
-from powerdeck.hardware import cpu as cpu_mod, tdp as tdp_mod
+from powerdeck.hardware import cpu as cpu_mod, tdp as tdp_mod, pstate as pstate_mod
 from powerdeck.state import PowerProfile, default_profile
 
 
@@ -100,6 +100,7 @@ class ApplyTdpRoutingTests(unittest.TestCase):
     def setUp(self):
         self.p = plugin_module.Plugin()
         self.p.__dict__.pop("capabilities", None)
+        self.p.capabilities = capabilities.Capabilities()
         self.calls = {"set_tdp": [], "soft": [], "native": []}
 
         def fake_set_tdp(w, *, prefer_native=True):
@@ -136,6 +137,66 @@ class ApplyTdpRoutingTests(unittest.TestCase):
         self.assertEqual(self.calls["set_tdp"], [])
 
 
+class PStateCapsTests(unittest.TestCase):
+    """P-State visibility gating that drove issues #1 and #2.
+
+    Issue #1: the P-State mode selector was hidden by
+    `!activePowerControl` in Content.tsx, which is True whenever a
+    native_tdp / platform_profile method is active -- i.e. on the
+    majority of AMD handhelds where mode switching is most useful
+    (switch to active to enable EPP, switch to passive to hand
+    control to the platform).
+
+    Issue #2: in passive mode the cpufreq governor is the primary
+    control surface, so the governor slider must remain visible.
+
+    The frontend now reads `mode_switch_supported` (not the old
+    `!activePowerControl` check) and the backend's _pstate_caps() sets
+    it True for any amd-pstate device. These tests lock in that
+    contract.
+    """
+
+    def setUp(self):
+        self.p = plugin_module.Plugin()
+        self.p.__dict__.pop("capabilities", None)
+        self.p.capabilities = capabilities.Capabilities()
+
+    def test_pstate_caps_returns_mode_switch_supported(self):
+        with mock.patch.object(pstate_mod, "is_available", return_value=True), \
+             mock.patch.object(pstate_mod, "get_mode", return_value="active"):
+            caps = self.p._pstate_caps()
+        self.assertIsNotNone(caps)
+        self.assertTrue(caps["mode_switch_supported"],
+                        "frontend gates <PstateSection> on this flag")
+
+    def test_pstate_caps_none_when_not_available(self):
+        with mock.patch.object(pstate_mod, "is_available", return_value=False):
+            self.assertIsNone(self.p._pstate_caps())
+
+    def test_epp_available_only_in_active_mode(self):
+        for mode in ("active", "passive", "guided"):
+            with mock.patch.object(pstate_mod, "is_available", return_value=True), \
+                 mock.patch.object(pstate_mod, "get_mode", return_value=mode):
+                caps = self.p._pstate_caps()
+            self.assertEqual(caps["epp_available"], mode == "active",
+                             f"epp_available must be True only in active mode (got {caps['epp_available']} for {mode})")
+
+    def test_epp_preferences_empty_in_passive_mode(self):
+        with mock.patch.object(pstate_mod, "is_available", return_value=True), \
+             mock.patch.object(pstate_mod, "get_mode", return_value="passive"):
+            caps = self.p._pstate_caps()
+        self.assertEqual(caps["epp_preferences"], [],
+                         "passive mode must clear epp_preferences (frontend hides EPP slider)")
+
+    def test_epp_preferences_populated_in_active_mode(self):
+        with mock.patch.object(pstate_mod, "is_available", return_value=True), \
+             mock.patch.object(pstate_mod, "get_mode", return_value="active"), \
+             mock.patch.object(cpu_mod, "available_epp", return_value=["power", "performance"]):
+            caps = self.p._pstate_caps()
+        self.assertEqual(caps["epp_preferences"], ["power", "performance"])
+        self.assertTrue(caps["epp_available"])
+
+
 class ApplySettingsTests(unittest.TestCase):
     """D1: apply_settings must (a) return False when a write fails, and
     (b) NOT persist the rejected value to disk."""
@@ -143,6 +204,7 @@ class ApplySettingsTests(unittest.TestCase):
     def setUp(self):
         self.p = plugin_module.Plugin()
         self.p.__dict__.pop("capabilities", None)
+        self.p.capabilities = capabilities.Capabilities()
         self.p.capabilities = _caps(active_method="native_tdp", native=True, plat_profile=False)
         self.p.current_profile = PowerProfile()
         self.p.current_profile.tdp = 15

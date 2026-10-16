@@ -42,7 +42,6 @@ function Sections() {
 
   const device = state.device_info;
   const caps = state.capabilities;
-  const activePowerControl = device.powerControl?.active_method && device.powerControl.active_method !== "none";
   const isRogAlly = !!(caps.rog_ally?.device_name);
 
   return (
@@ -52,7 +51,7 @@ function Sections() {
       {device.has_fan_control && !isRogAlly && <CoolingSection />}
       {isRogAlly && caps.rog_ally?.available_controls?.fan_control && <RogAllyFansSection />}
 
-      {caps.pstate && !activePowerControl && <PstateSection />}
+      {caps.pstate && caps.pstate.mode_switch_supported && <PstateSection />}
 
       {!device.powerControl?.platform_profile_available && caps.tdp_control.available && <TdpSection />}
       {!caps.tdp_control.available && caps.tdp_control.has_soft_control && <TdpSection softMode />}
