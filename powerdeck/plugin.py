@@ -278,6 +278,11 @@ class Plugin:
 
     def _apply_profile_full(self, profile: PowerProfile) -> bool:
         """Apply every field of a profile to hardware. Used by switch_active_profile."""
+        # P-State mode must be applied FIRST — on classic amd-pstate,
+        # EPP sysfs files only exist in active mode.  Applying EPP before
+        # the mode switch causes the EPP write to silently fail.
+        if profile.pstateMode:
+            self._apply_field("pstateMode", profile.pstateMode)
         # TDP / native path
         self._apply_field("tdp", profile.tdp)
         # CPU
@@ -304,8 +309,6 @@ class Plugin:
             self._apply_field("platformProfile", profile.platformProfile)
         if profile.thermalPolicy is not None:
             self._apply_field("thermalPolicy", profile.thermalPolicy)
-        if profile.pstateMode:
-            self._apply_field("pstateMode", profile.pstateMode)
         return True
 
     # ── per-field writer ────────────────────────────────────────────
@@ -333,7 +336,7 @@ class Plugin:
         if key == "governor":
             return cpu_mod.set_governor
         if key == "epp":
-            return lambda v: cpu_mod.set_epp(v, governor="schedutil")
+            return cpu_mod.set_epp  # auto-selects best governor for swap
         if key == "fanProfile":
             return fan_mod.set_profile
         if key == "gpuMode":
@@ -373,12 +376,13 @@ class Plugin:
 
     def _apply_tdp_soft(self, watts: int) -> bool:
         """Map watts to governor+EPP when no native TDP path exists."""
+        swap_gov = cpu_mod._best_epp_governor() or "schedutil"
         if watts <= 8:
-            cpu_mod.set_governor("powersave")
-            cpu_mod.set_epp("power", governor="powersave")
+            cpu_mod.set_governor("powersave" if "powersave" in cpu_mod.available_governors() else swap_gov)
+            cpu_mod.set_epp("power", governor=cpu_mod._best_epp_governor())
         elif watts <= 18:
-            cpu_mod.set_governor("schedutil")
-            cpu_mod.set_epp("balance_power", governor="schedutil")
+            cpu_mod.set_governor(swap_gov)
+            cpu_mod.set_epp("balance_power", governor=cpu_mod._best_epp_governor())
         else:
             cpu_mod.set_governor("performance")
             cpu_mod.set_epp("performance", governor="performance")
@@ -590,21 +594,31 @@ class Plugin:
         if not pstate_mod.is_available():
             return None
         caps = self.capabilities
-        epp_preferences = (
-            caps.pstate.epp_preferences
-            if caps and caps.pstate and caps.pstate.epp_preferences
-            else cpu_mod.available_epp()
-        )
+        current_mode = pstate_mod.get_mode()
+        # EPP is honored in active mode on both amd-pstate and amd-pstate-epp.
+        # Use runtime detection (reads sysfs now) rather than the static caps
+        # detected at init, so mode switches via the UI are reflected
+        # immediately without waiting for a restart.
+        epp_available = current_mode == "active"
+        if epp_available:
+            runtime_prefs = cpu_mod.available_epp()
+            epp_preferences = runtime_prefs if runtime_prefs else (
+                caps.pstate.epp_preferences
+                if caps and caps.pstate and caps.pstate.epp_preferences
+                else ["power", "balance_power", "balance_performance", "performance"]
+            )
+        else:
+            epp_preferences = []
         available_governors = (
             caps.pstate.available_governors
             if caps and caps.pstate and caps.pstate.available_governors
             else cpu_mod.available_governors()
         )
         return {
-            "current_mode": pstate_mod.get_mode(),
+            "current_mode": current_mode,
             "available_modes": ["active", "passive", "guided"],
             "available_governors": available_governors,
-            "epp_available": pstate_mod.get_mode() == "active",
+            "epp_available": epp_available,
             "epp_preferences": epp_preferences,
             "mode_switch_supported": True,
         }

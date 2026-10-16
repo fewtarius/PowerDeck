@@ -71,10 +71,12 @@ export const GOVERNOR_DESCRIPTIONS: { [key: string]: string } = {
 };
 
 export const EPP_DESCRIPTIONS: { [key: string]: string } = {
+  "default": "Kernel default EPP",
   "power": "Maximum Power Saving",
   "balance_power": "Balanced Power Saving",
   "balance_performance": "Balanced Performance",
   "performance": "Max Performance",
+  "custom": "Custom (read from platform)",
 };
 
 export const COOLING_DESCRIPTIONS: { [key: string]: string } = {

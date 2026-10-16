@@ -32,6 +32,9 @@ ACPI_PLATFORM_PROFILE = "/sys/firmware/acpi/platform_profile"
 ACPI_PLATFORM_PROFILE_CHOICES = "/sys/firmware/acpi/platform_profile_choices"
 SCALING_DRIVERS_GLOB = "/sys/devices/system/cpu/cpu*/cpufreq/scaling_driver"
 
+AMD_PSTATE_STATUS = "/sys/devices/system/cpu/amd_pstate/status"
+CPU_EPP_PREF_PATH = "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_available_preferences"
+
 
 @dataclass
 class PowerControlCapabilities:
@@ -214,28 +217,47 @@ def _read_scaling_driver() -> str:
     return ""
 
 
+def _available_epp_preferences() -> List[str]:
+    """Read the full EPP preference list from sysfs at runtime.
+
+    On classic amd-pstate, these files only appear when the pstate mode
+    is 'active'.  On amd-pstate-epp they exist in all modes but writes
+    are only honored in 'active' mode.
+    """
+    if not os.path.exists(CPU_EPP_PREF_PATH):
+        return []
+    return [e for e in _read(CPU_EPP_PREF_PATH, "").split() if e]
+
+
 def _detect_pstate(current_driver: str) -> PStateCapabilities:
     caps = PStateCapabilities()
-    if current_driver != "amd-pstate-epp":
-        # Only amd-pstate-epp supports mode switching. Other drivers
-        # (intel-pstate, acpi-cpufreq) report a fixed scheduler.
-        if "amd-pstate" in current_driver:
-            caps.available = True
-            caps.current_mode = "passive"
-            caps.epp_available = False
+    if "amd-pstat" not in current_driver:
+        # intel-pstate, acpi-cpufreq — no pstate mode switching.
         return caps
 
+    # Both amd-pstate (classic) and amd-pstate-epp support mode
+    # switching via /sys/devices/system/cpu/amd_pstate/status.
+    # On kernel 6.18+, classic amd-pstate in "active" mode exposes the
+    # per-CPU energy_performance_preference sysfs files, enabling
+    # explicit EPP hint writes just like the -epp driver.  The old code
+    # hard-coded epp_available=False for classic amd-pstate, hiding the
+    # EPP slider even when the kernel fully supports it.
     caps.available = True
-    caps.current_mode = _read("/sys/devices/system/cpu/amd_pstate/status", "passive")
+    caps.current_mode = _read(AMD_PSTATE_STATUS, "passive")
     caps.available_modes = ["active", "passive", "guided"]
     caps.available_governors = _available_governors()
+    caps.mode_switch_supported = _exists(AMD_PSTATE_STATUS)
+
+    # EPP writes are only honored in active mode on both driver
+    # variants.  In passive/guided mode the kernel ignores EPP hints
+    # (or the files don't even exist on classic amd-pstate).
     caps.epp_available = caps.current_mode == "active"
-    caps.epp_preferences = (
-        ["power", "balance_power", "balance_performance", "performance"]
-        if caps.epp_available
-        else ["performance"]
-    )
-    caps.mode_switch_supported = _exists("/sys/devices/system/cpu/amd_pstate/status")
+    if caps.epp_available:
+        prefs = _available_epp_preferences()
+        caps.epp_preferences = prefs if prefs else [
+            "power", "balance_power", "balance_performance", "performance"
+        ]
+
     return caps
 
 

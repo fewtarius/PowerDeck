@@ -22,8 +22,9 @@ CPU_ROOT = "/sys/devices/system/cpu"
 
 # Module-level lock so the background game-monitor thread and the async
 # callable handlers never race on a multi-step sysfs transaction (e.g.
-# governor swap + freq cap in set_boost).
-_sysfs_lock = threading.Lock()
+# governor swap + freq cap in set_boost).  RLock (reentrant) because
+# set_epp calls set_governor while already holding the lock.
+_sysfs_lock = threading.RLock()
 
 
 def _cpu_paths(pattern: str) -> list[str]:
@@ -43,14 +44,38 @@ def get_governor() -> Optional[str]:
 
 
 def set_governor(governor: str) -> bool:
-    if governor not in available_governors():
+    available = available_governors()
+    if not available:
         return False
+    if governor not in available:
+        # Requested governor not available on this driver. Auto-fallback
+        # to the best non-performance governor (performance restricts
+        # EPP to 'performance'-only on amd-pstate-epp).  If only
+        # 'performance' exists, use it as-is.
+        fallback = next((g for g in available if g != "performance"), available[0])
+        governor = fallback
     with _sysfs_lock:
         success = False
         for path in _cpu_paths("cpu*/cpufreq/scaling_governor"):
             if write_sysfs(path, governor):
                 success = True
         return success
+
+
+def _best_epp_governor() -> Optional[str]:
+    """Pick a governor that exposes the full EPP hint set.
+
+    On amd-pstate-epp active mode (Zen 4+, kernel 6.18+), only
+    'performance' and 'powersave' may be exposed — 'performance'
+    silently restricts EPP to performance-only, so we prefer
+    'powersave'.  On classic cpufreq/sysfs, 'schedutil' is preferred
+    for its low-latency response.
+    """
+    available = available_governors()
+    for preferred in ("schedutil", "powersave", "ondemand", "conservative"):
+        if preferred in available:
+            return preferred
+    return next((g for g in available if g != "performance"), None)
 
 
 def get_epp() -> Optional[str]:
@@ -70,7 +95,9 @@ def available_epp() -> List[str]:
 def set_epp(epp: str, governor: Optional[str] = None) -> bool:
     """Set EPP on all CPUs. If a swap is needed (governor=performance,
     EPP!=performance), switch to the supplied governor first and
-    restore after the EPP write.
+    restore after the EPP write.  If no governor is given (or the
+    given one is not available), auto-select the best available
+    governor that exposes the full EPP hint set.
     """
     with _sysfs_lock:
         cur_gov = get_governor()
@@ -78,9 +105,19 @@ def set_epp(epp: str, governor: Optional[str] = None) -> bool:
         restore_governor: Optional[str] = None
         if needs_swap and governor:
             restore_governor = "performance" if governor == "performance" else None
-            set_governor(governor)
+            if governor not in available_governors():
+                # Requested governor not available (e.g. "schedutil" on
+                # amd-pstate-epp active where only powersave/perf exist).
+                # Fall back to the best available non-performance governor.
+                swap_gov = _best_epp_governor()
+                if swap_gov:
+                    set_governor(swap_gov)
+            else:
+                set_governor(governor)
         elif needs_swap:
-            set_governor("schedutil")
+            swap_gov = _best_epp_governor()
+            if swap_gov:
+                set_governor(swap_gov)
 
         success = False
         pattern = os.path.join(CPU_ROOT, "cpu*/cpufreq/energy_performance_preference")

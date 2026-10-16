@@ -54,6 +54,11 @@ def default_profile(is_ac: bool, default_tdp: int = 15, gpu_min: int = 400, gpu_
     schedutil+balance_performance on AC; schedutil+balance_power on battery.
     governor=performance only exposes EPP=performance under amd-pstate-epp
     and silently wastes power on most APUs.
+
+    Battery TDP is scaled to 60% of the default TDP (min 5W) to match
+    the historical v1.0.70 behaviour that users relied on for ~6W idle
+    on battery. This only applies to freshly-created profiles that don't
+    already exist on disk.
     """
     if is_ac:
         return PowerProfile(
@@ -68,17 +73,24 @@ def default_profile(is_ac: bool, default_tdp: int = 15, gpu_min: int = 400, gpu_
             gpuFreqMax=gpu_max,
             gpuFreqFixed=(gpu_min + gpu_max) // 2,
         )
+    battery_tdp = max(5, int(default_tdp * 0.6)) if default_tdp > 10 else default_tdp
     return PowerProfile(
-        tdp=default_tdp,
-        cpuCores=8,
-        governor="schedutil",
+        tdp=battery_tdp,
+        cpuCores=4,
+        governor="powersave",
         fanProfile="quiet",
-        smt=True,
-        epp="balance_power",
+        smt=False,
+        epp="power",
         gpuMode="battery",
         gpuFreqMin=gpu_min,
         gpuFreqMax=max(gpu_min + 100, int(gpu_max * 0.8)),
         gpuFreqFixed=max(gpu_min + 50, int((gpu_min + gpu_max) * 0.4)),
+        wifiPowerSave=True,
+        usbAutosuspend=True,
+        pcieAspm=True,
+        pciRuntimePm=True,
+        platformProfile="low-power",
+        thermalPolicy=1,
     )
 
 

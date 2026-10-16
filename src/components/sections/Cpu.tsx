@@ -11,20 +11,21 @@ export function CpuSection() {
 
   const device = state.device_info;
   const profile = state.current_profile;
-  const activePowerControl =
-    device.powerControl?.active_method && device.powerControl.active_method !== "none";
-
   const orderedGovernors = getOrderedGovernors(state.capabilities.governors);
-  // On amd-pstate (non-epp) in passive mode, the governor IS the main
-  // control surface for frequency behaviour: schedutil/powersave/
-  // conservative actually honour scaling_max_freq as a hard cap, while
-  // "performance" ignores it (CPU floats at boost clocks regardless of
-  // the TDP limit). So we always show the governor selector on plain
-  // amd-pstate devices, even when native TDP (ryzenadj) is the active
-  // power-control method.
-  const isPlainAmdPstate = device.scalingDriver === "amd-pstate";
-  const showGovernor = device.scalingDriver !== "amd-pstate-epp" && (!activePowerControl || isPlainAmdPstate);
-  const showEpp = device.scalingDriver === "amd-pstate-epp" && !activePowerControl;
+  const pstateCaps = state.capabilities.pstate;
+  // platform_profile hands CPU control entirely to the platform firmware;
+  // hide governor + EPP to avoid stomping the platform's decisions.
+  // native_tdp (ryzenadj) and "none" let us control EPP/governor freely.
+  const isPlatformManaged = device.powerControl?.active_method === "platform_profile";
+  // Governor is relevant on all drivers when not platform-managed:
+  // on amd-pstate-epp it gates the EPP hint set (performance governor
+  // silently restricts EPP to 'performance'), and on classic amd-pstate
+  // it's the primary control surface in passive mode.
+  const showGovernor = !isPlatformManaged && orderedGovernors.length > 1;
+  // Show EPP controls whenever the backend reports EPP as available —
+  // this covers both amd-pstate-epp (always, in active mode) and
+  // classic amd-pstate (active mode exposes per-CPU EPP sysfs files).
+  const showEpp = (pstateCaps?.epp_available ?? false) && !isPlatformManaged;
 
   const maxCores = device.max_cpu_cores || 16;
   const cpuCoresMax = profile.smt ? maxCores : Math.floor(maxCores / 2);
@@ -33,9 +34,13 @@ export function CpuSection() {
   const govName = orderedGovernors[governorIdx] ?? profile.governor;
   const govDesc = GOVERNOR_DESCRIPTIONS[profile.governor] ?? "";
 
-  const eppIdx = Math.max(0, EPP_VALUES.indexOf(profile.epp as any));
-  const eppName = EPP_VALUES[eppIdx] ?? profile.epp;
-  const eppDesc = EPP_DESCRIPTIONS[profile.epp as any] ?? "";
+  const eppOptions =
+    showEpp && pstateCaps && pstateCaps.epp_preferences.length > 0
+      ? pstateCaps.epp_preferences
+      : Array.from(EPP_VALUES);
+  const eppIdx = Math.max(0, eppOptions.indexOf(profile.epp as string));
+  const eppName = eppOptions[eppIdx] ?? profile.epp;
+  const eppDesc = EPP_DESCRIPTIONS[profile.epp as string] ?? "";
 
   return (
     <PanelSection title="CPU Control">
@@ -76,7 +81,7 @@ export function CpuSection() {
           />
         </PanelSectionRow>
       )}
-      {showGovernor && orderedGovernors.length > 1 && (
+      {showGovernor && (
         <PanelSectionRow>
           <LabeledSlider
             label="Governor"
@@ -98,12 +103,12 @@ export function CpuSection() {
             label="EPP"
             value={eppIdx}
             min={0}
-            max={EPP_VALUES.length - 1}
+            max={eppOptions.length - 1}
             step={1}
-            notches={EPP_VALUES.length}
+            notches={eppOptions.length}
             icon={<FaRocket />}
             displayValue={eppName}
-            onChange={(v) => applySettings({ epp: EPP_VALUES[v] })}
+            onChange={(v) => applySettings({ epp: eppOptions[v] })}
             description={eppDesc}
           />
         </PanelSectionRow>

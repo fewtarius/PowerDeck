@@ -495,6 +495,7 @@ Profile structure (via `PowerProfileData` dataclass):
 | CPU boost | `/sys/devices/system/cpu/cpufreq/boost` |
 | SMT control | `/sys/devices/system/cpu/smt/control` |
 | CPU online | `/sys/devices/system/cpu/cpu*/online` |
+| AMD P-State mode | `/sys/devices/system/cpu/amd_pstate/status` (read/write "active"/"passive"/"guided") |
 | GPU frequency (AMD) | `/sys/class/drm/card*/device/pp_dpm_sclk` |
 | GPU perf level (AMD) | `/sys/class/drm/card*/device/power_dpm_force_performance_level` |
 | GPU freq min/max (Intel) | `/sys/class/drm/card*/gt_min_freq_mhz`, `gt_max_freq_mhz` |
@@ -555,6 +556,18 @@ EXTERNAL_MANAGER_DBUS_IFACE = "com.steampowered.SteamOSManager1.ExternalManager1
 | Change VERSION file directly without sync | Package/plugin versions get out of sync | Run `./update-version.sh` |
 | Create files in `.clio/` manually | CLIO manages its own directory | Let CLIO handle `.clio/` internals |
 | Leave DEBUG_ENABLED=true in production | Verbose logging impacts performance | Set to false before release build |
+| Hardcode "schedutil" governor for EPP swap | On amd-pstate-epp active mode, only "performance" and "powersave" are available — "schedutil" silently fails, leaving governor at "performance" which restricts EPP to performance-only | Use `_best_epp_governor()` to auto-select the best available non-"performance" governor |
+| Use `threading.Lock()` for sysfs locks when functions call each other | `set_epp` calls `set_governor` while holding the lock — `Lock` deadlocks, `RLock` is reentrant | Use `threading.RLock()` for `_sysfs_lock` |
+| Apply EPP before pstate mode | On classic amd-pstate, EPP sysfs files only exist in "active" mode — the write silently fails | Apply `pstateMode` FIRST in `_apply_profile_full`, before governor and EPP |
+
+**EPP & Governor Interaction (amd-pstate / amd-pstate-epp):**
+
+- In `active` mode, the full EPP hint set (`default`, `performance`, `balance_performance`, `balance_power`, `power`, `custom`) is exposed and writable.
+- With governor=`performance`, the kernel silently coerces EPP writes to `performance` — CPU idles at boost clocks on all cores.
+- `set_epp()` auto-swaps to `_best_epp_governor()` (prefers `schedutil` > `powersave` > `ondemand` > `conservative`) when governor=`performance` and EPP≠`performance`.
+- `set_governor()` auto-falls-back to the best available non-`performance` governor when the requested one is not in `scaling_available_governors`.
+- On amd-pstate-epp active mode (Zen 4+, kernel 6.18+), only `performance` and `powersave` governors are available.
+- `_pstate_caps()` uses runtime detection (reads sysfs) rather than static init-time caps, so UI gated on `epp_available` reflects the current mode immediately after a mode switch.
 
 ---
 
