@@ -37,7 +37,7 @@ export function TdpSection({ softMode = false }: TdpSectionProps) {
         <PanelSectionRow>
           <div style={{ padding: "8px 0", fontSize: 11, color: "#666" }}>
             Battery Saver (Low TDP): powersave governor + power EPP<br />
-            Balanced (Medium TDP): schedutil governor + balance_power EPP<br />
+            Balanced (Medium TDP): best available balanced governor (schedutil or powersave) + balance_power EPP<br />
             Performance (High TDP): performance governor + performance EPP
           </div>
         </PanelSectionRow>

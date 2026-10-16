@@ -113,12 +113,16 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         const payload: any = { ...partial };
         if (targetProfileId) payload.target_profile_id = targetProfileId;
         const ok = await applySettingsApi(payload);
-        if (ok) {
-          await refresh();
-        }
+        // Refresh the state unconditionally. On success this re-reads the
+        // freshly-applied profile; on failure the backend does NOT persist
+        // the rejected value, so the refresh re-reads the previous (unchanged)
+        // profile and the controlled LabeledSlider thumb snaps back to the
+        // real hardware value instead of sticking at the optimistic drag.
+        await refresh();
         return ok;
       } catch (e) {
         setError(`Failed to apply: ${e}`);
+        await refresh();
         return false;
       }
     },

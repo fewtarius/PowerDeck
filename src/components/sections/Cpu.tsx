@@ -1,8 +1,8 @@
 import { PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
-import { FaMicrochip, FaRocket } from "react-icons/fa";
+import { FaMicrochip } from "react-icons/fa";
 
 import { useSettings } from "../../settings/SettingsProvider";
-import { LabeledSlider } from "../shared";
+import { LabeledSlider, governorIcon, eppIcon } from "../shared";
 import { EPP_DESCRIPTIONS, EPP_VALUES, GOVERNOR_DESCRIPTIONS, getOrderedGovernors } from "../../api";
 
 export function CpuSection() {
@@ -32,7 +32,12 @@ export function CpuSection() {
 
   const governorIdx = Math.max(0, orderedGovernors.indexOf(profile.governor));
   const govName = orderedGovernors[governorIdx] ?? profile.governor;
-  const govDesc = GOVERNOR_DESCRIPTIONS[profile.governor] ?? "";
+  // Description must track the *displayed* (snapped) governor, not the
+  // raw profile value: when the profile holds a governor the kernel
+  // doesn't expose (e.g. "schedutil" under amd-pstate-epp active where
+  // only powersave/performance exist) the slider snaps to index 0 but
+  // the description still read the stale profile value.
+  const govDesc = GOVERNOR_DESCRIPTIONS[govName] ?? GOVERNOR_DESCRIPTIONS[profile.governor] ?? "";
 
   const eppOptions =
     showEpp && pstateCaps && pstateCaps.epp_preferences.length > 0
@@ -40,7 +45,7 @@ export function CpuSection() {
       : Array.from(EPP_VALUES);
   const eppIdx = Math.max(0, eppOptions.indexOf(profile.epp as string));
   const eppName = eppOptions[eppIdx] ?? profile.epp;
-  const eppDesc = EPP_DESCRIPTIONS[profile.epp as string] ?? "";
+  const eppDesc = EPP_DESCRIPTIONS[eppName] ?? EPP_DESCRIPTIONS[profile.epp as string] ?? "";
 
   return (
     <PanelSection title="CPU Control">
@@ -90,7 +95,8 @@ export function CpuSection() {
             max={orderedGovernors.length - 1}
             step={1}
             notches={orderedGovernors.length}
-            icon={<FaMicrochip />}
+            valueIcons={orderedGovernors.map(governorIcon)}
+            icon={governorIcon(govName)}
             displayValue={govName}
             onChange={(v) => applySettings({ governor: orderedGovernors[v] })}
             description={govDesc}
@@ -106,7 +112,8 @@ export function CpuSection() {
             max={eppOptions.length - 1}
             step={1}
             notches={eppOptions.length}
-            icon={<FaRocket />}
+            valueIcons={eppOptions.map(eppIcon)}
+            icon={eppIcon(eppName)}
             displayValue={eppName}
             onChange={(v) => applySettings({ epp: eppOptions[v] })}
             description={eppDesc}

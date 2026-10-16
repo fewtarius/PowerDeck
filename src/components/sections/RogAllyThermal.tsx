@@ -1,8 +1,7 @@
 import { PanelSection, PanelSectionRow } from "@decky/ui";
-import { FaThermometerHalf } from "react-icons/fa";
 
 import { useSettings } from "../../settings/SettingsProvider";
-import { LabeledSlider } from "../shared";
+import { LabeledSlider, thermalPolicyIcon } from "../shared";
 
 const THERMAL_NAMES = ["Quiet", "Balanced", "Aggressive", "Performance"];
 const THERMAL_DESCRIPTIONS = [
@@ -31,7 +30,8 @@ export function RogAllyThermalSection() {
           max={3}
           step={1}
           notches={4}
-          icon={<FaThermometerHalf />}
+          valueIcons={Array.from({ length: 4 }, (_, i) => thermalPolicyIcon(i))}
+          icon={thermalPolicyIcon(idx)}
           displayValue={name}
           onChange={(v) => applySettings({ thermalPolicy: v })}
           description={desc}

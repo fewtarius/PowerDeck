@@ -2,7 +2,7 @@ import { PanelSection, PanelSectionRow } from "@decky/ui";
 import { FaTachometerAlt } from "react-icons/fa";
 
 import { useSettings } from "../../settings/SettingsProvider";
-import { LabeledSlider } from "../shared";
+import { LabeledSlider, gpuModeIcon } from "../shared";
 
 const MODE_LABELS: { [k: string]: string } = {
   battery: "Battery",
@@ -74,7 +74,8 @@ export function GpuSection() {
           max={modes.length - 1}
           step={1}
           notches={modes.length}
-          icon={<FaTachometerAlt />}
+          valueIcons={modes.map(gpuModeIcon)}
+          icon={gpuModeIcon(mode)}
           displayValue={modeLabel}
           onChange={(v) => applySettings({ gpuMode: modes[v] })}
           description={modeDesc}

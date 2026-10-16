@@ -1,8 +1,7 @@
 import { PanelSection, PanelSectionRow } from "@decky/ui";
-import { FaCogs } from "react-icons/fa";
 
 import { useSettings } from "../../settings/SettingsProvider";
-import { LabeledSlider } from "../shared";
+import { LabeledSlider, pstateIcon } from "../shared";
 
 const PSTATE_NAMES = ["Active", "Passive", "Guided"];
 const PSTATE_DESCRIPTIONS = [
@@ -10,6 +9,7 @@ const PSTATE_DESCRIPTIONS = [
   "OS scales the CPU",
   "Hardware + OS scaling",
 ];
+const PSTATE_MODES = ["active", "passive", "guided"];
 
 export function PstateSection() {
   const { state, applySettings } = useSettings();
@@ -18,7 +18,7 @@ export function PstateSection() {
   if (!caps) return null;
 
   const current = caps.current_mode || "guided";
-  const idx = ["active", "passive", "guided"].indexOf(current);
+  const idx = PSTATE_MODES.indexOf(current);
   const safe = idx >= 0 ? idx : 2;
 
   const name = PSTATE_NAMES[safe];
@@ -31,12 +31,13 @@ export function PstateSection() {
           label="P-State"
           value={safe}
           min={0}
-          max={2}
+          max={PSTATE_MODES.length - 1}
           step={1}
-          notches={3}
-          icon={<FaCogs />}
+          notches={PSTATE_MODES.length}
+          valueIcons={PSTATE_MODES.map(pstateIcon)}
+          icon={pstateIcon(PSTATE_MODES[safe])}
           displayValue={name}
-          onChange={(v) => applySettings({ pstateMode: ["active", "passive", "guided"][v] })}
+          onChange={(v) => applySettings({ pstateMode: PSTATE_MODES[v] })}
           description={desc}
         />
       </PanelSectionRow>

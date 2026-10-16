@@ -1,8 +1,7 @@
 import { PanelSection, PanelSectionRow } from "@decky/ui";
-import { FaGamepad } from "react-icons/fa";
 
 import { useSettings } from "../../settings/SettingsProvider";
-import { LabeledSlider } from "../shared";
+import { LabeledSlider, controllerIcon } from "../shared";
 import { CONTROLLER_MODE_LABELS } from "../../api";
 
 export function ControllerSection() {
@@ -27,7 +26,8 @@ export function ControllerSection() {
           max={Math.max(0, modes.length - 1)}
           step={1}
           notches={modes.length}
-          icon={<FaGamepad />}
+          valueIcons={modes.map(controllerIcon)}
+          icon={controllerIcon(current)}
           displayValue={name}
           onChange={(v) => {
             const mode = modes[v];

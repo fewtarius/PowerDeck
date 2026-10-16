@@ -1,8 +1,7 @@
 import { PanelSection, PanelSectionRow } from "@decky/ui";
-import { FaCogs } from "react-icons/fa";
 
 import { useSettings } from "../../settings/SettingsProvider";
-import { LabeledSlider } from "../shared";
+import { LabeledSlider, platformProfileIcon } from "../shared";
 import { PLATFORM_PROFILE_DESCRIPTIONS } from "../../api";
 
 // Friendly display names for platform profile strings. ACPI uses
@@ -42,7 +41,8 @@ export function PlatformProfileSection() {
           max={profiles.length - 1}
           step={1}
           notches={profiles.length}
-          icon={<FaCogs />}
+          valueIcons={profiles.map(platformProfileIcon)}
+          icon={platformProfileIcon(current)}
           displayValue={name}
           onChange={(v) => applySettings({ platformProfile: profiles[v] })}
           description={desc}

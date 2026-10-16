@@ -1,8 +1,7 @@
 import { PanelSection, PanelSectionRow } from "@decky/ui";
-import { FaFan } from "react-icons/fa";
 
 import { useSettings } from "../../settings/SettingsProvider";
-import { LabeledSlider } from "../shared";
+import { LabeledSlider, coolingIcon } from "../shared";
 import { COOLING_PROFILES, COOLING_DESCRIPTIONS } from "../../api";
 
 const COOLING_DISPLAY: { [k: string]: string } = {
@@ -31,7 +30,8 @@ export function CoolingSection() {
           max={COOLING_PROFILES.length - 1}
           step={1}
           notches={COOLING_PROFILES.length}
-          icon={<FaFan />}
+          valueIcons={COOLING_PROFILES.map(coolingIcon)}
+          icon={coolingIcon(profile)}
           displayValue={name}
           onChange={(v) => applySettings({ fanProfile: COOLING_PROFILES[v] })}
           description={desc}

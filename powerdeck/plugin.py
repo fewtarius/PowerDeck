@@ -369,10 +369,21 @@ class Plugin:
         caps = self.capabilities
         if not caps:
             return False
-        if caps.power_control.active_method == "platform_profile" and not caps.power_control.native_tdp_available:
-            # When ACPI owns TDP, the watt-level slider is software-mapped.
+        native = caps.power_control.native_tdp_available
+        platform = caps.power_control.platform_profile_available
+        if platform and not native:
+            # ACPI platform_profile owns the watt level; map watts to
+            # governor/EPP so the soft slider has a real effect.
             return self._apply_tdp_soft(int(watts))
-        return tdp_mod.set_tdp(int(watts), prefer_native=True)[0]
+        if native:
+            return tdp_mod.set_tdp(int(watts), prefer_native=True)[0]
+        if caps.gpu_vendor == "intel":
+            # Intel exposes RAPL on platform_profile-less devices.
+            return tdp_mod.set_tdp(int(watts), prefer_native=False)[0]
+        # No native TDP path at all (Secure Boot + no ACPI + no RAPL):
+        # fall back to the governor/EPP soft mapping. This is the case
+        # _tdp_control_availability labels method="soft".
+        return self._apply_tdp_soft(int(watts))
 
     def _apply_tdp_soft(self, watts: int) -> bool:
         """Map watts to governor+EPP when no native TDP path exists."""
@@ -456,11 +467,13 @@ class Plugin:
         """Apply a partial set of fields. May also carry `target_profile_id`
         as a top-level entry to switch the active profile id.
 
-        A hardware-writing failure is logged but does not flip the
-        return value when the device lacks the backing sysfs entry -
-        the value is still saved to the profile for when the device
-        gains the capability. Frontend visibility is gated by
-        Capabilities so this is a defensive measure only.
+        A hardware-writing failure is logged, the rejected field is NOT
+        persisted (so the saved profile keeps matching what the hardware
+        actually accepted), and the call returns False so the frontend
+        can revert its optimistic view. Returning True unconditionally
+        here previously let failed writes (e.g. Secure Boot blocking
+        ryzenadj) be saved as "applied", leaving the slider thumb and the
+        hardware reading out of sync until the next reload.
         """
         if not isinstance(partial, dict):
             return False
@@ -474,23 +487,36 @@ class Plugin:
             profile_data = self.current_profile
 
         any_failure = False
+        # Cache the set of known profile fields once (to_dict is cheap but
+        # avoids re-serializing per field). Charge-limit is device-level
+        # (not a profile field) and is persisted separately.
+        profile_fields = set(profile_data.to_dict().keys())
         for key, value in partial.items():
             if value is None:
                 continue
-            setattr(profile_data, key, value)
             if key == "chargeLimit":
                 self.persistent.set("battery_charge_limit", int(value))
                 ok = battery_mod.set_limit(int(value))
                 if not ok:
                     any_failure = True
                 continue
-            if key in profile_data.to_dict():
-                if not self._apply_field(key, value):
-                    any_failure = True
+            if key not in profile_fields:
+                # Unknown field - ignore defensively (don't write to disk).
+                continue
+            # Write hardware FIRST. Only commit the value to the in-memory
+            # profile (+ later to disk) when the write actually succeeded,
+            # so a rejected value can't overwrite a good one.
+            if not self._apply_field(key, value):
+                any_failure = True
+                decky_plugin.logger.warning(
+                    f"apply_settings: {key}={value} not applied (no backing sysfs)"
+                )
+                continue
+            setattr(profile_data, key, value)
         self.profile_store.save(profile_id, profile_data)
         if any_failure:
-            decky_plugin.logger.warning("apply_settings: some fields had no backing sysfs")
-        return True
+            decky_plugin.logger.warning("apply_settings: some fields were not applied")
+        return not any_failure
 
     async def set_per_game_profiles_enabled(self, enabled: bool) -> bool:
         self.persistent.set("per_game_profiles_enabled", bool(enabled))
@@ -564,29 +590,47 @@ class Plugin:
     # ── helpers ─────────────────────────────────────────────────────
 
     def _tdp_control_availability(self, caps: capabilities.Capabilities) -> Dict[str, Any]:
+        # Branch order mirrors the active-method detection in
+        # capabilities._detect_power_control_method so the availability
+        # dict the frontend reads stays in lockstep with _apply_tdp.
         native = caps.power_control.native_tdp_available
-        soft = caps.power_control.active_method == "platform_profile"
+        platform = caps.power_control.platform_profile_available
+
         if native:
             available = True
             method = "native_tdp"
             reason = caps.power_control.reason
+            has_soft = False
         elif caps.gpu_vendor == "intel":
             available = True
             method = "intel_rapl"
             reason = "Intel RAPL exposed"
-        elif caps.power_control.platform_profile_available:
+            has_soft = False
+        elif platform:
+            # ACPI platform_profile owns the watt-level slider, so the
+            # software soft-fallback must NOT be advertised (the
+            # PlatformProfileSection owns this surface instead).
             available = True
             method = "platform_profile"
             reason = caps.power_control.reason
+            has_soft = False
         else:
+            # No native path, no ACPI, no Intel RAPL: the only thing we
+            # can do is map watts -> governor/EPP via _apply_tdp_soft.
+            # has_soft_control MUST be True here so the frontend's
+            # `!available && has_soft_control` gate actually renders the
+            # soft slider. (Previously this was `soft = active_method ==
+            # "platform_profile"`, which reported False here and True in
+            # the branch above where it must be False -- exactly inverted.)
             available = False
             method = "soft"
             reason = caps.power_control.reason or "no native TDP path"
+            has_soft = True
 
         return {
             "available": available,
             "method": method,
-            "has_soft_control": soft,
+            "has_soft_control": has_soft,
             "reason": reason,
         }
 

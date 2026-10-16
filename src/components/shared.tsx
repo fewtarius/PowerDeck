@@ -1,5 +1,9 @@
 import { ReactNode, useCallback, useEffect, useState } from "react";
 import { SliderField } from "@decky/ui";
+import { FaBatteryThreeQuarters, FaBullseye, FaCog, FaChartBar, FaFire,
+  FaBatteryFull, FaBatteryHalf, FaRocket, FaSyncAlt, FaMicrochip,
+  FaLightbulb, FaThermometerHalf, FaGamepad, FaPause, FaSlidersH,
+  FaVolumeOff, FaBalanceScale, FaXbox, FaPlaystation } from "react-icons/fa";
 
 // Accent colors used across the UI. Keep these in sync with the
 // inline styles in components/sections/* - one-off hex values
@@ -14,6 +18,94 @@ export const COLORS = {
   statusError: "#F44336",     // red - error / failed
 } as const;
 
+// ── Icon helpers ─────────────────────────────────────────────────────
+// One icon per discrete position of a categorical slider. The active
+// (selected) icon is rendered tinted with COLORS.accent so the user gets
+// a persistent visual anchor for "where am I" without reading the label.
+// These mirror the colour/icon language of the pre-rewrite UI so the
+// panel keeps its established visual vocabulary.
+export function governorIcon(governor: string): ReactNode {
+  switch (governor) {
+    case "powersave": return <FaBatteryThreeQuarters />;
+    case "conservative": return <FaLightbulb />;
+    case "ondemand": return <FaChartBar />;
+    case "schedutil": return <FaCog />;
+    case "performance": return <FaRocket />;
+    default: return <FaCog />;
+  }
+}
+
+export function eppIcon(epp: string): ReactNode {
+  switch (epp) {
+    case "power": return <FaBatteryFull />;
+    case "balance_power": return <FaBatteryHalf />;
+    case "balance_performance": return <FaChartBar />;
+    case "performance": return <FaRocket />;
+    case "default": return <FaCog />;
+    case "custom": return <FaSlidersH />;
+    default: return <FaBatteryHalf />;
+  }
+}
+
+export function gpuModeIcon(mode: string): ReactNode {
+  switch (mode) {
+    case "battery": return <FaBatteryHalf />;
+    case "auto": return <FaSyncAlt />;
+    case "performance": return <FaRocket />;
+    case "range": return <FaSlidersH />;
+    case "fixed": return <FaBullseye />;
+    default: return <FaSyncAlt />;
+  }
+}
+
+export function coolingIcon(profile: string): ReactNode {
+  switch (profile) {
+    case "auto": return <FaCog />;
+    case "quiet": return <FaVolumeOff />;
+    case "moderate": return <FaBalanceScale />;
+    case "aggressive": return <FaFire />;
+    default: return <FaCog />;
+  }
+}
+
+export function pstateIcon(mode: string): ReactNode {
+  switch (mode) {
+    case "active": return <FaRocket />;
+    case "passive": return <FaPause />;
+    case "guided": return <FaSlidersH />;
+    default: return <FaCog />;
+  }
+}
+
+export function thermalPolicyIcon(policy: number): ReactNode {
+  switch (policy) {
+    case 0: return <FaThermometerHalf />;
+    case 1: return <FaBalanceScale />;
+    case 2: return <FaFire />;
+    case 3: return <FaRocket />;
+    default: return <FaThermometerHalf />;
+  }
+}
+
+export function platformProfileIcon(profile: string): ReactNode {
+  if (profile === "power-saver" || profile === "low-power") return <FaBatteryFull />;
+  if (profile === "performance") return <FaRocket />;
+  return <FaBalanceScale />;
+}
+
+export function controllerIcon(mode: string): ReactNode {
+  // Re-exported from api labels; kept here so the icon set lives with
+  // the rest of the shared iconography rather than the callable layer.
+  switch (mode) {
+    case "deck-uhid": return <FaMicrochip />;
+    case "xbox-series":
+    case "xbox-elite": return <FaXbox />;
+    case "ds5-edge":
+    case "ds5": return <FaPlaystation />;
+    default: return <FaGamepad />;
+  }
+}
+
 interface LabeledSliderProps {
   label: string;
   value: number;
@@ -26,6 +118,12 @@ interface LabeledSliderProps {
   notches?: number;
   displayValue?: string;
   icon?: ReactNode;
+  /** Optional icon per discrete position (categorical sliders). When
+   * provided, a row of icon notches is rendered beneath the slider and
+   * the icon for the active position is tinted COLORS.accent, giving the
+   * user a persistent visual anchor for "where am I" without reading the
+   * label. Matches the colour/icon language of the pre-rewrite UI. */
+  valueIcons?: ReactNode[];
 }
 
 /**
@@ -62,6 +160,7 @@ export function LabeledSlider({
   notches,
   displayValue,
   icon,
+  valueIcons,
 }: LabeledSliderProps) {
   // Mirror value in local state so the slider thumb follows the user's
   // drag immediately. Without this, the controlled SliderField snaps back
@@ -99,6 +198,38 @@ export function LabeledSlider({
         icon={icon}
         onChange={handleChange}
       />
+      {valueIcons && valueIcons.length > 0 && (
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            padding: "2px 12px 4px",
+            pointerEvents: "none",
+          }}
+          aria-hidden="true"
+        >
+          {valueIcons.map((ic, i) => (
+            <span
+              key={i}
+              style={{
+                color:
+                  i === Math.round(internalValue) && internalValue >= min && internalValue <= max
+                    ? COLORS.accent
+                    : COLORS.textTertiary,
+                fontSize: "1.1em",
+                opacity:
+                  i === Math.round(internalValue) && internalValue >= min && internalValue <= max
+                    ? 1
+                    : 0.5,
+                transition: "color 0.16s ease, opacity 0.16s ease",
+              }}
+            >
+              {ic}
+            </span>
+          ))}
+        </div>
+      )}
       {description && (
         <div
           style={{

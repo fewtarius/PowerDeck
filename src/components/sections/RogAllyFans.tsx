@@ -1,8 +1,8 @@
 import { PanelSection, PanelSectionRow } from "@decky/ui";
-import { FaFan } from "react-icons/fa";
 
 import { useSettings } from "../../settings/SettingsProvider";
 import { LabeledSlider } from "../shared";
+import { FaFan, FaStopCircle } from "react-icons/fa";
 
 function fanModeToIdx(mode: number): number {
   return mode === 2 ? 1 : 0;
@@ -10,6 +10,7 @@ function fanModeToIdx(mode: number): number {
 
 const FAN_NAMES = ["Silent", "Performance"];
 const FAN_DESCRIPTIONS = ["Off when cool", "Full speed"];
+const FAN_ICONS = [<FaStopCircle />, <FaFan />];
 
 export function RogAllyFansSection() {
   const { state, setRogAllyFanMode } = useSettings();
@@ -34,7 +35,8 @@ export function RogAllyFansSection() {
           max={1}
           step={1}
           notches={2}
-          icon={<FaFan />}
+          valueIcons={FAN_ICONS}
+          icon={FAN_ICONS[cpuIdx]}
           displayValue={cpuName}
           onChange={async (v) => {
             await setRogAllyFanMode(1, v === 1 ? 2 : 0);
@@ -50,7 +52,8 @@ export function RogAllyFansSection() {
           max={1}
           step={1}
           notches={2}
-          icon={<FaFan />}
+          valueIcons={FAN_ICONS}
+          icon={FAN_ICONS[gpuIdx]}
           displayValue={gpuName}
           onChange={async (v) => {
             await setRogAllyFanMode(2, v === 1 ? 2 : 0);
