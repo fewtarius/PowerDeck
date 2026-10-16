@@ -110,6 +110,13 @@ export function CpuSection() {
             onChange={(v) => applySettings({ governor: orderedGovernors[v] })}
             description={govDesc}
           />
+          {pstateCaps?.current_mode === "guided" && (
+            <div style={{ padding: "8px 12px", color: "#ffb366", fontSize: "0.8em" }}>
+              Warning: Governor is ignored in Guided mode. Switch the CPU
+              Driver Mode (below) to "Active" for this setting to take
+              effect.
+            </div>
+          )}
         </PanelSectionRow>
       )}
       {showEpp && (
@@ -126,6 +133,12 @@ export function CpuSection() {
             onChange={(v) => applySettings({ epp: orderedEppOptions[v] })}
             description={eppDesc}
           />
+          {pstateCaps?.current_mode !== "active" && (
+            <div style={{ padding: "8px 12px", color: "#ffb366", fontSize: "0.8em" }}>
+              EPP is only honored in Active mode. Switch the CPU Driver
+              Mode (below) to "Active" for this setting to take effect.
+            </div>
+          )}
         </PanelSectionRow>
       )}
     </PanelSection>

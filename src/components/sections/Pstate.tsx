@@ -5,9 +5,9 @@ import { LabeledSlider, pstateIcon } from "../shared";
 
 const PSTATE_NAMES = ["Active", "Passive", "Guided"];
 const PSTATE_DESCRIPTIONS = [
-  "CPU scales via EPP",
-  "OS scales the CPU",
-  "Hardware + OS scaling",
+  "OS controls via governor + EPP",
+  "OS controls frequency directly",
+  "Firmware-controlled (governor/EPP ignored)",
 ];
 const PSTATE_MODES = ["active", "passive", "guided"];
 
