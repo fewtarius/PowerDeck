@@ -31,7 +31,6 @@ export function RogAllyThermalSection() {
           step={1}
           notches={4}
           valueIcons={Array.from({ length: 4 }, (_, i) => thermalPolicyIcon(i))}
-          icon={thermalPolicyIcon(idx)}
           displayValue={name}
           onChange={(v) => applySettings({ thermalPolicy: v })}
           description={desc}

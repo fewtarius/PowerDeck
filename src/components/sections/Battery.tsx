@@ -1,5 +1,4 @@
 import { useState } from "react";
-import type { ReactNode } from "react";
 import { PanelSection, PanelSectionRow } from "@decky/ui";
 import { FaBatteryEmpty, FaBatteryHalf, FaBatteryFull } from "react-icons/fa";
 
@@ -22,12 +21,6 @@ const CHARGE_NOTCH_ICONS = [<FaBatteryEmpty />, <FaBatteryHalf />, <FaBatteryFul
 const CHARGE_STEP = 5;
 const CHARGE_MIN = 20;
 const CHARGE_MAX = 100;
-
-function chargeNotchIcon(value: number): ReactNode {
-  if (value <= 60) return CHARGE_NOTCH_ICONS[0]; // battery-friendly
-  if (value <= 80) return CHARGE_NOTCH_ICONS[1]; // balanced
-  return CHARGE_NOTCH_ICONS[2]; // full charge
-}
 
 export function BatterySection() {
   const { state, refresh } = useSettings();
@@ -61,7 +54,6 @@ export function BatterySection() {
               ? CHARGE_NOTCH_ICONS[CHARGE_NOTCH_VALUES.indexOf(CHARGE_MIN + i * CHARGE_STEP)]
               : null
           )}
-          icon={chargeNotchIcon(value)}
           displayValue={`${value}% (${preset.name})`}
           onChange={(v) => handleChange(v)}
           description="Range: 20-100%"

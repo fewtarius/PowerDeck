@@ -31,7 +31,6 @@ export function CoolingSection() {
           step={1}
           notches={COOLING_PROFILES.length}
           valueIcons={COOLING_PROFILES.map(coolingIcon)}
-          icon={coolingIcon(profile)}
           displayValue={name}
           onChange={(v) => applySettings({ fanProfile: COOLING_PROFILES[v] })}
           description={desc}

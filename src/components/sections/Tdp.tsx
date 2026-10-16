@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
-import { FaMicrochip } from "react-icons/fa";
 
 import { useSettings } from "../../settings/SettingsProvider";
 import { LabeledSlider } from "../shared";
@@ -49,7 +48,6 @@ export function TdpSection({ softMode = false }: TdpSectionProps) {
           min={min}
           max={max}
           step={1}
-          icon={<FaMicrochip />}
           displayValue={`${tdp} Watts`}
           onChange={(value) => applySettings({ tdp: value })}
           description={softMode ? "Mapped to governor + EPP" : `Range: ${min}-${max}W`}
@@ -73,7 +71,6 @@ export function TdpSection({ softMode = false }: TdpSectionProps) {
                   min={limits.min}
                   max={customMax}
                   step={1}
-                  icon={<FaMicrochip />}
                   displayValue={`${customMin} Watts`}
                   onChange={(value) => {
                     setCustomMin(value);
@@ -91,7 +88,6 @@ export function TdpSection({ softMode = false }: TdpSectionProps) {
                   min={customMin}
                   max={limits.max}
                   step={1}
-                  icon={<FaMicrochip />}
                   displayValue={`${customMax} Watts`}
                   onChange={(value) => {
                     setCustomMax(value);

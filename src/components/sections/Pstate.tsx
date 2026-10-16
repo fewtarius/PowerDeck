@@ -35,7 +35,6 @@ export function PstateSection() {
           step={1}
           notches={PSTATE_MODES.length}
           valueIcons={PSTATE_MODES.map(pstateIcon)}
-          icon={pstateIcon(PSTATE_MODES[safe])}
           displayValue={name}
           onChange={(v) => applySettings({ pstateMode: PSTATE_MODES[v] })}
           description={desc}

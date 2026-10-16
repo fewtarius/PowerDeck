@@ -42,7 +42,6 @@ export function PlatformProfileSection() {
           step={1}
           notches={profiles.length}
           valueIcons={profiles.map(platformProfileIcon)}
-          icon={platformProfileIcon(current)}
           displayValue={name}
           onChange={(v) => applySettings({ platformProfile: profiles[v] })}
           description={desc}

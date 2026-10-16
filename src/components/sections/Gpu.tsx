@@ -1,5 +1,4 @@
 import { PanelSection, PanelSectionRow } from "@decky/ui";
-import { FaTachometerAlt } from "react-icons/fa";
 
 import { useSettings } from "../../settings/SettingsProvider";
 import { LabeledSlider, gpuModeIcon } from "../shared";
@@ -75,7 +74,6 @@ export function GpuSection() {
           step={1}
           notches={modes.length}
           valueIcons={modes.map(gpuModeIcon)}
-          icon={gpuModeIcon(mode)}
           displayValue={modeLabel}
           onChange={(v) => applySettings({ gpuMode: modes[v] })}
           description={modeDesc}
@@ -90,7 +88,6 @@ export function GpuSection() {
               min={minFreq}
               max={profile.gpuFreqMax || maxFreq}
               step={SLIDER_STEP}
-              icon={<FaTachometerAlt />}
               displayValue={`${profile.gpuFreqMin || minFreq} MHz`}
               onChange={(v) => adjustRange("min", v)}
               description={`Range: ${minFreq}-${maxFreq}MHz`}
@@ -103,7 +100,6 @@ export function GpuSection() {
               min={profile.gpuFreqMin || minFreq}
               max={maxFreq}
               step={SLIDER_STEP}
-              icon={<FaTachometerAlt />}
               displayValue={`${profile.gpuFreqMax || maxFreq} MHz`}
               onChange={(v) => adjustRange("max", v)}
               description={`Range: ${minFreq}-${maxFreq}MHz`}
@@ -122,7 +118,6 @@ export function GpuSection() {
             min={minFreq}
             max={maxFreq}
             step={SLIDER_STEP}
-            icon={<FaTachometerAlt />}
             displayValue={`${Math.min(profile.gpuFreqFixed || Math.floor((minFreq + maxFreq) / 2), maxFreq)} MHz`}
             onChange={(v) => {
               const clamped = Math.max(minFreq, Math.min(v, maxFreq));

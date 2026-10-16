@@ -36,7 +36,6 @@ export function RogAllyFansSection() {
           step={1}
           notches={2}
           valueIcons={FAN_ICONS}
-          icon={FAN_ICONS[cpuIdx]}
           displayValue={cpuName}
           onChange={async (v) => {
             await setRogAllyFanMode(1, v === 1 ? 2 : 0);
@@ -53,7 +52,6 @@ export function RogAllyFansSection() {
           step={1}
           notches={2}
           valueIcons={FAN_ICONS}
-          icon={FAN_ICONS[gpuIdx]}
           displayValue={gpuName}
           onChange={async (v) => {
             await setRogAllyFanMode(2, v === 1 ? 2 : 0);

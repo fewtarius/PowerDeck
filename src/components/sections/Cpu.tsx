@@ -1,5 +1,4 @@
 import { PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
-import { FaMicrochip } from "react-icons/fa";
 
 import { useSettings } from "../../settings/SettingsProvider";
 import { LabeledSlider, governorIcon, eppIcon } from "../shared";
@@ -44,13 +43,20 @@ export function CpuSection() {
   // the description still read the stale profile value.
   const govDesc = GOVERNOR_DESCRIPTIONS[govName] ?? GOVERNOR_DESCRIPTIONS[profile.governor] ?? "";
 
-  const eppOptions =
-    showEpp && pstateCaps && pstateCaps.epp_preferences.length > 0
-      ? pstateCaps.epp_preferences
-      : Array.from(EPP_VALUES);
-  const eppIdx = Math.max(0, eppOptions.indexOf(profile.epp as string));
-  const eppName = eppOptions[eppIdx] ?? profile.epp;
-  const eppDesc = EPP_DESCRIPTIONS[eppName] ?? EPP_DESCRIPTIONS[profile.epp as string] ?? "";
+  const eppOptions = (showEpp && pstateCaps && pstateCaps.epp_preferences.length > 0
+    ? pstateCaps.epp_preferences
+    : Array.from(EPP_VALUES)
+  ).filter((e) => e !== "default" && e !== "custom");
+  // Enforce canonical left-to-right order regardless of the kernel's
+  // sysfs ordering (energy_performance_available_preferences is returned
+  // in an arbitrary sequence, e.g. "default performance ... power").
+  // UI must read battery-saving on the left, performance on the right.
+  const orderedEppOptions = EPP_VALUES.filter((e) =>
+    (eppOptions as readonly string[]).includes(e)
+  ) as string[];
+  const eppIdx = Math.max(0, orderedEppOptions.indexOf(profile.epp as string));
+  const eppName = orderedEppOptions[eppIdx] ?? profile.epp;
+  const eppDesc = EPP_DESCRIPTIONS[eppName as string] ?? EPP_DESCRIPTIONS[profile.epp as string] ?? "";
 
   return (
     <PanelSection title="CPU Control">
@@ -61,7 +67,6 @@ export function CpuSection() {
           min={1}
           max={cpuCoresMax}
           step={1}
-          icon={<FaMicrochip />}
           displayValue={`${profile.cpuCores} (Online)`}
           onChange={(value) => applySettings({ cpuCores: value })}
           description={`Range: 1-${cpuCoresMax}`}
@@ -101,7 +106,6 @@ export function CpuSection() {
             step={1}
             notches={orderedGovernors.length}
             valueIcons={orderedGovernors.map(governorIcon)}
-            icon={governorIcon(govName)}
             displayValue={govName}
             onChange={(v) => applySettings({ governor: orderedGovernors[v] })}
             description={govDesc}
@@ -114,13 +118,12 @@ export function CpuSection() {
             label="EPP"
             value={eppIdx}
             min={0}
-            max={eppOptions.length - 1}
+            max={orderedEppOptions.length - 1}
             step={1}
-            notches={eppOptions.length}
-            valueIcons={eppOptions.map(eppIcon)}
-            icon={eppIcon(eppName)}
+            notches={orderedEppOptions.length}
+            valueIcons={orderedEppOptions.map(eppIcon)}
             displayValue={eppName}
-            onChange={(v) => applySettings({ epp: eppOptions[v] })}
+            onChange={(v) => applySettings({ epp: orderedEppOptions[v] })}
             description={eppDesc}
           />
         </PanelSectionRow>

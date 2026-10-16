@@ -117,7 +117,6 @@ interface LabeledSliderProps {
   valueSuffix?: string;
   notches?: number;
   displayValue?: string;
-  icon?: ReactNode;
   /** Optional icon per discrete position (categorical sliders). When
    * provided, a row of icon notches is rendered beneath the slider and
    * the icon for the active position is tinted COLORS.accent, giving the
@@ -144,9 +143,7 @@ interface LabeledSliderProps {
  * with workload").
  *
  * Pass `notches` to render discrete tick marks at each notch position
- * so the slider looks like a step selector. `icon` is rendered on
- * the left of the slider to give the user a visual anchor for what
- * the slider controls (CPU, GPU, fan, etc.).
+ * so the slider looks like a step selector.
  */
 export function LabeledSlider({
   label,
@@ -159,7 +156,6 @@ export function LabeledSlider({
   valueSuffix = "",
   notches,
   displayValue,
-  icon,
   valueIcons,
 }: LabeledSliderProps) {
   // Mirror value in local state so the slider thumb follows the user's
@@ -188,17 +184,16 @@ export function LabeledSlider({
   return (
     <>
       <SliderField
-        label={`${label}: ${inline}`}
+        label={`${label}:`}
         value={internalValue}
         min={min}
         max={max}
         step={step}
         notchTicksVisible={!!notches}
         bottomSeparator="none"
-        icon={icon}
         onChange={handleChange}
       />
-      {valueIcons && valueIcons.length > 0 && (
+      {valueIcons && valueIcons.length > 0 ? (
         <div
           style={{
             display: "flex",
@@ -228,6 +223,22 @@ export function LabeledSlider({
               {ic}
             </span>
           ))}
+        </div>
+      ) : (
+        // Numeric sliders have no valueIcons row — show the current
+        // value right-justified below the slider so the user always sees
+        // the active setting (e.g. "15W", "3 / 8").
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "flex-end",
+            alignItems: "center",
+            fontSize: "0.85em",
+            color: COLORS.textSecondary,
+            padding: "2px 12px 4px",
+          }}
+        >
+          <span>{inline}</span>
         </div>
       )}
       {description && (

@@ -27,7 +27,6 @@ export function ControllerSection() {
           step={1}
           notches={modes.length}
           valueIcons={modes.map(controllerIcon)}
-          icon={controllerIcon(current)}
           displayValue={name}
           onChange={(v) => {
             const mode = modes[v];
