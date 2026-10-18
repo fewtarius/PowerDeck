@@ -25,6 +25,7 @@ MODE_FIXED = "fixed"
 
 DPM_FILE = "/sys/class/drm/card*/device/pp_dpm_sclk"
 DPM_LEVEL = "/sys/class/drm/card*/device/power_dpm_force_performance_level"
+OD_CLK_VOLTAGE = "/sys/class/drm/card*/device/pp_od_clk_voltage"
 
 
 def _cards(pattern: str) -> List[str]:
@@ -106,44 +107,158 @@ def get_freq_range() -> Tuple[int, int]:
     return _intel_range()
 
 
+def _amd_dpm_levels(path: str) -> List[Tuple[int, int]]:
+    """Parse pp_dpm_sclk file: returns list of (index, freq_mhz).
+
+    File format: "0: 800Mhz *\n1: 1100Mhz \n2: 2700Mhz \n"
+    The asterisk marks the currently-active level.
+    """
+    levels: List[Tuple[int, int]] = []
+    try:
+        with open(path, "r") as f:
+            for line in f:
+                m = re.match(r"^(\d+):\s*(\d+)Mhz", line)
+                if m:
+                    levels.append((int(m.group(1)), int(m.group(2))))
+    except OSError:
+        pass
+    return levels
+
+
+def _amd_read_od_range(path: str) -> Tuple[int, int]:
+    """Read the SCLK OD_RANGE from pp_od_clk_voltage.
+
+    Format line: "SCLK:     800Mhz       2700Mhz"
+    Returns (min_mhz, max_mhz), falling back to DPM-derived range.
+    """
+    try:
+        with open(path, "r") as f:
+            content = f.read()
+        for line in content.split("\n"):
+            if "SCLK:" in line:
+                parts = line.replace("SCLK:", "").strip().split()
+                freqs = []
+                for p in parts:
+                    if "Mhz" in p:
+                        m = re.search(r"(\d+)", p)
+                        if m:
+                            freqs.append(int(m.group(1)))
+                if len(freqs) >= 2:
+                    return freqs[0], freqs[1]
+    except OSError:
+        pass
+    return _amd_dpm_range()
+
+
+def _amd_set_range_od(min_mhz: int, max_mhz: int) -> bool:
+    """Set the GPU clock frequency range on AMD via pp_od_clk_voltage.
+
+    The amdgpu driver exposes per-GPU overdrive clock control via the
+    pp_od_clk_voltage sysfs file.  The protocol is:
+      1. Write "manual" to power_dpm_force_performance_level
+      2. Write "r" to pp_od_clk_voltage (reset to defaults)
+      3. Write "s 0 <min_mhz>"  (set minimum SCLK level)
+      4. Write "s 1 <max_mhz>"  (set maximum SCLK level)
+      5. Write "c" to pp_od_clk_voltage (commit)
+
+    This works on all AMD GPUs (Renoir, Cezanne, Phoenix, Phoenix1 /
+    Strix Halo, etc.) and is the interface that the old monolith used.
+    The pp_dpm_sclk index-write approach only works on a subset of
+    asics and returns EINVAL on many APUs (e.g. Phoenix1), which is why
+    GPU freq sliders silently failed to update.
+    """
+    level_paths = _cards(DPM_LEVEL)
+    od_paths = _cards(OD_CLK_VOLTAGE)
+    if not level_paths or not od_paths:
+        return _amd_set_range_dpm(min_mhz, max_mhz)
+
+    # Clamp to the hardware-supported SCLK range
+    min_hw, max_hw = _amd_read_od_range(od_paths[0])
+    min_mhz = max(min_hw, min(min_mhz, max_hw))
+    max_mhz = max(min_hw, min(max_mhz, max_hw))
+
+    # Step 1: switch to manual mode so OD writes are honored
+    for lp in level_paths:
+        write_sysfs(lp, "manual")
+
+    success = False
+    for od_path in od_paths:
+        try:
+            # Step 2: reset to defaults
+            with open(od_path, "w") as f:
+                f.write("r")
+            # Step 3: set minimum SCLK
+            with open(od_path, "w") as f:
+                f.write(f"s 0 {min_mhz}")
+            # Step 4: set maximum SCLK
+            with open(od_path, "w") as f:
+                f.write(f"s 1 {max_mhz}")
+            # Step 5: commit
+            with open(od_path, "w") as f:
+                f.write("c")
+            success = True
+        except OSError:
+            continue
+    return success
+
+
+def _amd_set_range_dpm(min_mhz: int, max_mhz: int) -> bool:
+    """Fallback: set GPU clock range via pp_dpm_sclk index writes.
+
+    Per the kernel docs (Documentation/gpu/amdgpu/thermal.rst), to
+    change the clock range on pp_dpm_sclk you must:
+      1. Write "manual" to power_dpm_force_performance_level
+      2. Write space-separated DPM indices to pp_dpm_sclk
+         (e.g. "2 3 4" enables levels 2-4, making level 2 the min
+         and level 4 the max).
+
+    NOTE: This method returns EINVAL on some APUs (e.g. Phoenix1 /
+    Strix Halo), so pp_od_clk_voltage is preferred.  This is only
+    reached when OD_CLK_VOLTAGE sysfs is unavailable.
+    """
+    level_paths = _cards(DPM_LEVEL)
+    dpm_paths = _cards(DPM_FILE)
+    if not level_paths or not dpm_paths:
+        return False
+
+    # Step 1: switch to manual mode so pp_dpm_sclk writes are honored.
+    for lp in level_paths:
+        write_sysfs(lp, "manual")
+
+    success = False
+    for path in dpm_paths:
+        levels = _amd_dpm_levels(path)
+        if not levels:
+            continue
+        # Find the index with the lowest frequency >= min_mhz (the floor)
+        # and the index with the highest frequency <= max_mhz (the ceiling).
+        min_idx = levels[0][0]
+        max_idx = levels[-1][0]
+        for idx, freq in levels:
+            if freq <= min_mhz:
+                min_idx = idx
+            if freq >= max_mhz:
+                max_idx = idx
+                break
+        # Ensure min_idx <= max_idx
+        lo, hi = sorted((min_idx, max_idx))
+        # Build the space-separated index list (inclusive range)
+        indices = " ".join(str(i) for i in range(lo, hi + 1))
+        if write_sysfs(path, indices):
+            success = True
+    return success
+
+
 def set_freq_range(min_mhz: int, max_mhz: int) -> bool:
-    """Set the GPU's frequency range. AMD uses pp_dpm_sclk; Intel uses gt_*_freq_mhz.
+    """Set the GPU's frequency range. AMD uses pp_od_clk_voltage; Intel uses gt_*_freq_mhz.
 
     For Intel, min and max must differ by at least 50 MHz to avoid a
     silent rejection by the driver.
     """
+    if _cards(OD_CLK_VOLTAGE):
+        return _amd_set_range_od(min_mhz, max_mhz)
     if _cards(DPM_FILE):
-        success = False
-        for path in _cards(DPM_FILE):
-            try:
-                with open(path, "r") as f:
-                    lines = f.readlines()
-                if not lines:
-                    continue
-                last_idx = len(lines) - 1
-                first_idx = next(
-                    (i for i, ln in enumerate(lines) if str(min_mhz) in ln and "Mhz" in ln),
-                    None,
-                )
-                if first_idx is None:
-                    first_idx = 0
-                lines[first_idx] = re.sub(
-                    r"\*?",
-                    "*",
-                    lines[first_idx].replace("*", ""),
-                    count=1,
-                ) if first_idx == last_idx else "*" + lines[first_idx].lstrip("*").lstrip()
-                for ln_idx, ln in enumerate(lines):
-                    if ln_idx == first_idx:
-                        lines[ln_idx] = "*" + ln.lstrip("*").lstrip() if "*" not in ln else ln
-                    else:
-                        lines[ln_idx] = ln.replace("*", " ", 1).lstrip() + " " if ln_idx == 0 else ln
-                with open(path, "w") as f:
-                    f.writelines(lines)
-                success = True
-            except (OSError, ValueError):
-                continue
-        return success
+        return _amd_set_range_dpm(min_mhz, max_mhz)
 
     if min_mhz >= max_mhz:
         max_mhz = min_mhz + 50
