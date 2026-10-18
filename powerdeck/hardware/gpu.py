@@ -35,22 +35,38 @@ def get_mode() -> str:
     """Approximate the current GPU mode from sysfs.
 
     "performance" / "high" -> "performance"; "low" -> "battery";
-    otherwise "auto".
+    "manual" -> "range"; otherwise "auto".
     """
     level = read_sysfs(_cards(DPM_LEVEL)[0] if _cards(DPM_LEVEL) else "", "auto")
     if level == "high":
         return MODE_PERFORMANCE
     if level == "low":
         return MODE_BATTERY
+    if level == "manual":
+        return MODE_RANGE
     return MODE_AUTO
 
 
 def set_mode(mode: str) -> bool:
-    level = {"battery": "low", "auto": "auto", "performance": "high"}.get(mode)
+    level_map = {
+        "battery": "low",
+        "auto": "auto",
+        "performance": "high",
+        "range": "manual",
+        "fixed": "manual",
+    }
+    level = level_map.get(mode)
     if not level:
         return False
+    paths = _cards(DPM_LEVEL)
+    if not paths:
+        # Intel: no power_dpm_force_performance_level sysfs.  On Intel
+        # GPUs, "range" and "fixed" are controlled entirely via
+        # gt_min_freq_mhz / gt_max_freq_mhz, so accept any mode and
+        # succeed (the frequency files carry the actual control).
+        return True
     success = False
-    for path in _cards(DPM_LEVEL):
+    for path in paths:
         if write_sysfs(path, level):
             success = True
     return success

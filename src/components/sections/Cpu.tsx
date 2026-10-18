@@ -1,8 +1,16 @@
 import { PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
 
 import { useSettings } from "../../settings/SettingsProvider";
-import { LabeledSlider, governorIcon, eppIcon } from "../shared";
+import { LabeledSlider, governorIcon, eppIcon, pstateIcon } from "../shared";
 import { EPP_DESCRIPTIONS, EPP_VALUES, GOVERNOR_DESCRIPTIONS, getOrderedGovernors } from "../../api";
+
+const PSTATE_NAMES = ["Active", "Passive", "Guided"];
+const PSTATE_DESCRIPTIONS = [
+  "OS controls via governor + EPP",
+  "OS controls frequency directly",
+  "Firmware-controlled (governor/EPP ignored)",
+];
+const PSTATE_MODES = ["active", "passive", "guided"];
 
 export function CpuSection() {
   const { state, applySettings } = useSettings();
@@ -58,6 +66,13 @@ export function CpuSection() {
   const eppName = orderedEppOptions[eppIdx] ?? profile.epp;
   const eppDesc = EPP_DESCRIPTIONS[eppName as string] ?? EPP_DESCRIPTIONS[profile.epp as string] ?? "";
 
+  // P-State mode index (computed once; defaults to Guided = 2)
+  const pstateModes: string[] = PSTATE_MODES;
+  const pstateIdx = Math.max(
+    0,
+    pstateModes.indexOf(pstateCaps?.current_mode ?? "guided")
+  );
+
   return (
     <PanelSection title="CPU Control">
       <PanelSectionRow>
@@ -78,10 +93,12 @@ export function CpuSection() {
             label="SMT (Hyperthreading)"
             checked={profile.smt}
             onChange={(enabled) => {
-              const adjusted =
-                !enabled && profile.cpuCores > Math.floor(maxCores / 2)
-                  ? Math.floor(maxCores / 2)
-                  : profile.cpuCores;
+              const smtDisabledMax = Math.floor(maxCores / 2);
+              const adjusted = !enabled
+                ? Math.min(profile.cpuCores, smtDisabledMax)
+                : (profile.cpuCores === smtDisabledMax
+                    ? maxCores
+                    : profile.cpuCores);
               applySettings({ smt: enabled as boolean, cpuCores: adjusted });
             }}
           />
@@ -94,6 +111,28 @@ export function CpuSection() {
             checked={profile.cpuBoost}
             onChange={(v) => applySettings({ cpuBoost: v as boolean })}
           />
+        </PanelSectionRow>
+      )}
+      {pstateCaps && pstateCaps.mode_switch_supported && (
+        <PanelSectionRow>
+          <LabeledSlider
+            label="CPU Driver Mode (P-State)"
+            value={pstateIdx}
+            min={0}
+            max={pstateModes.length - 1}
+            step={1}
+            notches={pstateModes.length}
+            valueIcons={pstateModes.map(pstateIcon)}
+            displayValue={PSTATE_NAMES[pstateIdx]}
+            onChange={(v) => applySettings({ pstateMode: pstateModes[v] })}
+            description={PSTATE_DESCRIPTIONS[pstateIdx]}
+          />
+          {pstateCaps.current_mode === "guided" && (
+            <div style={{ padding: "8px 12px", color: "#ffb366", fontSize: "0.8em" }}>
+              Governor and EPP are ignored in Guided mode. Switch to "Active"
+              for those settings to take effect.
+            </div>
+          )}
         </PanelSectionRow>
       )}
       {showGovernor && (

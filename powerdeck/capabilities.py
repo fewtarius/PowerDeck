@@ -275,7 +275,7 @@ def _available_fan_profiles() -> List[str]:
     ]
     out: set = set()
     for path in sorted(glob.glob("/sys/class/hwmon/hwmon*/name")):
-        if _read(path) in ("asus_custom_fan_curve", "steamfork_fan"):
+        if _read(path) in ("asus_custom_fan_curve", "steamfork_fan", "oxp_ec"):
             out.add("auto")
             out.add("quiet")
             out.add("moderate")
@@ -436,7 +436,7 @@ def detect() -> Capabilities:
 
     # Fan
     caps.has_fan_control = any(
-        _read(p) in ("steamfork_fan", "asus_custom_fan_curve")
+        _read(p) in ("steamfork_fan", "asus_custom_fan_curve", "oxp_ec")
         for p in glob.glob("/sys/class/hwmon/hwmon*/name")
     )
 

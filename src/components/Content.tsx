@@ -4,7 +4,6 @@ import { SettingsProvider, useSettings } from "../settings/SettingsProvider";
 import { DeviceStatusSection } from "./sections/DeviceStatus";
 import { CoolingSection } from "./sections/Cooling";
 import { RogAllyFansSection } from "./sections/RogAllyFans";
-import { PstateSection } from "./sections/Pstate";
 import { TdpSection } from "./sections/Tdp";
 import { PlatformProfileSection } from "./sections/PlatformProfile";
 import { RogAllyThermalSection } from "./sections/RogAllyThermal";
@@ -50,8 +49,6 @@ function Sections() {
 
       {device.has_fan_control && !isRogAlly && <CoolingSection />}
       {isRogAlly && caps.rog_ally?.available_controls?.fan_control && <RogAllyFansSection />}
-
-      {caps.pstate && caps.pstate.mode_switch_supported && <PstateSection />}
 
       {!device.powerControl?.platform_profile_available && caps.tdp_control.available && <TdpSection />}
       {!caps.tdp_control.available && caps.tdp_control.has_soft_control && <TdpSection softMode />}
