@@ -202,6 +202,25 @@ def _detect_power_control_method() -> PowerControlCapabilities:
 
 
 def _count_cpu_cores() -> int:
+    """Count the total *logical* CPU count (including offline threads).
+
+    ``os.cpu_count()`` follows the process' CPU affinity and the online
+    CPU mask — on systems where secondary threads are offline (e.g. an
+    SMT-disabled profile, or hotplug offlining some CPUs), it returns
+    the *online* count rather than the hardware-present count.  On a
+    Ryzen Z1 Extreme this returns 6 instead of 16, making the core
+    slider cap at 5 even with SMT enabled.
+
+    Instead we count the ``cpuN`` directories under /sys/devices/system,
+    which reflects the hardware topology regardless of online/offline
+    state.
+    """
+    try:
+        count = len(glob.glob(os.path.join("/sys/devices/system/cpu", "cpu[0-9]*")))
+        if count > 0:
+            return max(1, count)
+    except Exception:
+        pass
     try:
         return max(1, os.cpu_count() or 1)
     except Exception:
