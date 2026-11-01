@@ -202,11 +202,14 @@ def get_profile() -> str:
             return "auto"
         return "moderate"
 
-    # oxp_ec (non-JELOS SteamFork / AYANEO): pwm1_enable 0 = auto
+    # oxp_ec (non-JELOS SteamFork / AYANEO): pwm1_enable 2 = the EC
+    # curve, 1 = manual control.  0 only stops the driver from writing
+    # the PWM register and leaves the fan latched at its last duty, so
+    # it is never a valid reading of "auto".
     oxp = _curve_hwmon("oxp_ec")
     if oxp:
         raw = read_sysfs(os.path.join(oxp, "pwm1_enable"))
-        if raw == "0":
+        if raw == "2":
             return "auto"
         return "moderate"
 
