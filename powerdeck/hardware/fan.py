@@ -63,21 +63,61 @@ def _has_jelos_fan() -> bool:
     return os.path.exists("/usr/bin/jelos-fancontrol")
 
 
+def _reload_jelos_fancontrol() -> None:
+    """Ask the jelos-fancontrol daemon to reload cooling.profile.
+
+    The daemon re-reads cooling.profile when it is signalled with SIGHUP
+    and keeps running, so signalling it applies the new curve without
+    restarting the unit.  A signal aimed at a stopped unit does nothing,
+    so the daemon is started when it is not running - it reads the
+    profile at startup.
+    """
+    try:
+        subprocess.run(
+            ["systemctl", "kill", "-s", "SIGHUP", "jelos-fancontrol"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception:
+        # If systemctl isn't available, signal the daemon directly.
+        try:
+            subprocess.run(["pkill", "-HUP", "-f", "devicequirks/.*/bin/fancontrol"],
+                           capture_output=True, text=True, timeout=5)
+        except Exception:
+            pass
+
+    try:
+        active = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "jelos-fancontrol"],
+            capture_output=True, text=True, timeout=5,
+        ).returncode == 0
+    except Exception:
+        active = False
+
+    if not active:
+        try:
+            subprocess.run(["systemctl", "start", "jelos-fancontrol"],
+                           capture_output=True, text=True, timeout=10)
+        except Exception:
+            pass
+
+
 def _set_jelos_profile(profile: str) -> bool:
     """Set a cooling profile on JELOS via jelos-set-setting + service pulse.
 
-    The jelos-fancontrol daemon reads cooling.profile at startup (and on
-    SIGHUP), so we update the setting and then send SIGHUP to the running
-    service so it picks up the new curve immediately.
+    The jelos-fancontrol daemon reads cooling.profile at startup and
+    re-reads it when it receives SIGHUP, so we update the setting and
+    then signal the running service so it picks up the new curve
+    immediately.
     """
     if not _has_jelos_fan():
         # Fall back to raw pwm1_enable toggle on the oxp_ec hwmon.
+        # 2 hands the fan to the EC curve, 1 takes manual control.
         oxp = _curve_hwmon("oxp_ec")
         if not oxp:
             return False
         enable_path = os.path.join(oxp, "pwm1_enable")
         if profile == "auto":
-            return write_sysfs(enable_path, "0")
+            return write_sysfs(enable_path, "2")
         return write_sysfs(enable_path, "1")
 
     try:
@@ -88,20 +128,9 @@ def _set_jelos_profile(profile: str) -> bool:
     except Exception:
         pass
 
-    # Send SIGHUP to the daemon so it re-reads the new profile and
-    # reapplies the corresponding PWM curve.
-    try:
-        subprocess.run(
-            ["systemctl", "kill", "-s", "SIGHUP", "jelos-fancontrol"],
-            capture_output=True, text=True, timeout=5,
-        )
-    except Exception:
-        # If systemctl isn't available, try killing by name.
-        try:
-            subprocess.run(["pkill", "-HUP", "jelos-fancontrol"],
-                           capture_output=True, text=True, timeout=5)
-        except Exception:
-            pass
+    # Reload the profile in the daemon so it reapplies the corresponding
+    # PWM curve.
+    _reload_jelos_fancontrol()
 
     return True
 
@@ -139,12 +168,14 @@ def set_profile(profile: str) -> bool:
         return write_sysfs(enable_path, "1")
 
     # oxp_ec / AYANEO handhelds (non-JELOS SteamFork): pwm1_enable
-    # 0 = automatic (daemon off), 1 = manual (daemon on).
+    # 2 = the EC curve, 1 = manual (daemon on).  Writing 0 only stops the
+    # driver from updating the PWM register - the fan then sits at the
+    # last value that was written, with no thermal feedback.
     oxp = _curve_hwmon("oxp_ec")
     if oxp:
         enable_path = os.path.join(oxp, "pwm1_enable")
         if profile == "auto":
-            return write_sysfs(enable_path, "0")
+            return write_sysfs(enable_path, "2")
         return write_sysfs(enable_path, "1")
 
     asus = _curve_hwmon("asus_custom_fan_curve")
