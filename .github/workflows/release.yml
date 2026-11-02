@@ -63,8 +63,14 @@ jobs:
         run: |
           if [ -f "VERSION" ]; then
             chmod +x update-version.sh
-            ./update-version.sh
-            echo "Version synchronized from VERSION file"
+            # --sync keeps the version as it is.  Without it the script
+            # bumps the patch number, so the package would carry a
+            # version one higher than the tag it was released under -
+            # the plugin would then report a version that no release
+            # exists for and the in-plugin updater would offer that
+            # older release forever.
+            ./update-version.sh --sync
+            echo "Version synchronized from VERSION file: $(cat VERSION)"
           else
             echo "VERSION file not found, using existing versions"
           fi

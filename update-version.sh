@@ -1,11 +1,28 @@
 #!/bin/bash
 # Update version in package.json and plugin.json from VERSION file
 # If no VERSION file, reads from git tag and increments patch version
+#
+# Usage:
+#   update-version.sh          bump the patch version (local development)
+#   update-version.sh --sync   keep the VERSION file as it is (release build)
+#
+# The release build must use --sync: the version that goes into the
+# package has to match the release tag, otherwise the plugin reports a
+# version that no release exists for and the in-plugin updater offers
+# to "update" to an older release forever.
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" & pwd)"
 VERSION_FILE="$SCRIPT_DIR/VERSION"
+
+SYNC=false
+for arg in "$@"; do
+  case "${arg}" in
+    --sync) SYNC=true ;;
+    *) echo "ERROR: Unknown argument: ${arg}" >&2; exit 1 ;;
+  esac
+done
 
 # Function to increment patch version
 increment_version() {
@@ -52,8 +69,13 @@ if [ -z "$CURRENT_VERSION" ]; then
     exit 1
 fi
 
-# Increment version for new release
-VERSION=$(increment_version "$CURRENT_VERSION")
+if [ "$SYNC" = "true" ]; then
+    # Release build: the package has to carry the version of the tag.
+    VERSION="$CURRENT_VERSION"
+else
+    # Local development: bump the patch version for the next build.
+    VERSION=$(increment_version "$CURRENT_VERSION")
+fi
 
 echo "Current version: $CURRENT_VERSION"
 echo "New version: $VERSION"
