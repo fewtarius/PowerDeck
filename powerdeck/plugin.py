@@ -19,6 +19,7 @@ from typing import Any, Dict, Optional
 import decky_plugin
 
 from . import capabilities, updates
+from ._env import clean_env
 from .device_controllers import rog_ally
 from . import controller_emulation
 from .hardware import (
@@ -180,7 +181,8 @@ class Plugin:
         """
         try:
             result = subprocess.run(
-                ["ps", "aux"], capture_output=True, text=True, timeout=3
+                ["ps", "aux"], capture_output=True, text=True, timeout=3,
+                env=clean_env(),
             )
         except Exception:
             return GAME_DEFAULT_ID

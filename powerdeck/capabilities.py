@@ -21,6 +21,8 @@ import subprocess
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from ._env import clean_env
+
 
 # Files that indicate this device supports the relevant control.
 SMT_CONTROL = "/sys/devices/system/cpu/smt/control"
@@ -493,6 +495,7 @@ def detect() -> Capabilities:
             ],
             capture_output=True,
             timeout=2,
+            env=clean_env(),
         )
         caps.steamos_manager_available = b"true" in out.stdout
     except Exception:

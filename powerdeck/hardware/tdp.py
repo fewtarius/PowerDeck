@@ -20,6 +20,7 @@ import shutil
 import subprocess
 from typing import List, Optional, Tuple
 
+from .._env import clean_env
 from ._sysfs import file_exists, read_sysfs, write_sysfs
 
 
@@ -107,6 +108,7 @@ def set_tdp_native(
             cmd,
             capture_output=True,
             timeout=5,
+            env=clean_env(),
             text=True,
             check=False,
         )
@@ -143,7 +145,8 @@ def get_tdp_native() -> Optional[int]:
     if not path:
         return None
     try:
-        result = subprocess.run([path, "-i"], capture_output=True, timeout=5, text=True)
+        result = subprocess.run([path, "-i"], capture_output=True, timeout=5, text=True,
+                               env=clean_env())
         for line in result.stdout.splitlines():
             if "STAPM LIMIT" in line.upper():
                 parts = line.split()

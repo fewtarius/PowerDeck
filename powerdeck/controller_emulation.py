@@ -20,6 +20,8 @@ from typing import List, Optional, Tuple
 
 import decky_plugin  # noqa: F401 - this module always runs inside Decky
 
+from ._env import clean_env
+
 
 # The canonical list of InputPlumber target devices. The frontend
 # lets the user pick one of these; "default" is a UI-only label that
@@ -154,7 +156,7 @@ def _list_targets() -> List[str]:
     try:
         out = subprocess.run(
             ["inputplumber", "device", "0", "targets", "list"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, env=clean_env(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
@@ -186,7 +188,7 @@ def _set_targets(targets: List[str]) -> bool:
     try:
         out = subprocess.run(
             ["inputplumber", "device", "0", "targets", "set", *targets],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, env=clean_env(),
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False

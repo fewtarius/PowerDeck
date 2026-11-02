@@ -32,6 +32,8 @@ from typing import Optional
 
 import decky_plugin
 
+from ._env import clean_env
+
 
 GITHUB_API = "https://api.github.com/repos/fewtarius/PowerDeck/releases/latest"
 STAGING_DIR = "/tmp/powerdeck_staged_update"
@@ -257,13 +259,9 @@ def install_staged_update() -> dict:
         # Restart plugin_loader with a clean environment to avoid OpenSSL conflicts
         # The Decky/Python runtime may set LD_LIBRARY_PATH to a PyInstaller temp
         # dir containing an incompatible libcrypto.so.3, which breaks systemctl.
-        clean_env = os.environ.copy()
-        for var in ("LD_LIBRARY_PATH", "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD"):
-            clean_env.pop(var, None)
-
         restart_result = subprocess.run(
             ["systemctl", "restart", "plugin_loader"],
-            env=clean_env,
+            env=clean_env(),
             check=False,
             timeout=15,
             capture_output=True,

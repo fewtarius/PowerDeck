@@ -21,7 +21,17 @@ import os
 import subprocess
 from typing import List, Optional
 
+from .._env import clean_env
 from ._sysfs import file_exists, read_sysfs, write_sysfs
+
+
+def _log(message: str) -> None:
+    """Report a problem through the Decky logger when running inside it."""
+    try:
+        import decky_plugin
+        decky_plugin.logger.warning(message)
+    except Exception:
+        pass
 
 
 PROFILES = ["auto", "quiet", "moderate", "aggressive"]
@@ -75,20 +85,20 @@ def _reload_jelos_fancontrol() -> None:
     try:
         subprocess.run(
             ["systemctl", "kill", "-s", "SIGHUP", "jelos-fancontrol"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, env=clean_env(),
         )
     except Exception:
         # If systemctl isn't available, signal the daemon directly.
         try:
             subprocess.run(["pkill", "-HUP", "-f", "devicequirks/.*/bin/fancontrol"],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, timeout=5, env=clean_env())
         except Exception:
             pass
 
     try:
         active = subprocess.run(
             ["systemctl", "is-active", "--quiet", "jelos-fancontrol"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, env=clean_env(),
         ).returncode == 0
     except Exception:
         active = False
@@ -96,7 +106,7 @@ def _reload_jelos_fancontrol() -> None:
     if not active:
         try:
             subprocess.run(["systemctl", "start", "jelos-fancontrol"],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10, env=clean_env())
         except Exception:
             pass
 
@@ -121,12 +131,24 @@ def _set_jelos_profile(profile: str) -> bool:
         return write_sysfs(enable_path, "1")
 
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["jelos-set-setting", "cooling.profile", profile],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, env=clean_env(),
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        _log(f"cooling profile write failed: {exc}")
+        return False
+
+    if result.returncode != 0:
+        # The helper could not run, or it refused the write.  Report it
+        # instead of pretending it worked: the fan would otherwise keep
+        # running the previous profile with no indication that the
+        # change was never applied.
+        _log(
+            "jelos-set-setting cooling.profile %s failed (rc=%s): %s"
+            % (profile, result.returncode, (result.stderr or "").strip())
+        )
+        return False
 
     # Reload the profile in the daemon so it reapplies the corresponding
     # PWM curve.
@@ -140,14 +162,18 @@ def _get_jelos_profile() -> str:
     try:
         result = subprocess.run(
             ["jelos-get-setting", "cooling.profile"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, env=clean_env(),
         )
         if result.returncode == 0 and result.stdout.strip():
             profile = result.stdout.strip()
             if profile in PROFILES:
                 return profile
-    except Exception:
-        pass
+        _log(
+            "jelos-get-setting cooling.profile failed (rc=%s): %s"
+            % (result.returncode, (result.stderr or "").strip())
+        )
+    except Exception as exc:
+        _log(f"cooling profile read failed: {exc}")
     return "moderate"
 
 
