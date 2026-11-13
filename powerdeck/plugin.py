@@ -430,7 +430,13 @@ class Plugin:
             # fought those fields.
             return True
         if native:
-            return tdp_mod.set_tdp(int(watts), prefer_native=True)[0]
+            return tdp_mod.set_tdp(
+                int(watts),
+                prefer_native=True,
+                fast_max=caps.tdp_fast_max,
+                slow_max=caps.tdp_slow_max,
+                burst_delta=caps.tdp_burst_delta,
+            )[0]
         if caps.gpu_vendor == "intel":
             # Intel exposes RAPL on platform_profile-less devices.
             return tdp_mod.set_tdp(int(watts), prefer_native=False)[0]
@@ -501,6 +507,12 @@ class Plugin:
                     "min": caps.tdp_min,
                     "max": caps.tdp_max,
                     "current": caps.default_tdp,
+                    # Measured ceilings, when the spec table has them.
+                    # slow_max below the chosen watts means the part bursts
+                    # to that figure but sustains only slow_max.
+                    "fast_max": caps.tdp_fast_max,
+                    "slow_max": caps.tdp_slow_max,
+                    "burst_delta": caps.tdp_burst_delta,
                 },
                 "tdp_control": self._tdp_control_availability(caps),
                 "pstate": self._pstate_caps(),

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 import unittest
 from unittest import mock
 
@@ -108,10 +109,12 @@ class ApplyTdpRoutingTests(unittest.TestCase):
         self.p.capabilities = capabilities.Capabilities()
         self.calls = {"set_tdp": [], "soft": [], "native": []}
 
-        def fake_set_tdp(w, *, prefer_native=True):
+        def fake_set_tdp(w, *, prefer_native=True, **kwargs):
             self.calls["set_tdp"].append((w, prefer_native))
             return False, "soft_fallback"
         self.p._apply_tdp_soft = lambda w: (self.calls["soft"].append(w), True)[1]
+        original = tdp_mod.set_tdp
+        self.addCleanup(setattr, tdp_mod, "set_tdp", original)
         tdp_mod.set_tdp = fake_set_tdp
 
     def test_native_device_calls_set_tdp_prefers_native(self):
@@ -427,7 +430,9 @@ class TdpOwnershipTests(unittest.TestCase):
         self.p.__dict__.pop("capabilities", None)
         self.p.capabilities = capabilities.Capabilities()
         self.calls = []
-        tdp_mod.set_tdp = lambda w, prefer_native=True: (
+        original = tdp_mod.set_tdp
+        self.addCleanup(setattr, tdp_mod, "set_tdp", original)
+        tdp_mod.set_tdp = lambda w, prefer_native=True, **kwargs: (
             self.calls.append((w, prefer_native)), (True, "ok")
         )[1]
         self.p._apply_tdp_soft = lambda w: (self.calls.append(("soft", w)), True)[1]
@@ -471,7 +476,7 @@ class TdpOwnershipTests(unittest.TestCase):
 
 
 class TdpRangeTests(unittest.TestCase):
-    """The slider ceiling comes from the hardware, not a hardcoded 25W."""
+    """The slider ceiling comes from the spec table, not the live SMU."""
 
     def setUp(self):
         capabilities._TDP_RANGE_CACHE = None
@@ -481,18 +486,106 @@ class TdpRangeTests(unittest.TestCase):
         capabilities._TDP_RANGE_CACHE = None
         capabilities._SMU_INFO_CACHE = None
 
-    def test_smu_apu_ceiling_raises_max(self):
+    def test_spec_ceiling_wins_over_live_smu(self):
+        # PPT LIMIT APU reports what the firmware is currently set to, not
+        # what the part is rated for. The 70W reading on the Emdoor N161L
+        # must not become the slider ceiling when AMD rates the part at 120W.
         with mock.patch.object(capabilities, "_ryzenadj_smu_info",
-                               return_value={"PPT LIMIT APU": 70.0, "STAPM LIMIT": 55.0}):
+                               return_value={"PPT LIMIT APU": 70.0, "STAPM LIMIT": 55.0}), \
+                mock.patch("powerdeck.hardware.processor_db.tdp_bounds",
+                           return_value={"min": 45, "max": 120, "default": 55}):
             tdp_min, tdp_max, default = capabilities._tdp_limits_from_processor_db()
-        self.assertEqual(tdp_min, 4)
-        self.assertEqual(tdp_max, 70)
-        self.assertEqual(default, 55, "unset profiles should show the firmware limit")
+        self.assertEqual(tdp_max, 120, "cTDP ceiling must come from the spec table")
+        self.assertEqual(tdp_min, 4, "floor stays low so battery profiles can save power")
+        self.assertEqual(default, 55, "live STAPM is what an unset profile displays")
 
     def test_falls_back_when_smu_unreadable(self):
-        with mock.patch.object(capabilities, "_ryzenadj_smu_info", return_value={}):
+        with mock.patch.object(capabilities, "_ryzenadj_smu_info", return_value={}), \
+                mock.patch("powerdeck.hardware.processor_db.tdp_bounds", return_value=None):
             tdp_min, tdp_max, default = capabilities._tdp_limits_from_processor_db()
         self.assertEqual((tdp_min, tdp_max, default), (4, 25, 15))
+
+
+class TieredBurstTests(unittest.TestCase):
+    """STAPM is sustained; fast/slow burst above it up to measured ceilings."""
+
+    def test_120w_matches_measured_config(self):
+        # Verified on Strix Halo: stapm 120, fast 120, slow 100.
+        self.assertEqual(
+            tdp_mod.tiered_limits(120, fast_max=120, slow_max=100, burst_delta=25),
+            (120, 120, 100),
+        )
+
+    def test_slow_stays_capped_below_stapm(self):
+        # A part rated to 120W but measuring a 100W slow ceiling sustains
+        # 100W. Flooring slow to stapm would lie about sustained watts.
+        stapm, _, slow = tdp_mod.tiered_limits(120, fast_max=120, slow_max=100,
+                                               burst_delta=25)
+        self.assertEqual(slow, 100)
+        self.assertLess(slow, stapm)
+
+    def test_burst_above_sustained_at_moderate_wattage(self):
+        self.assertEqual(
+            tdp_mod.tiered_limits(55, fast_max=120, slow_max=100, burst_delta=25),
+            (55, 80, 68),
+        )
+
+    def test_no_ceilings_collapses_to_sustained(self):
+        self.assertEqual(tdp_mod.tiered_limits(55), (55, 55, 55))
+
+    def test_fast_never_below_stapm(self):
+        stapm, fast, _ = tdp_mod.tiered_limits(100, fast_max=120, burst_delta=5)
+        self.assertGreaterEqual(fast, stapm)
+
+    def test_set_tdp_passes_tiered_values_and_apu_limit(self):
+        captured = {}
+
+        def fake_native(watts, **kwargs):
+            captured["watts"] = watts
+            captured.update(kwargs)
+            return True
+
+        with mock.patch.object(tdp_mod, "set_tdp_native", side_effect=fake_native):
+            ok, method = tdp_mod.set_tdp(120, fast_max=120, slow_max=100, burst_delta=25)
+        self.assertTrue(ok)
+        self.assertEqual(method, "ryzenadj")
+        self.assertEqual(captured["stapm_limit"], 120_000)
+        self.assertEqual(captured["fast_limit"], 120_000)
+        self.assertEqual(captured["sustained_limit"], 100_000)
+        self.assertEqual(captured["apu_slow_limit"], 120_000)
+
+
+class SkinTempFlagTests(unittest.TestCase):
+    """--apu-skin-temp aborts the whole ryzenadj run on parts without one."""
+
+    def test_ai_max_detected_as_strix_halo(self):
+        # /proc/cpuinfo reports the marketing name, never "Strix Halo".
+        cpuinfo = "model name\t: AMD RYZEN AI MAX+ 395 w/ Radeon 8060S\n"
+        with mock.patch("builtins.open", mock.mock_open(read_data=cpuinfo)):
+            self.assertTrue(tdp_mod.is_strix_halo())
+
+    def test_non_halo_not_flagged(self):
+        cpuinfo = "model name\t: AMD Ryzen 7 7840U w/ Radeon 780M\n"
+        with mock.patch("builtins.open", mock.mock_open(read_data=cpuinfo)):
+            self.assertFalse(tdp_mod.is_strix_halo())
+
+    def test_retries_without_skin_temp_when_family_rejects_it(self):
+        calls = []
+        reject = subprocess.CompletedProcess(
+            args=[], returncode=255, stdout="",
+            stderr="set_apu_skin_temp_limit is not supported on this family",
+        )
+        ok = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        def fake_run(args, **kwargs):
+            calls.append(list(args))
+            return reject if any(a.startswith("--apu-skin-temp") for a in args) else ok
+
+        with mock.patch.object(tdp_mod.subprocess, "run", side_effect=fake_run):
+            result = tdp_mod.set_tdp_native(55, omit_skin_temp=False)
+        self.assertTrue(result, "must succeed after dropping the unsupported flag")
+        self.assertTrue(any("--apu-skin-temp" in " ".join(a) for a in calls))
+        self.assertFalse("--apu-skin-temp" in " ".join(calls[-1]))
 
 
 if __name__ == "__main__":

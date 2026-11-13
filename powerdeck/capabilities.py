@@ -91,6 +91,13 @@ class Capabilities:
     tdp_min: int = 4
     tdp_max: int = 25
     default_tdp: int = 15
+    # Tiered burst ceilings. STAPM is the sustained limit the user picks;
+    # fast/slow may burst above it up to these ceilings. None means the
+    # processor spec table has no measured values, in which case the
+    # sustained value is used for all three.
+    tdp_fast_max: Optional[int] = None
+    tdp_slow_max: Optional[int] = None
+    tdp_burst_delta: Optional[int] = None
 
     has_fan_control: bool = False
     supports_cpu_boost: bool = False
@@ -414,13 +421,22 @@ def _ryzenadj_smu_info() -> Dict[str, float]:
 def _tdp_limits_from_processor_db() -> Tuple[int, int, int]:
     """Return (min, max, default) TDP for the running processor.
 
-    ``max`` is the ceiling the power slider offers; ``default`` is the
-    value shown when a profile carries no TDP, and reflects the limit the
+    ``max`` is the ceiling the power slider offers. It comes from AMD's
+    published cTDP range, because runtime probes cannot answer this: the
+    SMU's ``PPT LIMIT APU`` reports the limit the firmware is *currently*
+    set to, not what the silicon is rated for. On the Emdoor N161L that
+    reads 70W against an AMD-published 45-120W range.
+
+    ``default`` is the value shown when a profile carries no TDP. That is
+    the live ``STAPM LIMIT``, so an untouched profile displays what the
     firmware actually shipped with rather than an invented number.
 
-    Intel takes its bound from RAPL. AMD reads the SMU's APU ceiling
-    (``PPT LIMIT APU``) via ryzenadj - the OEM-configured package budget.
-    Falls back to the conservative 4-25W range when neither is readable.
+    ``min`` stays low even when the spec table gives a higher cTDP floor.
+    Battery profiles are expected to go under the vendor minimum - it is
+    proven to work on this hardware and is the point of the slider.
+
+    Intel takes its bound from RAPL. Falls back to 4-25W when nothing is
+    readable.
     """
     global _TDP_RANGE_CACHE
     if _TDP_RANGE_CACHE is not None:
@@ -439,20 +455,55 @@ def _tdp_limits_from_processor_db() -> Tuple[int, int, int]:
         except (ValueError, OSError):
             pass
 
-    info = _ryzenadj_smu_info()
-    ceiling = info.get("PPT LIMIT APU")
-    if ceiling and ceiling >= tdp_max:
-        tdp_max = int(round(ceiling))
+    # Spec ceiling for this exact part.
+    try:
+        from .hardware.processor_db import tdp_bounds
 
+        bounds = tdp_bounds()
+    except Exception:
+        bounds = None
+    if bounds and bounds.get("max"):
+        tdp_max = max(bounds["max"], tdp_max)
+        if bounds.get("default"):
+            default = bounds["default"]
+
+    info = _ryzenadj_smu_info()
     current = info.get("STAPM LIMIT")
     if current and current > 0:
         default = int(round(current))
-    elif tdp_max > 25:
+    elif not bounds and tdp_max > 25:
         default = max(25, tdp_max // 2)
 
     default = max(tdp_min, min(default, tdp_max))
     _TDP_RANGE_CACHE = (tdp_min, tdp_max, default)
     return _TDP_RANGE_CACHE
+
+
+def _tdp_burst_ceilings() -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Return (fast_max, slow_max, burst_delta) for the running processor.
+
+    Only parts with measured values in the spec table return anything.
+    AMD does not publish PPT fast/slow ceilings, so inventing them for
+    every CPU would mean writing watts the silicon may refuse.
+    """
+    try:
+        from .hardware.processor_db import find_running
+
+        entry = find_running()
+    except Exception:
+        return None, None, None
+    if not entry:
+        return None, None, None
+
+    def _int(key: str) -> Optional[int]:
+        value = entry.get(key)
+        return value if isinstance(value, int) and value > 0 else None
+
+    return (
+        _int("tdp_fast_limit_max"),
+        _int("tdp_slow_limit_max"),
+        _int("tdp_burst_delta"),
+    )
 
 
 def _battery_charge_limit_available() -> bool:
@@ -527,6 +578,17 @@ def detect() -> Capabilities:
     except Exception:
         pass
 
+    # CPU marketing name. This is what the spec table is keyed on, so the
+    # UI and the TDP ceiling must agree on it.
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.lower().startswith("model name"):
+                    caps.cpu_name = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+
     # CPU + SMT + cores
     caps.cpu_core_count = _count_cpu_cores()
     caps.max_cpu_cores = caps.cpu_core_count
@@ -536,6 +598,7 @@ def detect() -> Capabilities:
 
     # TDP limits
     caps.tdp_min, caps.tdp_max, caps.default_tdp = _tdp_limits_from_processor_db()
+    caps.tdp_fast_max, caps.tdp_slow_max, caps.tdp_burst_delta = _tdp_burst_ceilings()
 
     # Fan
     caps.has_fan_control = any(

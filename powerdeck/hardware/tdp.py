@@ -48,17 +48,68 @@ def _find_ryzenadj() -> Optional[str]:
 def is_strix_halo() -> bool:
     """Heuristic: AMD Strix Halo (Ryzen AI MAX) lacks a skin-temp sensor.
 
-    The actual detection comes from CPU family/model; we use a wider
-    matcher because the precise family IDs vary across kernel versions.
-    Fall back to True if /proc/cpuinfo mentions "Strix Halo" anywhere.
+    Passing ``--apu-skin-temp`` to ryzenadj on these parts exits 255 with
+    "set_apu_skin_temp_limit is not supported on this family" and aborts
+    the whole run, so every other limit in the same invocation is lost.
+
+    /proc/cpuinfo reports the marketing name ("AMD RYZEN AI MAX+ 395"),
+    never the codename, so matching on "Strix Halo" alone silently fails
+    and re-introduces the 255. Match the product family too.
     """
     try:
         with open("/proc/cpuinfo", "r") as f:
-            if "Strix Halo" in f.read():
-                return True
+            cpuinfo = f.read().upper()
+        if "STRIX HALO" in cpuinfo:
+            return True
+        if "AI MAX" in cpuinfo or "GORGON HALO" in cpuinfo:
+            return True
     except OSError:
         pass
     return False
+
+
+def tiered_limits(
+    watts: int,
+    *,
+    fast_max: Optional[int] = None,
+    slow_max: Optional[int] = None,
+    burst_delta: Optional[int] = None,
+) -> Tuple[int, int, int]:
+    """Split a sustained wattage into (stapm, fast, slow) in watts.
+
+    STAPM is what the chip is allowed to hold indefinitely. Fast and slow
+    are the short and medium PPT windows, which are allowed to burst
+    above STAPM so a brief load does not get pre-emptively throttled to
+    the sustained figure.
+
+      fast = min(stapm + burst_delta, fast_max)
+      slow = min(stapm * 1.25,          slow_max)
+
+    Without measured ceilings for the part, all three collapse to the
+    sustained value - guessing headroom would mean writing watts the
+    silicon may reject.
+
+    ``slow`` may come out below ``stapm`` when the part's measured slow
+    ceiling is lower than the requested sustained figure - the 395 tops
+    out at 120W cTDP but measures a 100W slow ceiling, so a 120W request
+    is 120W burst and 100W sustained. Do not floor it to ``stapm``; that
+    would silently promise sustained watts the part cannot hold.
+    """
+    stapm = max(1, int(watts))
+    if not burst_delta and not fast_max and not slow_max:
+        return stapm, stapm, stapm
+
+    delta = burst_delta if burst_delta and burst_delta > 0 else 25
+    fast = stapm + delta
+    if fast_max:
+        fast = min(fast, fast_max)
+    fast = max(fast, stapm)
+
+    slow = int(stapm * 1.25)
+    if slow_max:
+        slow = min(slow, slow_max)
+
+    return stapm, fast, slow
 
 
 def set_tdp_native(
@@ -68,6 +119,7 @@ def set_tdp_native(
     fast_limit: Optional[int] = None,
     sustained_limit: Optional[int] = None,
     stapm_limit: Optional[int] = None,
+    apu_slow_limit: Optional[int] = None,
 ) -> bool:
     """Write STAPM/fast/slow via ryzenadj. Returns True on success.
 
@@ -95,6 +147,10 @@ def set_tdp_native(
         f"--slow-limit={sustained_limit}",
         f"--tctl-temp={int(os.environ.get('POWERDECK_TCTL_TEMP', 95))}",
     ]
+    # PPT LIMIT APU is the package-wide window. Leave it alone unless the
+    # caller asks, because it also gates the iGPU on an APU.
+    if apu_slow_limit is not None:
+        cmd.append(f"--apu-slow-limit={apu_slow_limit}")
     if not omit_skin_temp:
         # ryzenadj's flag is --apu-skin-temp and takes degrees C (not mW).
         # Older PowerDeck revisions passed a milliwatt-scaled value to a
@@ -103,16 +159,31 @@ def set_tdp_native(
         # silently failed to apply.
         cmd.append(f"--apu-skin-temp={int(os.environ.get('POWERDECK_SKIN_TEMP', 95))}")
 
-    try:
-        result = subprocess.run(
-            cmd,
+    def _run(args: List[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            args,
             capture_output=True,
             timeout=5,
             env=clean_env(),
             text=True,
             check=False,
         )
-        return result.returncode == 0
+
+    try:
+        result = _run(cmd)
+        if result.returncode == 0:
+            return True
+        # A family that rejects --apu-skin-temp aborts the entire run, so
+        # the STAPM/PPT writes in the same invocation are lost. Detection
+        # is name-based and new silicon ships faster than this file is
+        # updated, so retry once without the flag before giving up.
+        output = f"{result.stdout or ''}{result.stderr or ''}"
+        # ryzenadj spells the failure "set_apu_skin_temp_limit" (underscores)
+        # while the flag is --apu-skin-temp (hyphens). Match either.
+        if "skin_temp" in output or "skin-temp" in output:
+            retry = [arg for arg in cmd if not arg.startswith("--apu-skin-temp")]
+            return _run(retry).returncode == 0
+        return False
     except (subprocess.SubprocessError, FileNotFoundError):
         return False
 
@@ -126,13 +197,35 @@ def set_tdp_sysfs(watts: int) -> bool:
     return write_sysfs(path, str(uw))
 
 
-def set_tdp(watts: int, *, prefer_native: bool = True) -> Tuple[bool, str]:
+def set_tdp(
+    watts: int,
+    *,
+    prefer_native: bool = True,
+    fast_max: Optional[int] = None,
+    slow_max: Optional[int] = None,
+    burst_delta: Optional[int] = None,
+) -> Tuple[bool, str]:
     """Single TDP set. Returns (ok, method).
 
     method is one of: "ryzenadj", "sysfs", "soft_fallback".
+
+    ``watts`` is the sustained limit; fast/slow burst above it using the
+    part's measured ceilings when the spec table has them.
     """
     if prefer_native:
-        if set_tdp_native(watts):
+        stapm, fast, slow = tiered_limits(
+            watts, fast_max=fast_max, slow_max=slow_max, burst_delta=burst_delta
+        )
+        ok = set_tdp_native(
+            watts,
+            stapm_limit=stapm * 1000,
+            fast_limit=fast * 1000,
+            sustained_limit=slow * 1000,
+            # PPT LIMIT APU gates the whole package including the iGPU, so
+            # it has to be high enough that the burst ceiling is reachable.
+            apu_slow_limit=fast * 1000,
+        )
+        if ok:
             return True, "ryzenadj"
     if set_tdp_sysfs(watts):
         return True, "sysfs"

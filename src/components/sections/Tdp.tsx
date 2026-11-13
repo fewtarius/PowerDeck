@@ -25,6 +25,12 @@ export function TdpSection({ softMode = false }: TdpSectionProps) {
   // commits a limit into the profile and takes ownership from then on.
   const managed = profileTdp != null;
   const tdp = Math.min(Math.max(profileTdp ?? limits.current ?? min, min), max);
+  // A part can be rated to a burst figure it cannot hold indefinitely.
+  // The 395 tops out at 120W cTDP but measures a 100W slow ceiling, so a
+  // 120W selection is 120W burst and 100W sustained. Say so rather than
+  // implying the sustained figure it is.
+  const sustained =
+    limits.slow_max != null && limits.slow_max < tdp ? limits.slow_max : tdp;
 
   return (
     <PanelSection title={softMode ? "TDP Control (Soft - Governor/EPP Mapping)" : "TDP Control"}>
@@ -59,7 +65,9 @@ export function TdpSection({ softMode = false }: TdpSectionProps) {
             softMode
               ? "Mapped to governor + EPP"
               : managed
-                ? `Range: ${min}-${max}W`
+                ? sustained < tdp
+                  ? `${tdp}W burst / ${sustained}W sustained. Range: ${min}-${max}W`
+                  : `Range: ${min}-${max}W`
                 : `Not managed by PowerDeck - firmware limit ${limits.current}W. Move to set. Range: ${min}-${max}W`
           }
         />

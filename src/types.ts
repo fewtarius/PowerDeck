@@ -149,7 +149,14 @@ export interface BackendState {
     epp: string | null;
     platform_profile: string | null;
     fan_profiles: string[];
-    tdp_limits: { min: number; max: number; current: number };
+    tdp_limits: {
+      min: number;
+      max: number;
+      current: number;
+      fast_max?: number | null;
+      slow_max?: number | null;
+      burst_delta?: number | null;
+    };
     tdp_control: TdpControlAvailability;
     pstate: PStateModeCapabilities | null;
     battery_charge_limit: number | null;
