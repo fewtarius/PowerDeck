@@ -559,6 +559,7 @@ EXTERNAL_MANAGER_DBUS_IFACE = "com.steampowered.SteamOSManager1.ExternalManager1
 | Hardcode "schedutil" governor for EPP swap | On amd-pstate-epp active mode, only "performance" and "powersave" are available — "schedutil" silently fails, leaving governor at "performance" which restricts EPP to performance-only | Use `_best_epp_governor()` to auto-select the best available non-"performance" governor |
 | Use `threading.Lock()` for sysfs locks when functions call each other | `set_epp` calls `set_governor` while holding the lock — `Lock` deadlocks, `RLock` is reentrant | Use `threading.RLock()` for `_sysfs_lock` |
 | Apply EPP before pstate mode | On classic amd-pstate, EPP sysfs files only exist in "active" mode — the write silently fails | Apply `pstateMode` FIRST in `_apply_profile_full`, before governor and EPP |
+| Hide governor/EPP when `active_method == "platform_profile"` | ACPI platform_profile drives EC power limits and fan on Emdoor/Strix Halo hardware; it does not own cpufreq. Hiding EPP left users with no performance lever while the profile sat at `balance_performance` | Gate the EPP slider on `pstate.epp_available` only — the backend already gates that on pstate mode "active" |
 
 **EPP & Governor Interaction (amd-pstate / amd-pstate-epp):**
 
@@ -568,6 +569,9 @@ EXTERNAL_MANAGER_DBUS_IFACE = "com.steampowered.SteamOSManager1.ExternalManager1
 - `set_governor()` auto-falls-back to the best available non-`performance` governor when the requested one is not in `scaling_available_governors`.
 - On amd-pstate-epp active mode (Zen 4+, kernel 6.18+), only `performance` and `powersave` governors are available.
 - `_pstate_caps()` uses runtime detection (reads sysfs) rather than static init-time caps, so UI gated on `epp_available` reflects the current mode immediately after a mode switch.
+- `capabilities.governor` / `capabilities.epp` / `capabilities.platform_profile` are live sysfs readings, not profile values. The UI displays these so a coerced/rejected write or an external tool is visible immediately.
+- On devices that expose ACPI `platform_profile` without native TDP (`active_method == "platform_profile"`), `_apply_tdp()` is a no-op. It used to soft-map watts into governor/EPP, which fought the profile's own `governor`/`epp` fields on every switch.
+- Available-governor snapping: profiles saved on a different driver (`schedutil` from intel-pstate) are snapped to `_best_epp_governor()` on load in `initialize()` / `switch_active_profile()` and re-persisted. `set_governor()`'s silent fallback otherwise leaves the stored value lying about the hardware.
 
 ---
 

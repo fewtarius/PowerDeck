@@ -87,11 +87,15 @@ class Plugin:
         game_id = self.persistent.get("last_game_id", GAME_DEFAULT_ID)
         self.current_profile_id = make_profile_id(game_id, is_ac)
 
+        default_governor = cpu_mod._best_epp_governor()
         profile = self.profile_store.load(self.current_profile_id)
         if profile is None:
             profile = default_profile(is_ac, self.capabilities.default_tdp,
                                       self.capabilities.min_gpu_freq,
-                                      self.capabilities.max_gpu_freq)
+                                      self.capabilities.max_gpu_freq,
+                                      governor=default_governor)
+            self.profile_store.save(self.current_profile_id, profile)
+        elif self._snap_profile_to_hardware(profile):
             self.profile_store.save(self.current_profile_id, profile)
         self.current_profile = profile
 
@@ -278,7 +282,10 @@ class Plugin:
                 game_id = profile_id[: -len("_ac" if is_ac else "_battery")]
                 loaded = default_profile(is_ac, self.capabilities.default_tdp if self.capabilities else 15,
                                          self.capabilities.min_gpu_freq if self.capabilities else 400,
-                                         self.capabilities.max_gpu_freq if self.capabilities else 1600)
+                                         self.capabilities.max_gpu_freq if self.capabilities else 1600,
+                                         governor=cpu_mod._best_epp_governor())
+                self.profile_store.save(profile_id, loaded)
+            elif self._snap_profile_to_hardware(loaded):
                 self.profile_store.save(profile_id, loaded)
 
             self.current_profile_id = profile_id
@@ -288,6 +295,28 @@ class Plugin:
         # Apply outside the lock to avoid holding it during slow hardware I/O.
         self._apply_profile_full(profile_to_apply)
         return profile_to_apply
+
+    def _snap_profile_to_hardware(self, profile: PowerProfile) -> bool:
+        """Replace profile values the running driver cannot apply.
+
+        A profile written on a different driver (e.g. governor="schedutil"
+        from an intel-pstate box) is silently coerced by set_governor()'s
+        fallback, so the stored value keeps misreporting what the CPU
+        actually runs. Snap to a governor the driver exposes and report
+        whether anything changed so the caller can persist it.
+        """
+        available = cpu_mod.available_governors()
+        if not available or profile.governor in available:
+            return False
+        fallback = cpu_mod._best_epp_governor()
+        if not fallback:
+            return False
+        decky_plugin.logger.info(
+            f"profile governor {profile.governor!r} unavailable; "
+            f"snapping to {fallback!r}"
+        )
+        profile.governor = fallback
+        return True
 
     def _apply_profile_full(self, profile: PowerProfile) -> bool:
         """Apply every field of a profile to hardware. Used by switch_active_profile."""
@@ -389,9 +418,14 @@ class Plugin:
         native = caps.power_control.native_tdp_available
         platform = caps.power_control.platform_profile_available
         if platform and not native:
-            # ACPI platform_profile owns the watt level; map watts to
-            # governor/EPP so the soft slider has a real effect.
-            return self._apply_tdp_soft(int(watts))
+            # ACPI platform_profile owns the watt level. Do NOT soft-map
+            # watts into governor/EPP here: on devices where the platform
+            # profile only drives EC power limits + fan (Emdoor N161L,
+            # Strix Halo), CPU scaling is still under amd-pstate-epp and
+            # belongs to the profile's explicit governor/epp fields. The
+            # soft mapping rewrote CPU state on every profile switch and
+            # fought those fields.
+            return True
         if native:
             return tdp_mod.set_tdp(int(watts), prefer_native=True)[0]
         if caps.gpu_vendor == "intel":
@@ -450,6 +484,13 @@ class Plugin:
             },
             "capabilities": {
                 "governors": cpu_mod.available_governors(),
+                # Live hardware values, not the saved profile: the UI must
+                # show what the CPU is actually running (EPP/governor can
+                # change outside the plugin, and a profile value can be
+                # rejected or coerced by the kernel).
+                "governor": cpu_mod.get_governor(),
+                "epp": cpu_mod.get_epp(),
+                "platform_profile": platform_profile_mod.get_profile(),
                 "fan_profiles": fan_mod.available_profiles(),
                 "tdp_limits": {"min": caps.tdp_min, "max": caps.tdp_max},
                 "tdp_control": self._tdp_control_availability(caps),

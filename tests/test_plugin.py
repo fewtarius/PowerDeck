@@ -24,7 +24,12 @@ import tests.conftest  # noqa: F401
 
 from powerdeck import capabilities
 from powerdeck import plugin as plugin_module
-from powerdeck.hardware import cpu as cpu_mod, tdp as tdp_mod, pstate as pstate_mod
+from powerdeck.hardware import (
+    cpu as cpu_mod,
+    platform_profile as platform_profile_mod,
+    pstate as pstate_mod,
+    tdp as tdp_mod,
+)
 from powerdeck.state import PowerProfile, default_profile
 
 
@@ -129,11 +134,15 @@ class ApplyTdpRoutingTests(unittest.TestCase):
         self.assertEqual(self.calls["set_tdp"], [(20, False)])
         self.assertEqual(self.calls["soft"], [])
 
-    def test_platform_profile_without_native_calls_soft(self):
-        # ACPI platform_profile owns watts but native is also off -> soft map.
+    def test_platform_profile_without_native_is_noop(self):
+        # ACPI platform_profile owns the watt level. On devices where the
+        # platform profile only drives EC power limits + fan (Emdoor N161L,
+        # Strix Halo), CPU scaling stays under amd-pstate-epp and belongs to
+        # the profile's governor/epp fields. Soft-mapping watts here rewrote
+        # CPU state on every switch and fought those fields.
         self.p.capabilities = _caps(active_method="platform_profile", native=False, plat_profile=True)
-        self.p._apply_tdp(15)
-        self.assertEqual(self.calls["soft"], [15])
+        self.assertTrue(self.p._apply_tdp(15))
+        self.assertEqual(self.calls["soft"], [])
         self.assertEqual(self.calls["set_tdp"], [])
 
 
@@ -349,6 +358,65 @@ class ProfileStoreTests(unittest.TestCase):
         self.assertIsNotNone(loaded)
         self.assertEqual(loaded.tdp, prof.tdp)
         self.assertEqual(loaded.governor, prof.governor)
+
+
+class LiveStateTests(unittest.TestCase):
+    """get_state must report live CPU state, not the saved profile."""
+
+    def test_state_reports_live_governor_epp_platform_profile(self):
+        p = plugin_module.Plugin()
+        p.capabilities = _caps(active_method="platform_profile", native=False, plat_profile=True)
+        with mock.patch.object(cpu_mod, "available_governors", return_value=["performance", "powersave"]), \
+                mock.patch.object(cpu_mod, "get_governor", return_value="powersave"), \
+                mock.patch.object(cpu_mod, "get_epp", return_value="performance"), \
+                mock.patch.object(platform_profile_mod, "get_profile", return_value="performance"):
+            state = _run(p.get_state())
+        caps = state["capabilities"]
+        self.assertEqual(caps["governor"], "powersave")
+        self.assertEqual(caps["epp"], "performance")
+        self.assertEqual(caps["platform_profile"], "performance")
+
+    def test_epp_available_does_not_depend_on_platform_profile(self):
+        # Regression: a device with ACPI platform_profile AND amd-pstate-epp
+        # in active mode must report EPP as available. The UI used to hide
+        # the EPP slider whenever active_method == "platform_profile".
+        p = plugin_module.Plugin()
+        p.capabilities = _caps(active_method="platform_profile", native=False, plat_profile=True)
+        with mock.patch.object(pstate_mod, "is_available", return_value=True), \
+                mock.patch.object(pstate_mod, "get_mode", return_value="active"), \
+                mock.patch.object(cpu_mod, "available_epp",
+                                  return_value=["power", "balance_performance", "performance"]), \
+                mock.patch.object(cpu_mod, "available_governors",
+                                  return_value=["performance", "powersave"]):
+            caps = p._pstate_caps()
+        self.assertTrue(caps["epp_available"])
+        self.assertIn("performance", caps["epp_preferences"])
+
+
+class GovernorSnapTests(unittest.TestCase):
+    """Profiles must not keep a governor the driver cannot apply."""
+
+    def test_unavailable_governor_snaps_to_available(self):
+        p = plugin_module.Plugin()
+        profile = PowerProfile(governor="schedutil")
+        with mock.patch.object(cpu_mod, "available_governors",
+                               return_value=["performance", "powersave"]), \
+                mock.patch.object(cpu_mod, "_best_epp_governor", return_value="powersave"):
+            changed = p._snap_profile_to_hardware(profile)
+        self.assertTrue(changed)
+        self.assertEqual(profile.governor, "powersave")
+
+    def test_available_governor_left_alone(self):
+        p = plugin_module.Plugin()
+        profile = PowerProfile(governor="powersave")
+        with mock.patch.object(cpu_mod, "available_governors",
+                               return_value=["performance", "powersave"]):
+            self.assertFalse(p._snap_profile_to_hardware(profile))
+        self.assertEqual(profile.governor, "powersave")
+
+    def test_default_profile_accepts_driver_governor(self):
+        prof = default_profile(True, 15, 400, 1600, governor="powersave")
+        self.assertEqual(prof.governor, "powersave")
 
 
 if __name__ == "__main__":

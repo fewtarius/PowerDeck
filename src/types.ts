@@ -145,6 +145,9 @@ export interface BackendState {
   };
   capabilities: {
     governors: string[];
+    governor: string | null;
+    epp: string | null;
+    platform_profile: string | null;
     fan_profiles: string[];
     tdp_limits: { min: number; max: number };
     tdp_control: TdpControlAvailability;

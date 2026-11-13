@@ -24,7 +24,14 @@ export function PlatformProfileSection() {
   if (!state) return null;
   const choices = state.device_info.powerControl?.platform_profile_choices ?? [];
   const profiles = choices.length > 0 ? choices : ["power-saver", "balanced", "performance"];
-  const current = normalize(state.current_profile.platformProfile ?? "balanced");
+  // Prefer the live sysfs value: the saved profile can diverge from the
+  // hardware (firmware default, another tool, or a profile written before
+  // platform_profile was exposed).
+  const current = normalize(
+    state.capabilities.platform_profile ??
+      state.current_profile.platformProfile ??
+      "balanced"
+  );
   const activeIdx = profiles.indexOf(current);
   const idx = activeIdx >= 0 ? activeIdx : 0;
 

@@ -20,36 +20,36 @@ export function CpuSection() {
   const profile = state.current_profile;
   const orderedGovernors = getOrderedGovernors(state.capabilities.governors);
   const pstateCaps = state.capabilities.pstate;
-  // platform_profile hands CPU control entirely to the platform firmware;
-  // hide governor + EPP to avoid stomping the platform's decisions.
-  // native_tdp (ryzenadj) and "none" let us control EPP/governor freely.
-  const isPlatformManaged = device.powerControl?.active_method === "platform_profile";
-  // Governor is relevant on all drivers when not platform-managed:
-  // on amd-pstate-epp it gates the EPP hint set (performance governor
-  // silently restricts EPP to 'performance'), and on classic amd-pstate
-  // it's the primary control surface in passive/guided mode. Show the
-  // governor selector whenever the kernel exposes more than one option;
-  // a single governor (e.g. only 'performance') offers nothing to choose.
-  const showGovernor = !isPlatformManaged && orderedGovernors.length > 1;
-  // Show EPP controls whenever the backend reports EPP as available —
-  // this covers both amd-pstate-epp (always, in active mode) and
-  // classic amd-pstate (active mode exposes per-CPU EPP sysfs files).
-  // EPP is only honored in active mode, so the backend gates
-  // epp_available on current_mode=="active"; the slider therefore
+  // Live hardware readings. The saved profile can disagree with the
+  // kernel (coerced EPP, governor fallback, external tooling), and the
+  // UI must show what the CPU is actually running.
+  const liveGovernor = state.capabilities.governor ?? null;
+  const liveEpp = state.capabilities.epp ?? null;
+  // Governor is relevant on all drivers: on amd-pstate-epp it gates the
+  // EPP hint set (performance governor silently restricts EPP to
+  // 'performance'), and on classic amd-pstate it's the primary control
+  // surface in passive/guided mode. Show it whenever the kernel exposes
+  // more than one option; a single governor offers nothing to choose.
+  const showGovernor = orderedGovernors.length > 1;
+  // ACPI platform_profile is a separate control surface - it drives EC
+  // power limits and fan, not cpufreq - so it must NOT suppress EPP.
+  // The backend already gates epp_available on pstate mode "active"
+  // (the only mode where the kernel honors the hint), so the slider
   // appears/disappears with the mode automatically.
-  const showEpp = (pstateCaps?.epp_available ?? false) && !isPlatformManaged;
+  const showEpp = pstateCaps?.epp_available ?? false;
 
   const maxCores = device.max_cpu_cores || 16;
   const cpuCoresMax = profile.smt ? maxCores : Math.floor(maxCores / 2);
 
-  const governorIdx = Math.max(0, orderedGovernors.indexOf(profile.governor));
-  const govName = orderedGovernors[governorIdx] ?? profile.governor;
+  const govValue = liveGovernor ?? profile.governor;
+  const governorIdx = Math.max(0, orderedGovernors.indexOf(govValue));
+  const govName = orderedGovernors[governorIdx] ?? govValue;
   // Description must track the *displayed* (snapped) governor, not the
   // raw profile value: when the profile holds a governor the kernel
   // doesn't expose (e.g. "schedutil" under amd-pstate-epp active where
   // only powersave/performance exist) the slider snaps to index 0 but
   // the description still read the stale profile value.
-  const govDesc = GOVERNOR_DESCRIPTIONS[govName] ?? GOVERNOR_DESCRIPTIONS[profile.governor] ?? "";
+  const govDesc = GOVERNOR_DESCRIPTIONS[govName] ?? "";
 
   const eppOptions = (showEpp && pstateCaps && pstateCaps.epp_preferences.length > 0
     ? pstateCaps.epp_preferences
@@ -62,9 +62,10 @@ export function CpuSection() {
   const orderedEppOptions = EPP_VALUES.filter((e) =>
     (eppOptions as readonly string[]).includes(e)
   ) as string[];
-  const eppIdx = Math.max(0, orderedEppOptions.indexOf(profile.epp as string));
-  const eppName = orderedEppOptions[eppIdx] ?? profile.epp;
-  const eppDesc = EPP_DESCRIPTIONS[eppName as string] ?? EPP_DESCRIPTIONS[profile.epp as string] ?? "";
+  const eppValue = (liveEpp ?? profile.epp) as string;
+  const eppIdx = Math.max(0, orderedEppOptions.indexOf(eppValue));
+  const eppName = orderedEppOptions[eppIdx] ?? eppValue;
+  const eppDesc = EPP_DESCRIPTIONS[eppName] ?? "";
 
   // P-State mode index (computed once; defaults to Guided = 2)
   const pstateModes: string[] = PSTATE_MODES;
@@ -172,12 +173,6 @@ export function CpuSection() {
             onChange={(v) => applySettings({ epp: orderedEppOptions[v] })}
             description={eppDesc}
           />
-          {pstateCaps?.current_mode !== "active" && (
-            <div style={{ padding: "8px 12px", color: "#ffb366", fontSize: "0.8em" }}>
-              EPP is only honored in Active mode. Switch the CPU Driver
-              Mode (below) to "Active" for this setting to take effect.
-            </div>
-          )}
         </PanelSectionRow>
       )}
     </PanelSection>

@@ -48,12 +48,25 @@ class PowerProfile:
         return asdict(self)
 
 
-def default_profile(is_ac: bool, default_tdp: int = 15, gpu_min: int = 400, gpu_max: int = 1600) -> PowerProfile:
+def default_profile(
+    is_ac: bool,
+    default_tdp: int = 15,
+    gpu_min: int = 400,
+    gpu_max: int = 1600,
+    governor: Optional[str] = None,
+) -> PowerProfile:
     """Return a sensible default profile. AC = balanced, battery = power-biased.
 
     schedutil+balance_performance on AC; schedutil+balance_power on battery.
     governor=performance only exposes EPP=performance under amd-pstate-epp
     and silently wastes power on most APUs.
+
+    ``governor`` overrides the AC default with a governor the running
+    cpufreq driver actually exposes. On amd-pstate-epp active mode only
+    "powersave" and "performance" exist, so a profile saved with
+    "schedutil" silently falls back at write time and misreports the CPU
+    state in the UI. Battery profiles keep "powersave" (present on every
+    supported driver; set_governor() falls back if it is not).
 
     Battery TDP is scaled to 60% of the default TDP (min 5W) to match
     the historical v1.0.70 behaviour that users relied on for ~6W idle
@@ -64,7 +77,7 @@ def default_profile(is_ac: bool, default_tdp: int = 15, gpu_min: int = 400, gpu_
         return PowerProfile(
             tdp=default_tdp,
             cpuCores=8,
-            governor="schedutil",
+            governor=governor or "schedutil",
             fanProfile="moderate",
             smt=True,
             epp="balance_performance",
