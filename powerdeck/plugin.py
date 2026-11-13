@@ -411,7 +411,10 @@ class Plugin:
             return battery_mod.set_limit
         return lambda _v: True
 
-    def _apply_tdp(self, watts: int) -> bool:
+    def _apply_tdp(self, watts: Optional[int]) -> bool:
+        if watts is None:
+            # No TDP in the profile: leave the firmware limit alone.
+            return True
         caps = self.capabilities
         if not caps:
             return False
@@ -492,7 +495,13 @@ class Plugin:
                 "epp": cpu_mod.get_epp(),
                 "platform_profile": platform_profile_mod.get_profile(),
                 "fan_profiles": fan_mod.available_profiles(),
-                "tdp_limits": {"min": caps.tdp_min, "max": caps.tdp_max},
+                # `current` is the firmware's live limit, shown when the
+                # active profile carries no TDP of its own.
+                "tdp_limits": {
+                    "min": caps.tdp_min,
+                    "max": caps.tdp_max,
+                    "current": caps.default_tdp,
+                },
                 "tdp_control": self._tdp_control_availability(caps),
                 "pstate": self._pstate_caps(),
                 "battery_charge_limit": battery_mod.get_limit(),

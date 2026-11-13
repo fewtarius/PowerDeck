@@ -560,6 +560,9 @@ EXTERNAL_MANAGER_DBUS_IFACE = "com.steampowered.SteamOSManager1.ExternalManager1
 | Use `threading.Lock()` for sysfs locks when functions call each other | `set_epp` calls `set_governor` while holding the lock — `Lock` deadlocks, `RLock` is reentrant | Use `threading.RLock()` for `_sysfs_lock` |
 | Apply EPP before pstate mode | On classic amd-pstate, EPP sysfs files only exist in "active" mode — the write silently fails | Apply `pstateMode` FIRST in `_apply_profile_full`, before governor and EPP |
 | Hide governor/EPP when `active_method == "platform_profile"` | ACPI platform_profile drives EC power limits and fan on Emdoor/Strix Halo hardware; it does not own cpufreq. Hiding EPP left users with no performance lever while the profile sat at `balance_performance` | Gate the EPP slider on `pstate.epp_available` only — the backend already gates that on pstate mode "active" |
+| Gate the TDP section on `!platform_profile_available` | On hardware with both ACPI platform_profile and a usable ryzenadj (Emdoor N161L / Strix Halo), `platform_profile` only drives EC fan and power policy — it never writes the SMU APU limit. The gate hid the watt slider while ryzenadj was fully functional, leaving the chip pinned at the firmware default (15W) with the GPU clamped to DPM level 0 | Gate on `tdp_control.method` being `native_tdp` or `intel_rapl`; render the TDP and Platform Profile sections independently |
+| Default a profile to a fixed TDP | A fresh profile carrying `tdp=15` applies 15W through ryzenadj at every startup and profile switch, silently capping 70W-class APUs | `PowerProfile.tdp` is `Optional[int]` and defaults to `None`; PowerDeck only writes watts after the user sets one |
+| Report `active_method == "platform_profile"` when ryzenadj is usable | The reported method drives UI decisions; claiming platform_profile while ryzenadj owns the watt limit hides controls | `_detect_power_control_method()` returns `native_tdp` whenever `native_tdp_available`, and keeps `platform_profile_available` for the EC/fan slider |
 
 **EPP & Governor Interaction (amd-pstate / amd-pstate-epp):**
 
@@ -572,6 +575,12 @@ EXTERNAL_MANAGER_DBUS_IFACE = "com.steampowered.SteamOSManager1.ExternalManager1
 - `capabilities.governor` / `capabilities.epp` / `capabilities.platform_profile` are live sysfs readings, not profile values. The UI displays these so a coerced/rejected write or an external tool is visible immediately.
 - On devices that expose ACPI `platform_profile` without native TDP (`active_method == "platform_profile"`), `_apply_tdp()` is a no-op. It used to soft-map watts into governor/EPP, which fought the profile's own `governor`/`epp` fields on every switch.
 - Available-governor snapping: profiles saved on a different driver (`schedutil` from intel-pstate) are snapped to `_best_epp_governor()` on load in `initialize()` / `switch_active_profile()` and re-persisted. `set_governor()`'s silent fallback otherwise leaves the stored value lying about the hardware.
+
+**TDP control (ryzenadj) vs ACPI platform_profile:**
+
+- They are orthogonal. `platform_profile` writes the EC register (`PWMD`) and pulses `ECWR`, which retunes EC fan and EC-side power policy. It does **not** touch the SMU PM table — verified on the Emdoor N161L by toggling balanced/performance with the SMU at 55W and watching `STAPM LIMIT` stay at 55W. `ryzenadj` is the only thing that moves `STAPM/PPT LIMIT`.
+- `_tdp_limits_from_processor_db()` derives the slider ceiling from the hardware: Intel from RAPL, AMD from the SMU's `PPT LIMIT APU` via `ryzenadj -i` (70W on Strix Halo), falling back to 4-25W. `default_tdp` is the live `STAPM LIMIT`, so an unset profile shows what the firmware actually shipped with. Results are cached in `_TDP_RANGE_CACHE` / `_SMU_INFO_CACHE`.
+- A clamped GPU on a power-limited APU looks like a broken DPM governor. `power_dpm_force_performance_level=auto` with `gpu_busy_percent=100` and `pp_dpm_sclk` stuck at level 0 means the package is over budget, not that DPM is stuck. Setting `high` does not help; raising `STAPM/PPT` does.
 
 ---
 

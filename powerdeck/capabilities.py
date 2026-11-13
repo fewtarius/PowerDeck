@@ -183,17 +183,28 @@ def _detect_power_control_method() -> PowerControlCapabilities:
     caps.platform_profile_available, caps.platform_profile_choices = _detect_acpi_platform_profile()
     caps.secure_boot_enabled = _detect_secure_boot()
     caps.dev_mem_available = _detect_dev_mem()
+    caps.native_tdp_available = caps.dev_mem_available and not caps.secure_boot_enabled
+
+    # ryzenadj wins when it is usable. On hardware that also exposes ACPI
+    # platform_profile (Emdoor N161L / Strix Halo), the platform profile
+    # only drives EC fan and power policy - writing it leaves the SMU APU
+    # power limit untouched, so it cannot own the watt slider. Reporting
+    # "platform_profile" here previously hid the TDP control from the UI
+    # while ryzenadj was fully functional.
+    if caps.native_tdp_available:
+        caps.active_method = "native_tdp"
+        if caps.platform_profile_available:
+            caps.reason = (
+                "ryzenadj + /dev/mem sets the SMU power limit; "
+                "ACPI platform_profile sets EC fan and power policy"
+            )
+        else:
+            caps.reason = "ryzenadj + /dev/mem provides native TDP control"
+        return caps
 
     if caps.platform_profile_available:
         caps.active_method = "platform_profile"
         caps.reason = "ACPI platform_profile provides TDP control"
-        caps.native_tdp_available = caps.dev_mem_available and not caps.secure_boot_enabled
-        return caps
-
-    if not caps.secure_boot_enabled and caps.dev_mem_available:
-        caps.active_method = "native_tdp"
-        caps.reason = "ryzenadj + /dev/mem provides native TDP control"
-        caps.native_tdp_available = True
         return caps
 
     if caps.secure_boot_enabled:
@@ -355,22 +366,93 @@ def _gpu_freq_range() -> Tuple[int, int]:
     return 400, 1600
 
 
-def _tdp_limits_from_processor_db() -> Tuple[int, int, int]:
-    """Look up TDP defaults for the running processor. Returns (min, max, default).
+# SMU power table, cached for the process lifetime. Reading it spawns
+# ryzenadj (~200ms) and detect() is called from several paths.
+_SMU_INFO_CACHE: Optional[Dict[str, float]] = None
+_TDP_RANGE_CACHE: Optional[Tuple[int, int, int]] = None
 
-    Tries the RyzenAdj-enumerated SMU values via /sys/class/hwmon. Returns
-    conservative defaults (4W-25W, 15W default) on failure.
+
+def _ryzenadj_smu_info() -> Dict[str, float]:
+    """Read the SMU power table through ryzenadj. Cached.
+
+    Returns a ``{name: watts}`` mapping, empty when the SMU is unreachable
+    (no /dev/mem, Secure Boot, Intel, or no ryzenadj binary).
     """
+    global _SMU_INFO_CACHE
+    if _SMU_INFO_CACHE is not None:
+        return _SMU_INFO_CACHE
+
+    info: Dict[str, float] = {}
+    _SMU_INFO_CACHE = info
+    if not _exists("/dev/mem") or _detect_secure_boot():
+        return info
+
     try:
-        # Read package power limits (uW) from RAPL if available.
-        rapl_path = "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"
-        if _exists(rapl_path):
-            with open(rapl_path, "r") as f:
-                watts = int(f.read().strip()) // 1_000_000
-            return 4, max(watts, 25), min(15, watts)
+        from .hardware.tdp import _find_ryzenadj
+
+        path = _find_ryzenadj()
+        if not path:
+            return info
+        out = subprocess.run(
+            [path, "-i"], capture_output=True, text=True, timeout=5, env=clean_env()
+        )
     except Exception:
-        pass
-    return 4, 25, 15
+        return info
+
+    for line in (out.stdout or "").splitlines():
+        m = re.match(r"^\|\s*([A-Z][A-Z0-9 ]+?)\s*\|\s*([0-9.]+)\s*\|", line)
+        if not m:
+            continue
+        try:
+            info[m.group(1).strip()] = float(m.group(2))
+        except ValueError:
+            continue
+    _SMU_INFO_CACHE = info
+    return info
+
+
+def _tdp_limits_from_processor_db() -> Tuple[int, int, int]:
+    """Return (min, max, default) TDP for the running processor.
+
+    ``max`` is the ceiling the power slider offers; ``default`` is the
+    value shown when a profile carries no TDP, and reflects the limit the
+    firmware actually shipped with rather than an invented number.
+
+    Intel takes its bound from RAPL. AMD reads the SMU's APU ceiling
+    (``PPT LIMIT APU``) via ryzenadj - the OEM-configured package budget.
+    Falls back to the conservative 4-25W range when neither is readable.
+    """
+    global _TDP_RANGE_CACHE
+    if _TDP_RANGE_CACHE is not None:
+        return _TDP_RANGE_CACHE
+
+    tdp_min, tdp_max, default = 4, 25, 15
+
+    rapl_path = "/sys/class/powercap/intel-rapl:0/constraint_0_power_limit_uw"
+    if _exists(rapl_path):
+        try:
+            watts = int(_read(rapl_path, "0")) // 1_000_000
+            if watts > 0:
+                tdp_min, tdp_max, default = 4, max(watts, 25), min(15, watts)
+                _TDP_RANGE_CACHE = (tdp_min, tdp_max, default)
+                return _TDP_RANGE_CACHE
+        except (ValueError, OSError):
+            pass
+
+    info = _ryzenadj_smu_info()
+    ceiling = info.get("PPT LIMIT APU")
+    if ceiling and ceiling >= tdp_max:
+        tdp_max = int(round(ceiling))
+
+    current = info.get("STAPM LIMIT")
+    if current and current > 0:
+        default = int(round(current))
+    elif tdp_max > 25:
+        default = max(25, tdp_max // 2)
+
+    default = max(tdp_min, min(default, tdp_max))
+    _TDP_RANGE_CACHE = (tdp_min, tdp_max, default)
+    return _TDP_RANGE_CACHE
 
 
 def _battery_charge_limit_available() -> bool:

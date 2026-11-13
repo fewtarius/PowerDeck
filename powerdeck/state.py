@@ -24,7 +24,10 @@ def make_profile_id(game_id: str, is_ac: bool) -> str:
 
 @dataclass
 class PowerProfile:
-    tdp: int = 15
+    # None means "PowerDeck does not manage the power limit" - the firmware
+    # default stands. A profile only starts writing watts once the user
+    # moves the slider, so a fresh install never silently caps the chip.
+    tdp: Optional[int] = None
     cpuBoost: bool = True
     cpuCores: int = 8
     governor: str = "schedutil"
@@ -68,14 +71,12 @@ def default_profile(
     state in the UI. Battery profiles keep "powersave" (present on every
     supported driver; set_governor() falls back if it is not).
 
-    Battery TDP is scaled to 60% of the default TDP (min 5W) to match
-    the historical v1.0.70 behaviour that users relied on for ~6W idle
-    on battery. This only applies to freshly-created profiles that don't
-    already exist on disk.
+    TDP is left unset on both AC and battery. PowerDeck only writes a
+    watt limit once the user picks one, so a fresh profile leaves the
+    firmware's own limit in place instead of silently capping the chip.
     """
     if is_ac:
         return PowerProfile(
-            tdp=default_tdp,
             cpuCores=8,
             governor=governor or "schedutil",
             fanProfile="moderate",
@@ -86,9 +87,7 @@ def default_profile(
             gpuFreqMax=gpu_max,
             gpuFreqFixed=(gpu_min + gpu_max) // 2,
         )
-    battery_tdp = max(5, int(default_tdp * 0.6)) if default_tdp > 10 else default_tdp
     return PowerProfile(
-        tdp=battery_tdp,
         cpuCores=4,
         governor="powersave",
         fanProfile="quiet",

@@ -419,5 +419,81 @@ class GovernorSnapTests(unittest.TestCase):
         self.assertEqual(prof.governor, "powersave")
 
 
+class TdpOwnershipTests(unittest.TestCase):
+    """A profile only manages watts once the user sets one."""
+
+    def setUp(self):
+        self.p = plugin_module.Plugin()
+        self.p.__dict__.pop("capabilities", None)
+        self.p.capabilities = capabilities.Capabilities()
+        self.calls = []
+        tdp_mod.set_tdp = lambda w, prefer_native=True: (
+            self.calls.append((w, prefer_native)), (True, "ok")
+        )[1]
+        self.p._apply_tdp_soft = lambda w: (self.calls.append(("soft", w)), True)[1]
+
+    def test_default_profile_leaves_tdp_unset(self):
+        for is_ac in (True, False):
+            prof = default_profile(is_ac, 15, 400, 1600)
+            self.assertIsNone(prof.tdp, "fresh profiles must not cap the chip")
+
+    def test_unset_tdp_writes_nothing(self):
+        self.p.capabilities = _caps(active_method="native_tdp", native=True, plat_profile=False)
+        self.assertTrue(self.p._apply_tdp(None))
+        self.assertEqual(self.calls, [], "no hardware write when tdp is unset")
+
+    def test_platform_profile_device_with_native_uses_ryzenadj(self):
+        # Emdoor N161L / Strix Halo: platform_profile exists AND ryzenadj
+        # works. The watt limit must go through ryzenadj; platform_profile
+        # never writes the SMU package limit.
+        self.p.capabilities = _caps(active_method="native_tdp", native=True, plat_profile=True)
+        self.assertTrue(self.p._apply_tdp(55))
+        self.assertEqual(self.calls, [(55, True)])
+
+    def test_native_wins_over_platform_profile_in_detection(self):
+        with mock.patch.object(capabilities, "_detect_acpi_platform_profile",
+                               return_value=(True, ["low-power", "balanced", "performance"])), \
+                mock.patch.object(capabilities, "_detect_secure_boot", return_value=False), \
+                mock.patch.object(capabilities, "_detect_dev_mem", return_value=True):
+            pc = capabilities._detect_power_control_method()
+        self.assertEqual(pc.active_method, "native_tdp")
+        self.assertTrue(pc.native_tdp_available)
+        self.assertTrue(pc.platform_profile_available)
+
+    def test_platform_profile_owns_watts_when_no_native(self):
+        with mock.patch.object(capabilities, "_detect_acpi_platform_profile",
+                               return_value=(True, ["low-power", "balanced", "performance"])), \
+                mock.patch.object(capabilities, "_detect_secure_boot", return_value=True), \
+                mock.patch.object(capabilities, "_detect_dev_mem", return_value=True):
+            pc = capabilities._detect_power_control_method()
+        self.assertEqual(pc.active_method, "platform_profile")
+        self.assertFalse(pc.native_tdp_available)
+
+
+class TdpRangeTests(unittest.TestCase):
+    """The slider ceiling comes from the hardware, not a hardcoded 25W."""
+
+    def setUp(self):
+        capabilities._TDP_RANGE_CACHE = None
+        capabilities._SMU_INFO_CACHE = None
+
+    def tearDown(self):
+        capabilities._TDP_RANGE_CACHE = None
+        capabilities._SMU_INFO_CACHE = None
+
+    def test_smu_apu_ceiling_raises_max(self):
+        with mock.patch.object(capabilities, "_ryzenadj_smu_info",
+                               return_value={"PPT LIMIT APU": 70.0, "STAPM LIMIT": 55.0}):
+            tdp_min, tdp_max, default = capabilities._tdp_limits_from_processor_db()
+        self.assertEqual(tdp_min, 4)
+        self.assertEqual(tdp_max, 70)
+        self.assertEqual(default, 55, "unset profiles should show the firmware limit")
+
+    def test_falls_back_when_smu_unreadable(self):
+        with mock.patch.object(capabilities, "_ryzenadj_smu_info", return_value={}):
+            tdp_min, tdp_max, default = capabilities._tdp_limits_from_processor_db()
+        self.assertEqual((tdp_min, tdp_max, default), (4, 25, 15))
+
+
 if __name__ == "__main__":
     unittest.main()

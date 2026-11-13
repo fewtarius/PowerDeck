@@ -16,10 +16,15 @@ export function TdpSection({ softMode = false }: TdpSectionProps) {
 
   if (!state) return null;
 
-  const tdp = state.current_profile.tdp;
+  const profileTdp = state.current_profile.tdp;
   const limits = state.capabilities.tdp_limits;
   const min = showAdvanced ? customMin : limits.min;
   const max = showAdvanced ? customMax : limits.max;
+  // An unset TDP means PowerDeck is not managing the power limit. Show the
+  // firmware's live value so the thumb reflects reality; the first drag
+  // commits a limit into the profile and takes ownership from then on.
+  const managed = profileTdp != null;
+  const tdp = Math.min(Math.max(profileTdp ?? limits.current ?? min, min), max);
 
   return (
     <PanelSection title={softMode ? "TDP Control (Soft - Governor/EPP Mapping)" : "TDP Control"}>
@@ -48,9 +53,15 @@ export function TdpSection({ softMode = false }: TdpSectionProps) {
           min={min}
           max={max}
           step={1}
-          displayValue={`${tdp} Watts`}
+          displayValue={managed ? `${tdp} Watts` : `${tdp} Watts (firmware)`}
           onChange={(value) => applySettings({ tdp: value })}
-          description={softMode ? "Mapped to governor + EPP" : `Range: ${min}-${max}W`}
+          description={
+            softMode
+              ? "Mapped to governor + EPP"
+              : managed
+                ? `Range: ${min}-${max}W`
+                : `Not managed by PowerDeck - firmware limit ${limits.current}W. Move to set. Range: ${min}-${max}W`
+          }
         />
       </PanelSectionRow>
       {!softMode && (
@@ -74,7 +85,7 @@ export function TdpSection({ softMode = false }: TdpSectionProps) {
                   displayValue={`${customMin} Watts`}
                   onChange={(value) => {
                     setCustomMin(value);
-                    if (state.current_profile.tdp < value) {
+                    if (managed && (profileTdp as number) < value) {
                       applySettings({ tdp: value });
                     }
                   }}
@@ -91,7 +102,7 @@ export function TdpSection({ softMode = false }: TdpSectionProps) {
                   displayValue={`${customMax} Watts`}
                   onChange={(value) => {
                     setCustomMax(value);
-                    if (state.current_profile.tdp > value) {
+                    if (managed && (profileTdp as number) > value) {
                       applySettings({ tdp: value });
                     }
                   }}

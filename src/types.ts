@@ -1,5 +1,5 @@
 export interface PowerProfile {
-  tdp: number;
+  tdp: number | null;
   cpuBoost: boolean;
   cpuCores: number;
   governor: string;
@@ -149,7 +149,7 @@ export interface BackendState {
     epp: string | null;
     platform_profile: string | null;
     fan_profiles: string[];
-    tdp_limits: { min: number; max: number };
+    tdp_limits: { min: number; max: number; current: number };
     tdp_control: TdpControlAvailability;
     pstate: PStateModeCapabilities | null;
     battery_charge_limit: number | null;

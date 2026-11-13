@@ -42,6 +42,13 @@ function Sections() {
   const device = state.device_info;
   const caps = state.capabilities;
   const isRogAlly = !!(caps.rog_ally?.device_name);
+  // A watt slider is only honest when a real watt backend is reachable.
+  // "platform_profile" owns EC fan and power policy; on hardware where
+  // ryzenadj also works (Emdoor N161L / Strix Halo) the platform profile
+  // never writes the SMU power limit, so it cannot back this slider.
+  const tdpMethod = caps.tdp_control.method;
+  const hasWattControl =
+    caps.tdp_control.available && (tdpMethod === "native_tdp" || tdpMethod === "intel_rapl");
 
   return (
     <>
@@ -50,7 +57,7 @@ function Sections() {
       {device.has_fan_control && !isRogAlly && <CoolingSection />}
       {isRogAlly && caps.rog_ally?.available_controls?.fan_control && <RogAllyFansSection />}
 
-      {!device.powerControl?.platform_profile_available && caps.tdp_control.available && <TdpSection />}
+      {hasWattControl && <TdpSection />}
       {!caps.tdp_control.available && caps.tdp_control.has_soft_control && <TdpSection softMode />}
       {device.powerControl?.platform_profile_available && <PlatformProfileSection />}
 
